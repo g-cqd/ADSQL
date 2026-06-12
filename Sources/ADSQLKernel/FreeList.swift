@@ -34,27 +34,14 @@ public enum FreeList {
     return (gen, seq)
   }
 
+  @inline(__always)
   static func appendVarint(_ value: UInt64, to bytes: inout [UInt8]) {
-    var v = value
-    while v >= 0x80 {
-      bytes.append(UInt8(v & 0x7F) | 0x80)
-      v >>= 7
-    }
-    bytes.append(UInt8(v))
+    Varint.append(value, to: &bytes)
   }
 
+  @inline(__always)
   static func readVarint(_ bytes: UnsafeRawBufferPointer, _ offset: inout Int) -> UInt64? {
-    var result: UInt64 = 0
-    var shift: UInt64 = 0
-    while offset < bytes.count {
-      let byte = bytes[offset]
-      offset += 1
-      result |= UInt64(byte & 0x7F) << shift
-      if byte & 0x80 == 0 { return result }
-      shift += 7
-      if shift > 63 { return nil }
-    }
-    return nil
+    Varint.read(bytes, &offset)
   }
 
   static let fixedWidthFlag: UInt32 = 0x8000_0000

@@ -19,6 +19,20 @@ public enum DBError: Error, Equatable, Sendable {
   case writerLockHeld(byPid: Int32)
   case snapshotDestinationExists
   case integrityFailure(String)
+
+  // Relational layer
+  case reservedKey
+  case noSuchTable(String)
+  case tableExists(String)
+  case noSuchIndex(String)
+  case indexExists(String)
+  case noSuchColumn(table: String, column: String)
+  case typeMismatch(table: String, column: String, expected: String, got: String)
+  case notNullViolation(table: String, column: String)
+  case uniqueViolation(table: String, index: String)
+  case foreignKeyViolation(table: String)
+  case indexKeyTooLarge(index: String, size: Int)
+  case invalidDefinition(String)
 }
 
 extension DBError: CustomStringConvertible {
@@ -42,6 +56,22 @@ extension DBError: CustomStringConvertible {
     case .writerLockHeld(let pid): return "another process (pid \(pid)) holds the writer lock"
     case .snapshotDestinationExists: return "snapshot destination already exists"
     case .integrityFailure(let why): return "integrity failure: \(why)"
+    case .reservedKey: return "keys beginning with 0x00 are reserved for the catalog"
+    case .noSuchTable(let name): return "no such table: \(name)"
+    case .tableExists(let name): return "table already exists: \(name)"
+    case .noSuchIndex(let name): return "no such index: \(name)"
+    case .indexExists(let name): return "index already exists: \(name)"
+    case .noSuchColumn(let table, let column): return "no such column: \(table).\(column)"
+    case .typeMismatch(let table, let column, let expected, let got):
+      return "type mismatch on \(table).\(column): expected \(expected), got \(got)"
+    case .notNullViolation(let table, let column):
+      return "NOT NULL violation: \(table).\(column)"
+    case .uniqueViolation(let table, let index):
+      return "UNIQUE violation on \(table) via index \(index)"
+    case .foreignKeyViolation(let table): return "foreign key violation on \(table)"
+    case .indexKeyTooLarge(let index, let size):
+      return "encoded key for index \(index) is \(size) bytes (max \(Format.maxKeySize))"
+    case .invalidDefinition(let why): return "invalid definition: \(why)"
     }
   }
 }
