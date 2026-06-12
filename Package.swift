@@ -22,7 +22,7 @@ let package = Package(
     ),
     .testTarget(
       name: "ADSQLKernelTests",
-      dependencies: ["ADSQLKernel", "ADSQLTestSupport"]
+      dependencies: ["ADSQLKernel", "ADSQLTestSupport", "CSQLite"]
     ),
   ]
 )

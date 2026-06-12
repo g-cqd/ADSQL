@@ -18,6 +18,13 @@ private func selectOf(_ sql: String) throws -> SQLSelect {
 
 @Suite("SQL parser — statements")
 struct SQLParserStatementTests {
+  @Test func blobLiterals() throws {
+    let s = try selectOf("SELECT x'00FF', X'cafe', x''")
+    if case .expr(let e, _, _) = s.columns[0] { #expect(e == .literal(.blob([0x00, 0xFF]))) }
+    if case .expr(let e, _, _) = s.columns[1] { #expect(e == .literal(.blob([0xCA, 0xFE]))) }
+    if case .expr(let e, _, _) = s.columns[2] { #expect(e == .literal(.blob([]))) }
+  }
+
   @Test func selectCoreShapes() throws {
     let s = try selectOf("""
       SELECT d.id, d.key AS path, COALESCE(r.display_name, d.framework) framework
@@ -289,7 +296,8 @@ struct SQLParserErrorTests {
     ("SELECT * FROM t WHERE a IN (SELECT b FROM s)", "json_each"),
     ("SELECT * FROM t WHERE EXISTS (SELECT 1)", "EXISTS"),
     ("SELECT ?1", "?NNN"),
-    ("SELECT x'00ff'", "expression"), // blob literals unsupported → x treated as ident, ' fails
+    ("SELECT x'012'", "odd-length blob"),
+    ("SELECT x'0g'", "non-hex blob"),
   ]
 
   @Test(arguments: unsupported.indices)
@@ -299,7 +307,7 @@ struct SQLParserErrorTests {
       _ = try SQLParser.parseOne(sql)
       Issue.record("\(sql) parsed but must be rejected")
     } catch {
-      switch error as? DBError {
+      switch error {
       case .sqlUnsupported, .sqlSyntax: break
       default: Issue.record("\(sql) threw unexpected \(error)")
       }

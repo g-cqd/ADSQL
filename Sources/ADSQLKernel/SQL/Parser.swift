@@ -788,6 +788,12 @@ struct SQLParser {
         pos += 1
         return .literal(.real(-d))
       }
+      if case .bigInteger(let text) = current.kind {
+        pos += 1
+        // SQLite: "-9223372036854775808" is the exact Int64.min.
+        if let v = Int64("-" + text) { return .literal(.integer(v)) }
+        return .literal(.real(-(Double(text) ?? 0)))
+      }
       return .unary(.negate, try unary())
     }
     if matchSymbol("+") { return try unary() }
@@ -803,9 +809,15 @@ struct SQLParser {
     case .real(let d):
       pos += 1
       return .literal(.real(d))
+    case .bigInteger(let text):
+      pos += 1
+      return .literal(.real(Double(text) ?? 0))
     case .string(let s):
       pos += 1
       return .literal(.text(s))
+    case .blob(let bytes):
+      pos += 1
+      return .literal(.blob(bytes))
     case .parameter(let param):
       pos += 1
       return .parameter(param, offset: token.offset)

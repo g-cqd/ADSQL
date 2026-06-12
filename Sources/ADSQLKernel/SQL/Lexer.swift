@@ -7,8 +7,12 @@ struct SQLToken: Equatable, Sendable {
     case keyword(String)        // uppercased
     case identifier(String)     // original case (bare or "quoted")
     case string(String)
+    case blob([UInt8])          // x'hexdigits'
     case integer(Int64)
     case real(Double)
+    /// Digit-only literal exceeding Int64 (sign may still rescue it:
+    /// SQLite parses -9223372036854775808 as the exact Int64.min).
+    case bigInteger(String)
     case parameter(SQLParam)
     case symbol(String)         // operators & punctuation
     case end
@@ -181,11 +185,46 @@ enum SQLLexer {
           tokens.append(SQLToken(kind: .real(d), offset: start))
         } else if let v = Int64(text) {
           tokens.append(SQLToken(kind: .integer(v), offset: start))
-        } else if let d = Double(text) { // integer literal overflowing i64
-          tokens.append(SQLToken(kind: .real(d), offset: start))
+        } else if Double(text) != nil { // integer literal overflowing i64
+          tokens.append(SQLToken(kind: .bigInteger(text), offset: start))
         } else {
           throw DBError.sqlSyntax(message: "malformed numeric literal", offset: start)
         }
+        continue
+      }
+      // x'hex' blob literal
+      if (b | 0x20) == 0x78, peek(1) == 0x27 {
+        i += 2
+        var out: [UInt8] = []
+        var pending: UInt8? = nil
+        while true {
+          guard let h = peek() else {
+            throw DBError.sqlSyntax(message: "unterminated blob literal", offset: start)
+          }
+          if h == 0x27 {
+            i += 1
+            break
+          }
+          let digit: UInt8
+          switch h {
+          case 0x30...0x39: digit = h - 0x30
+          case 0x41...0x46: digit = h - 0x41 + 10
+          case 0x61...0x66: digit = h - 0x61 + 10
+          default:
+            throw DBError.sqlSyntax(message: "malformed blob literal", offset: start)
+          }
+          if let high = pending {
+            out.append(high << 4 | digit)
+            pending = nil
+          } else {
+            pending = digit
+          }
+          i += 1
+        }
+        guard pending == nil else {
+          throw DBError.sqlSyntax(message: "odd-length blob literal", offset: start)
+        }
+        tokens.append(SQLToken(kind: .blob(out), offset: start))
         continue
       }
       // Identifiers / keywords
