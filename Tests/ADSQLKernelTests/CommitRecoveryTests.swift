@@ -16,7 +16,7 @@ struct CommitReopenTests {
       let pager = try Pager(channel: channel, maxMapSize: 1 << 30)
       for txn in 0..<6 {
         let ctx = TxnContext(source: pager, meta: meta)
-        try FreeList.harvest(ctx: ctx, upTo: meta.generation)
+        try FreeList.harvest(ctx: ctx, upTo: meta.reclaimLimit(minReader: .max))
         for op in OpScript.generate(seed: UInt64(txn), count: 300, keySpace: 500, deleteRatio: 20) {
           try KernelOps.apply(op, ctx: ctx, model: &model)
         }
@@ -131,7 +131,7 @@ struct CrashInjectionTests {
       let ctx = TxnContext(source: pager, meta: meta)
       // Full production lifecycle: harvest, mutate, serialize, commit —
       // page reuse under crash is exactly what this harness must prove safe.
-      try FreeList.harvest(ctx: ctx, upTo: meta.generation)
+      try FreeList.harvest(ctx: ctx, upTo: meta.reclaimLimit(minReader: .max))
       let ops = OpScript.generate(
         seed: 0xC0FFEE + UInt64(txn), count: opsPerTxn, keySpace: 300,
         deleteRatio: 25, bigValueRatio: 5)
@@ -197,11 +197,12 @@ struct CrashInjectionTests {
       }
     }
 
-    // The sweep must actually exercise intermediate generations, and the
-    // final cut (everything durable) must recover the last commit.
+    // The sweep must actually exercise intermediate generations, and a cut
+    // after the final group (writeback fully drained) must recover the
+    // last commit.
     #expect(recoveredGens.count > 2, "sweep should land on multiple generations")
     let finalImage = disk.materializeCrashImage(
-      cutGroup: disk.crashCutGroups.upperBound, tearSeed: 1)
+      cutGroup: disk.crashCutGroups.upperBound + 1, tearSeed: 1)
     let finalGen = try assertRecovers(
       image: finalImage, disk: disk, dir: dir, name: "cut-final.adsql", history: history)
     #expect(finalGen == history.lastGeneration)

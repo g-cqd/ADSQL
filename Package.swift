@@ -12,6 +12,8 @@ let package = Package(
     .target(name: "ADSQLKernel"),
     .target(name: "ADSQL", dependencies: ["ADSQLKernel"]),
     .executableTarget(name: "ADSQLTool", dependencies: ["ADSQL"]),
+    .systemLibrary(name: "CSQLite"),
+    .executableTarget(name: "ADSQLBench", dependencies: ["ADSQL", "CSQLite"]),
     .target(
       name: "ADSQLTestSupport",
       dependencies: ["ADSQLKernel"],

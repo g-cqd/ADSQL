@@ -6,7 +6,7 @@
 ///   3. write dirty pages (sorted, contiguous runs gathered into pwritev)
 ///   4. sync (barrier or full, per durability profile)
 ///   5. write the new meta to page (generation % 2)
-///   6. sync again
+///   6. `.full` only: sync again (commit durable on return)
 ///
 /// Recovery is `Meta.recover` over the two meta pages: the newest
 /// checksum-valid one wins; a torn in-flight meta falls back one generation.
@@ -46,14 +46,23 @@ public enum Committer {
       try channel.pwritev(run, at: Int(startPage) * Format.pageSize)
     }
 
-    try channel.sync(durability)
+    // The pre-meta sync only needs ORDERING (data before meta) — even for
+    // `.full`, whose trailing F_FULLFSYNC flushes the whole device cache
+    // including these pages. One full flush per commit, not two.
+    try channel.sync(durability == .full ? .barrier : durability)
 
     let metaBuf = PageBuf()
     let metaPageNo = newMeta.pageNo
     newMeta.encode(into: metaBuf.raw, pageNo: metaPageNo)
     try channel.pwrite(metaBuf.readOnly, at: Int(metaPageNo) * Format.pageSize)
 
-    try channel.sync(durability)
+    // `.full` must make THIS commit power-loss durable before returning.
+    // `.barrier` needs no trailing barrier: the next commit's barrier
+    // orders this meta ahead of the next meta, and page reuse lags one
+    // generation (Meta.reclaimLimit), so recovery to N-1 is always sound.
+    if durability == .full {
+      try channel.sync(.full)
+    }
     return newMeta
   }
 }

@@ -162,8 +162,8 @@ public final class Database: Sendable {
   ) throws(DBError) -> R {
     let snapshot: (Meta, UInt64)? = shared.withLock { state in
       guard !state.closed else { return nil }
-      let minReader = state.readers.keys.min() ?? state.meta.generation
-      return (state.meta, min(minReader, state.meta.generation))
+      let minReader = state.readers.keys.min() ?? UInt64.max
+      return (state.meta, state.meta.reclaimLimit(minReader: minReader))
     }
     guard let (meta, reclaimLimit) = snapshot else { throw DBError.databaseClosed }
 

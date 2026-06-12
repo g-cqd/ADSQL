@@ -47,6 +47,16 @@ public struct Meta: Equatable, Sendable {
   @inline(__always)
   public var pageNo: UInt64 { generation % 2 }
 
+  /// The newest generation whose freed pages the next transaction may
+  /// reuse. One generation of lag is what lets `.barrier` commits issue a
+  /// single barrier: meta(N) and the next transaction's data writes share
+  /// an ordering window, so recovery can land on N-1 — pages freed at
+  /// gens ≤ N-1 are absent from tree N-1 and safe to overwrite.
+  @inline(__always)
+  public func reclaimLimit(minReader: UInt64) -> UInt64 {
+    min(minReader, generation > 0 ? generation - 1 : 0)
+  }
+
   enum Offset {
     static let magic = 0
     static let formatVersion = 8

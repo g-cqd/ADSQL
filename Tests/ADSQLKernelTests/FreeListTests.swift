@@ -68,7 +68,7 @@ struct FreeListLifecycleTests {
 
     for txn in 0..<40 {
       let ctx = TxnContext(source: pager, meta: meta)
-      try FreeList.harvest(ctx: ctx, upTo: meta.generation)
+      try FreeList.harvest(ctx: ctx, upTo: meta.reclaimLimit(minReader: .max))
       let ops = OpScript.generate(
         seed: 0xFEED + UInt64(txn), count: 120, keySpace: 250,
         deleteRatio: 30, bigValueRatio: 6)
@@ -101,7 +101,7 @@ struct FreeListLifecycleTests {
     func churn(_ rounds: Range<Int>) throws {
       for txn in rounds {
         let ctx = TxnContext(source: pager, meta: meta)
-        try FreeList.harvest(ctx: ctx, upTo: meta.generation)
+        try FreeList.harvest(ctx: ctx, upTo: meta.reclaimLimit(minReader: .max))
         for k in 0..<200 {
           try KernelOps.put(
             ctx, Array("stable-\(k)".utf8),
@@ -140,7 +140,7 @@ struct FreeListLifecycleTests {
     meta = try Committer.commit(ctx: ctx, channel: channel, durability: .barrier)
 
     ctx = TxnContext(source: pager, meta: meta)
-    try FreeList.harvest(ctx: ctx, upTo: meta.generation)
+    try FreeList.harvest(ctx: ctx, upTo: meta.reclaimLimit(minReader: .max))
     for i in 0..<400 {
       try KernelOps.delete(ctx, Array("hl-\(i)".utf8))
     }
