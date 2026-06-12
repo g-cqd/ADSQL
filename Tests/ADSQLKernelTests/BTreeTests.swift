@@ -116,7 +116,7 @@ struct BTreeModelTests {
     // Max-size keys → 4 cells per leaf, ~15 separators per branch: a few
     // hundred inserts force depth ≥ 3 and exercise branch splits hard.
     let kernel = MemKernel()
-    var ctx = kernel.begin()
+    let ctx = kernel.begin()
     var rng = SplitMix64(seed: 17)
     var model = ModelStore()
     for _ in 0..<1200 {
@@ -169,7 +169,7 @@ struct BTreeModelTests {
 
   @Test func updatesPreserveCount() throws {
     let kernel = MemKernel()
-    var ctx = kernel.begin()
+    let ctx = kernel.begin()
     let key = Array("stable".utf8)
     for round in 0..<50 {
       try put(ctx, key, [UInt8](repeating: UInt8(round), count: round * 37 % 900))
