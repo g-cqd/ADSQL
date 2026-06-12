@@ -5,9 +5,9 @@ B+tree over mmap, single-writer / wait-free-reader MVCC, crash-safe by
 construction (committed pages are immutable; recovery is picking the newest
 checksum-valid meta page).
 
-Status: storage kernel (KV layer) under active development. Relational layer,
-SQL front end, and first-class FTS/vector indexes are planned on top of the
-same on-disk format.
+Status: storage kernel and relational layer (typed tables, catalog,
+secondary indexes, FK cascades) complete. SQL front end (M4) and
+first-class FTS/vector indexes (M5) are next, on the same on-disk format.
 
 - Platform: macOS 26+, Apple Silicon first (16 KiB native pages)
 - Toolchain: pinned via `.swift-version`; Swift 6 language mode, strict concurrency
@@ -42,6 +42,19 @@ apple-docs production pragmas) on a document_chunks-shaped dataset
 ¹ ADSQL `.barrier` (one F_BARRIERFSYNC per commit, crash-consistent by
 construction) vs SQLite `synchronous=FULL` (fsync per WAL commit) — the
 closest durability semantics on macOS.
+
+Relational layer (M3), documents-shaped table with 5 secondary indexes,
+200k rows (`ADSQLBench table`):
+
+| Scenario | ADSQL | SQLite | Δ |
+|---|---|---|---|
+| rowid point get (p50 / p99.9) | 1.0 µs / 24 µs | 2.4 µs / 170 µs | **2.4× / 7×** |
+| unique-key probe (p50) | 1.1 µs | 1.3 µs | ≈+ |
+| batch insert ×512 (5-index maintenance) | 101 k rows/s | 128 k rows/s | 0.79× ² |
+| index range scan (33k rows) | 1.1 M rows/s | 2.8 M rows/s | 0.39× ² |
+
+² Known headroom, addressed by the M4 executor: per-row dictionary
+assembly on insert, eager full-row materialization on scans.
 
 ## Develop
 

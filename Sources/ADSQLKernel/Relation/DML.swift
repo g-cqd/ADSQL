@@ -301,8 +301,9 @@ extension Relation {
 
   // MARK: - Delete
 
+  /// Physical single-row delete + index maintenance (no FK actions).
   @discardableResult
-  static func delete(
+  static func deleteRowCore(
     _ ctx: TxnContext, from tableName: String, rowid: Int64
   ) throws(DBError) -> Bool {
     var state = try ensureState(ctx)
@@ -333,6 +334,16 @@ extension Relation {
     table.handle = handle
     state.tableRecords[tableName] = table
     ctx.relation = state
+    return true
+  }
+
+  /// Row delete with ON DELETE actions (cascade chains, restrict checks).
+  @discardableResult
+  static func delete(
+    _ ctx: TxnContext, from tableName: String, rowid: Int64
+  ) throws(DBError) -> Bool {
+    guard try deleteRowCore(ctx, from: tableName, rowid: rowid) else { return false }
+    try processDeleteActions(ctx, deleted: [(table: tableName, rowid: rowid)])
     return true
   }
 

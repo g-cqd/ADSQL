@@ -26,7 +26,7 @@ while let argument = iterator.next() {
     scenarios.append(argument)
   }
 }
-if scenarios.isEmpty { scenarios = ["cold", "get", "scan", "concurrent", "upsert"] }
+if scenarios.isEmpty { scenarios = ["cold", "get", "scan", "concurrent", "upsert", "table"] }
 
 mkdir(dir, 0o755)
 print("ADSQL bench — rows=\(config.rows), engines=\(engines.joined(separator: ",")), dir=\(dir)")
@@ -56,6 +56,8 @@ do {
         try Scenarios.concurrent(engine, path: datasets[engine]!, config: config)
       case "upsert":
         try Scenarios.upserts(engine, dir: dir, config: config)
+      case "table":
+        try TableScenario.run(engine, dir: dir, config: config)
       default:
         print("unknown scenario \(scenario)")
         exit(1)

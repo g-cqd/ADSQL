@@ -4,10 +4,69 @@ import Synchronization
 /// its snapshot's version row first and only reuses the cache on a match,
 /// so old-generation readers reconstruct their own (older) schema instead
 /// of seeing a newer one.
+///
+/// Catalog records (which embed per-generation tree handles) are cached per
+/// COMMITTED GENERATION: any read at generation G can reuse a record loaded
+/// by another read at G, eliminating per-call catalog descents on hot read
+/// paths. A new commit simply starts a fresh per-generation map.
 public final class SchemaCache: Sendable {
   private let cached = Mutex<Schema?>(nil)
+  private struct Records {
+    var generation: UInt64
+    var tables: [String: Catalog.TableRecord] = [:]
+    var indexes: [String: Catalog.IndexRecord] = [:]
+  }
+  private let records = Mutex<Records>(Records(generation: 0))
 
   public init() {}
+
+  func tableRecord(
+    _ resolver: some PageResolver, meta: Meta, name: String
+  ) throws(DBError) -> Catalog.TableRecord? {
+    let cachedRecord: Catalog.TableRecord? = records.withLock { state in
+      state.generation == meta.generation ? state.tables[name] : nil
+    }
+    if let cachedRecord { return cachedRecord }
+    // Misses (including absent tables) load fresh; only positive results
+    // are cached.
+    let loaded = try Relation.tableRecord(resolver, mainTree: meta.mainTree, name: name)
+    if let loaded {
+      records.withLock { state in
+        if state.generation != meta.generation {
+          if state.generation < meta.generation {
+            state = Records(generation: meta.generation)
+          } else {
+            return
+          }
+        }
+        state.tables[name] = loaded
+      }
+    }
+    return loaded
+  }
+
+  func indexRecord(
+    _ resolver: some PageResolver, meta: Meta, name: String
+  ) throws(DBError) -> Catalog.IndexRecord? {
+    let cachedRecord: Catalog.IndexRecord? = records.withLock { state in
+      state.generation == meta.generation ? state.indexes[name] : nil
+    }
+    if let cachedRecord { return cachedRecord }
+    let loaded = try Relation.indexRecord(resolver, mainTree: meta.mainTree, name: name)
+    if let loaded {
+      records.withLock { state in
+        if state.generation != meta.generation {
+          if state.generation < meta.generation {
+            state = Records(generation: meta.generation)
+          } else {
+            return
+          }
+        }
+        state.indexes[name] = loaded
+      }
+    }
+    return loaded
+  }
 
   func schema(resolver: some PageResolver, meta: Meta) throws(DBError) -> Schema {
     let version = try currentVersion(resolver: resolver, meta: meta)
@@ -61,14 +120,24 @@ extension ReadTxn {
   }
 
   func tableRecord(_ name: String) throws(DBError) -> Catalog.TableRecord {
-    guard let record = try Relation.tableRecord(resolver, mainTree: meta.mainTree, name: name)
-    else { throw DBError.noSuchTable(name) }
+    let record =
+      if let schemaCache {
+        try schemaCache.tableRecord(resolver, meta: meta, name: name)
+      } else {
+        try Relation.tableRecord(resolver, mainTree: meta.mainTree, name: name)
+      }
+    guard let record else { throw DBError.noSuchTable(name) }
     return record
   }
 
   func indexRecord(_ name: String) throws(DBError) -> Catalog.IndexRecord {
-    guard let record = try Relation.indexRecord(resolver, mainTree: meta.mainTree, name: name)
-    else { throw DBError.noSuchIndex(name) }
+    let record =
+      if let schemaCache {
+        try schemaCache.indexRecord(resolver, meta: meta, name: name)
+      } else {
+        try Relation.indexRecord(resolver, mainTree: meta.mainTree, name: name)
+      }
+    guard let record else { throw DBError.noSuchIndex(name) }
     return record
   }
 

@@ -122,8 +122,9 @@ public struct TableDefinition: Equatable, Sendable {
       }
     }
     for fk in foreignKeys {
-      guard !fk.childColumns.isEmpty else {
-        throw DBError.invalidDefinition("table \(name): empty foreign key")
+      guard fk.childColumns.count == 1 else {
+        throw DBError.invalidDefinition(
+          "table \(name): foreign keys reference the parent rowid through exactly one column")
       }
       for column in fk.childColumns where columnIndex(of: column) == nil {
         throw DBError.noSuchColumn(table: name, column: column)
