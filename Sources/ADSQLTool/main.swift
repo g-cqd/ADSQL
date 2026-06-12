@@ -11,7 +11,9 @@ let usage = """
     adsql delete   <path> <key>
     adsql scan     <path> [limit]
     adsql stats    <path>
-    adsql check    <path>
+    adsql check    <path> [--deep]
+    adsql tables   <path>
+    adsql schema   <path> [table]
     adsql snapshot <path> <destination>
     adsql hold-read <path> <seconds>     # test helper: pin a read snapshot
   """
@@ -108,15 +110,60 @@ do {
     print("keys:        \(db.count)")
     db.close()
 
-  case "check":
+  case "check", "verify":
+    let deep = arguments.contains("--deep")
     let db = try Database.open(at: path, options: DatabaseOptions(readOnly: true))
-    let report = try db.verifyIntegrity()
+    let report = try db.verifyIntegrity(deep: deep)
     db.close()
-    print("ok — generation \(report.generation), \(report.kvCount) keys")
+    print("ok\(deep ? " (deep)" : "") — generation \(report.generation), \(report.kvCount) keys")
     print("pages: \(report.pageCount) total · \(report.mainTreePages) main · "
       + "\(report.overflowPages) overflow · \(report.freeTreePages) free-tree · "
-      + "\(report.freeListedPages) free")
-    print("depth: \(report.treeDepth)")
+      + "\(report.relationTreePages) relational · \(report.freeListedPages) free")
+    print("tables: \(report.tableCount) · indexes: \(report.indexCount) · depth: \(report.treeDepth)")
+
+  case "tables":
+    let db = try Database.open(at: path, options: DatabaseOptions(readOnly: true))
+    let listing = try db.read { (txn) throws(DBError) in
+      var out: [(String, UInt64, Int)] = []
+      let schema = try txn.schema()
+      for name in schema.tables.keys.sorted() {
+        out.append((name, try txn.rowCount(in: name), schema.indexes(on: name).count))
+      }
+      return out
+    }
+    db.close()
+    for (name, rows, indexCount) in listing {
+      print("\(name)\t\(rows) rows\t\(indexCount) indexes")
+    }
+
+  case "schema":
+    let db = try Database.open(at: path, options: DatabaseOptions(readOnly: true))
+    let schema = try db.read { (txn) throws(DBError) in try txn.schema() }
+    db.close()
+    let tableNames = arguments.count >= 4 ? [arguments[3]] : schema.tables.keys.sorted()
+    for name in tableNames {
+      guard let table = schema.tables[name] else {
+        FileHandle.standardError("no such table: \(name)")
+        exit(2)
+      }
+      print("table \(name) (catalog v\(schema.catalogVersion))")
+      for column in table.columns {
+        var line = "  \(column.name) \(column.type)"
+        if column.notNull { line += " NOT NULL" }
+        if column.collation == .nocase { line += " COLLATE NOCASE" }
+        if let def = column.defaultValue { line += " DEFAULT \(def)" }
+        print(line)
+      }
+      if case .rowidAlias(let column, let auto) = table.primaryKey {
+        print("  PRIMARY KEY \(column)\(auto ? " AUTOINCREMENT" : "")")
+      }
+      for fk in table.foreignKeys {
+        print("  FK (\(fk.childColumns.joined(separator: ", "))) → \(fk.parentTable) ON DELETE \(fk.onDelete)")
+      }
+      for index in schema.indexes(on: name) {
+        print("  index \(index.name)\(index.unique ? " UNIQUE" : "") (\(index.columns.joined(separator: ", ")))")
+      }
+    }
 
   case "snapshot":
     guard arguments.count == 4 else { fail("usage: adsql snapshot <path> <destination>") }

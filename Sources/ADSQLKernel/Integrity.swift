@@ -20,7 +20,8 @@ public struct IntegrityReport: Sendable {
 /// (corruption, leak, double-use) throws.
 public enum Integrity {
   public static func check(
-    resolver: some PageResolver, meta: Meta, verifyChecksums: Bool = true
+    resolver: some PageResolver, meta: Meta, verifyChecksums: Bool = true,
+    deep: Bool = false
   ) throws(DBError) -> IntegrityReport {
     let main = try BTree.validate(
       resolver: resolver, tree: meta.mainTree, verifyChecksums: verifyChecksums)
@@ -68,6 +69,10 @@ public enum Integrity {
         "leaked pages: \(Array(missing.prefix(20))) (\(missing.count) of \(meta.pageCount))")
     }
 
+    if deep {
+      try deepCheck(resolver: resolver, state: relationState)
+    }
+
     return IntegrityReport(
       generation: meta.generation,
       pageCount: meta.pageCount,
@@ -81,15 +86,72 @@ public enum Integrity {
       indexCount: relationState.indexRecords.count,
       relationTreePages: relationTreePages)
   }
+
+  /// Deep mode: index ⇄ row bijection. Every index entry must resolve to a
+  /// live row whose encoded column values reproduce the entry key exactly,
+  /// and per-table entry counts must equal row counts for every index.
+  static func deepCheck(
+    resolver: some PageResolver, state: RelationState
+  ) throws(DBError) -> Void {
+    for indexName in state.indexRecords.keys.sorted() {
+      let index = state.indexRecords[indexName]!
+      guard let tableName = state.tableName(for: index.tableId),
+        let table = state.tableRecords[tableName]
+      else {
+        throw DBError.integrityFailure("index \(indexName) references a missing table")
+      }
+      guard index.handle.count == table.handle.count else {
+        throw DBError.integrityFailure(
+          "index \(indexName) has \(index.handle.count) entries; table "
+            + "\(tableName) has \(table.handle.count) rows")
+      }
+
+      var entries = 0
+      var cursor = Cursor(resolver: resolver, tree: index.handle)
+      var positioned = try cursor.move(to: .first)
+      while positioned {
+        let entryKey: [UInt8]? = try cursor.withCurrent { (key, _) throws(DBError) in
+          [UInt8](key)
+        }
+        guard let entryKey else { break }
+        guard let rowid = entryKey.withUnsafeBytes({ KeyCodec.rowid(fromSuffixOf: $0) }) else {
+          throw DBError.integrityFailure("index \(indexName): malformed entry key")
+        }
+        guard
+          let recordBytes = try Relation.getBytes(
+            resolver, table.handle, key: KeyCodec.rowKey(rowid))
+        else {
+          throw DBError.integrityFailure(
+            "index \(indexName): dangling entry for rowid \(rowid)")
+        }
+        let row = try Relation.materializeRow(
+          table: table, rowid: rowid, recordBytes: recordBytes)
+        let expected = try Relation.indexEntryKey(
+          index: index, table: table, row: row, rowid: rowid)
+        guard expected == entryKey else {
+          throw DBError.integrityFailure(
+            "index \(indexName): entry for rowid \(rowid) does not match the row")
+        }
+        entries += 1
+        positioned = try cursor.next()
+      }
+      guard UInt64(entries) == index.handle.count else {
+        throw DBError.integrityFailure(
+          "index \(indexName): walked \(entries) entries, handle says \(index.handle.count)")
+      }
+    }
+  }
 }
 
 extension Database {
   /// Verifies the newest committed generation end to end (checksums,
-  /// structure, page liveness). Runs as a reader: the writer is unaffected.
-  public func verifyIntegrity() throws(DBError) -> IntegrityReport {
+  /// structure, page liveness; `deep` adds index ⇄ row bijection). Runs as
+  /// a reader: the writer is unaffected.
+  public func verifyIntegrity(deep: Bool = false) throws(DBError) -> IntegrityReport {
     let meta = try beginRead()
     defer { endRead(generation: meta.generation) }
-    return try Integrity.check(resolver: CommittedResolver(source: pager), meta: meta)
+    return try Integrity.check(
+      resolver: CommittedResolver(source: pager), meta: meta, deep: deep)
   }
 
   /// O(1) atomic snapshot via APFS clonefile(2). Quiesces the writer for

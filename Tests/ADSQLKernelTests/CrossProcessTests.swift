@@ -145,6 +145,46 @@ struct CrossProcessTests {
     _ = try db.verifyIntegrity()
   }
 
+  @Test func relationalCLIAgainstPopulatedDatabase() throws {
+    let dir = TempDir()
+    defer { dir.cleanup() }
+    let path = dir.file("relcli.adsql")
+    let db = try Database.open(at: path)
+    defer { db.close() }
+    try db.writeSync { (txn) throws(DBError) in
+      try txn.createTable(TableDefinition(
+        "documents",
+        columns: [
+          ColumnDefinition("id", .integer, notNull: true),
+          ColumnDefinition("key", .text, notNull: true),
+          ColumnDefinition("title", .text, collation: .nocase),
+        ],
+        primaryKey: .rowidAlias(column: "id", autoincrement: true)))
+      try txn.createIndex(
+        IndexDefinition("u_documents_key", on: "documents", columns: ["key"], unique: true))
+      for i in 0..<500 {
+        _ = try txn.insert(into: "documents", [
+          "key": .text("doc/\(i)"), "title": .text("Title \(i)"),
+        ])
+      }
+    }
+
+    let tables = try runCLI(["tables", path])
+    #expect(tables.status == 0)
+    #expect(tables.output.contains("documents"))
+    #expect(tables.output.contains("500 rows"))
+
+    let schema = try runCLI(["schema", path, "documents"])
+    #expect(schema.status == 0)
+    #expect(schema.output.contains("PRIMARY KEY id AUTOINCREMENT"))
+    #expect(schema.output.contains("u_documents_key UNIQUE"))
+
+    let verify = try runCLI(["check", path, "--deep"])
+    #expect(verify.status == 0, "deep verify failed: \(verify.output)")
+    #expect(verify.output.contains("ok (deep)"))
+    #expect(verify.output.contains("tables: 1"))
+  }
+
   @Test func readOnlyProcessSeesFreshCommits() throws {
     let dir = TempDir()
     defer { dir.cleanup() }

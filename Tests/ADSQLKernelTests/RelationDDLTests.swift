@@ -289,8 +289,9 @@ struct RelationDDLCrashTests {
         #expect(
           Set(state.tableRecords.keys) == want,
           "generation \(recovered.generation): tables \(state.tableRecords.keys.sorted())")
-        // Each table has exactly its index; whole-file liveness holds.
-        _ = try Integrity.check(resolver: resolver, meta: recovered)
+        // Each table has exactly its index; whole-file liveness holds and
+        // every index entry bijects to its row.
+        _ = try Integrity.check(resolver: resolver, meta: recovered, deep: true)
       }
     }
   }

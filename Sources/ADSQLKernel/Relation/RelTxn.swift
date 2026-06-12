@@ -77,6 +77,11 @@ extension ReadTxn {
     try Relation.readRow(resolver, table: try tableRecord(table), rowid: rowid)
   }
 
+  /// Number of rows in a table at this snapshot.
+  public func rowCount(in table: String) throws(DBError) -> UInt64 {
+    try tableRecord(table).handle.count
+  }
+
   /// Forward scan over a table in rowid order.
   public func withRowCursor<R>(
     table: String, _ body: (inout RowCursor<CommittedResolver>) throws(DBError) -> R
@@ -161,6 +166,11 @@ extension WriteTxn {
 
   public func row(in table: String, rowid: Int64) throws(DBError) -> Row? {
     try Relation.readRow(ctx, table: try tableRecord(table), rowid: rowid)
+  }
+
+  /// Number of rows in a table, including this transaction's writes.
+  public func rowCount(in table: String) throws(DBError) -> UInt64 {
+    try tableRecord(table).handle.count
   }
 
   public func withRowCursor<R>(

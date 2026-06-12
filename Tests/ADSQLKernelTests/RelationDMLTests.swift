@@ -64,7 +64,7 @@ private func verifyAgainstModel(_ db: Database, _ model: RelationalModelStore) t
     }
     #expect(engineOrder == model.indexOrder(indexName), "index \(indexName) order")
   }
-  _ = try db.verifyIntegrity()
+  _ = try db.verifyIntegrity(deep: true)
 }
 
 @Suite("Relation DML model tests")
