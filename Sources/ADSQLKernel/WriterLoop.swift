@@ -102,8 +102,16 @@ extension Database {
           restore.apply(to: ctx)
         }
       }
-      // Leave request scoping before free-list serialization.
+      // Leave request scoping before catalog/free-list serialization.
       ctx.requestEpoch = 0
+      if ctx.relation != nil {
+        do throws(DBError) {
+          try Relation.serializeState(ctx: ctx)
+        } catch {
+          for completion in completions { completion(error) }
+          continue
+        }
+      }
 
       if completions.isEmpty { continue }
       // Read-only batch: nothing to persist, nothing to sync.
@@ -120,6 +128,7 @@ extension Database {
         let newMeta = try Committer.commit(
           ctx: ctx, channel: channel, durability: options.durability)
         shared.withLock { $0.meta = newMeta }
+        if let state = ctx.relation { relationSchemaCache.publish(state.schema) }
         for completion in completions { completion(nil) }
       } catch {
         for completion in completions { completion(error) }
@@ -134,12 +143,14 @@ struct TxnRestorePoint {
   let pendingFree: [UInt64]
   let pool: [UInt64]
   let highWater: UInt64
+  let relation: RelationState?
 
   init(ctx: TxnContext) {
     self.meta = ctx.meta
     self.pendingFree = ctx.pendingFree
     self.pool = ctx.allocator.pool
     self.highWater = ctx.allocator.highWater
+    self.relation = ctx.relation
   }
 
   /// Restores scalar state; page buffers are restored by
@@ -149,5 +160,6 @@ struct TxnRestorePoint {
     ctx.pendingFree = pendingFree
     ctx.allocator.pool = pool
     ctx.allocator.highWater = highWater
+    ctx.relation = relation
   }
 }

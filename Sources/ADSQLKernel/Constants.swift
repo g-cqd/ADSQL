@@ -32,6 +32,10 @@ public enum Format {
   /// First allocatable data page.
   public static let firstDataPage: UInt64 = 2
 
+  /// Main-tree keys beginning with this byte belong to the relational
+  /// catalog; the public KV API rejects them.
+  public static let reservedKeyPrefix: UInt8 = 0x00
+
   /// Reader table (lock file) layout.
   public static let lockHeaderSize: Int = 128
   public static let readerSlotSize: Int = 128

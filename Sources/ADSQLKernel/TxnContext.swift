@@ -55,6 +55,10 @@ public final class TxnContext: PageResolver, OverflowPager {
   /// once concurrent readers move past this generation.
   public var pendingFree: [UInt64] = []
 
+  /// Relational state (catalog, handles, sequences), loaded lazily on first
+  /// relational use. Value-typed: TxnRestorePoint snapshots it by copy.
+  public internal(set) var relation: RelationState?
+
   /// Group-commit nesting: stacked micro-transactions bump the epoch; pages
   /// dirtied by earlier requests are cloned on first touch so a failing
   /// request can restore them (see RequestUndo).

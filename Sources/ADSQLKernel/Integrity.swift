@@ -9,6 +9,9 @@ public struct IntegrityReport: Sendable {
   public var freeTreePages: Int
   public var overflowPages: Int
   public var freeListedPages: Int
+  public var tableCount: Int = 0
+  public var indexCount: Int = 0
+  public var relationTreePages: Int = 0
 }
 
 /// Whole-file verification: both trees structurally valid with checksums,
@@ -35,6 +38,25 @@ public enum Integrity {
     }
     for page in main.reachablePages { try claim(page, "main tree") }
     for page in free.reachablePages { try claim(page, "free tree") }
+
+    // Relational trees: every table and index hangs off the catalog.
+    let relationState = try Relation.loadState(resolver: resolver, mainTree: meta.mainTree)
+    var relationTreePages = 0
+    for name in relationState.tableRecords.keys.sorted() {
+      let record = relationState.tableRecords[name]!
+      let report = try BTree.validate(
+        resolver: resolver, tree: record.handle, verifyChecksums: verifyChecksums)
+      for page in report.reachablePages { try claim(page, "table \(name)") }
+      relationTreePages += report.reachablePages.count
+    }
+    for name in relationState.indexRecords.keys.sorted() {
+      let record = relationState.indexRecords[name]!
+      let report = try BTree.validate(
+        resolver: resolver, tree: record.handle, verifyChecksums: verifyChecksums)
+      for page in report.reachablePages { try claim(page, "index \(name)") }
+      relationTreePages += report.reachablePages.count
+    }
+
     var freeListed = 0
     for entry in try FreeList.allListedPages(resolver: resolver, tree: meta.freeTree) {
       try claim(entry.page, "free entry gen \(entry.gen)")
@@ -54,7 +76,10 @@ public enum Integrity {
       mainTreePages: main.reachablePages.count,
       freeTreePages: free.reachablePages.count,
       overflowPages: main.overflowPages,
-      freeListedPages: freeListed)
+      freeListedPages: freeListed,
+      tableCount: relationState.tableRecords.count,
+      indexCount: relationState.indexRecords.count,
+      relationTreePages: relationTreePages)
   }
 }
 

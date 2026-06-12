@@ -49,6 +49,9 @@ public final class Database: Sendable {
   let writeQueue = DispatchQueue(label: "adsql.writer", qos: .userInitiated)
   /// Queued group-commit requests awaiting the next drain.
   let pendingWrites = Mutex<[PendingWrite]>([])
+  /// Latest-known schema snapshot, keyed by catalog version (MVCC-correct:
+  /// readers verify their snapshot's version row before reuse).
+  let relationSchemaCache = SchemaCache()
 
   private init(
     path: String, channel: FileChannel, pager: Pager, options: DatabaseOptions,
@@ -117,6 +120,11 @@ public final class Database: Sendable {
     shared.withLock { $0.meta.kvCount }
   }
 
+  @inline(__always)
+  static func checkUserKey(_ key: [UInt8]) throws(DBError) {
+    if key.first == Format.reservedKeyPrefix { throw DBError.reservedKey }
+  }
+
   // MARK: - Reads
 
   /// Runs `body` against an immutable snapshot of the newest committed
@@ -126,7 +134,9 @@ public final class Database: Sendable {
   ) throws(DBError) -> R {
     let meta = try beginRead()
     defer { endRead(generation: meta.generation) }
-    let txn = ReadTxn(resolver: CommittedResolver(source: pager), meta: meta)
+    let txn = ReadTxn(
+      resolver: CommittedResolver(source: pager), meta: meta,
+      schemaCache: relationSchemaCache)
     return try body(txn)
   }
 
@@ -215,6 +225,9 @@ public final class Database: Sendable {
 
     let txn = WriteTxn(ctx: ctx)
     let result = try body(txn)
+    if ctx.relation != nil {
+      try Relation.serializeState(ctx: ctx)
+    }
 
     // Nothing user-visible changed: drop the transaction entirely (harvest
     // churn was memory-only).
@@ -229,6 +242,7 @@ public final class Database: Sendable {
     let newMeta = try Committer.commit(
       ctx: ctx, channel: channel, durability: options.durability)
     shared.withLock { $0.meta = newMeta }
+    if let state = ctx.relation { relationSchemaCache.publish(state.schema) }
     return result
   }
 }
@@ -240,12 +254,14 @@ public final class Database: Sendable {
 public struct ReadTxn: ~Copyable {
   let resolver: CommittedResolver
   let meta: Meta
+  let schemaCache: SchemaCache?
 
   public var generation: UInt64 { meta.generation }
   public var count: UInt64 { meta.kvCount }
 
   /// Copying point lookup.
   public func get(_ key: [UInt8]) throws(DBError) -> [UInt8]? {
+    try Database.checkUserKey(key)
     var result: Result<[UInt8]?, DBError> = .success(nil)
     key.withUnsafeBytes { keyBytes in
       do throws(DBError) {
@@ -261,6 +277,7 @@ public struct ReadTxn: ~Copyable {
   }
 
   public func contains(_ key: [UInt8]) throws(DBError) -> Bool {
+    try Database.checkUserKey(key)
     var result: Result<Bool, DBError> = .success(false)
     key.withUnsafeBytes { keyBytes in
       do throws(DBError) {
@@ -279,6 +296,7 @@ public struct ReadTxn: ~Copyable {
   public func withValue<R>(
     forKey key: [UInt8], _ body: (RawSpan?) throws(DBError) -> R
   ) throws(DBError) -> R {
+    try Database.checkUserKey(key)
     var result: Result<R, DBError>?
     key.withUnsafeBytes { keyBytes in
       do throws(DBError) {
@@ -316,11 +334,13 @@ public struct ReadTxn: ~Copyable {
     return try body(&cursor)
   }
 
-  /// Visits every (key, value) pair in order. Values are materialized.
+  /// Visits every user (key, value) pair in order (system rows under the
+  /// reserved 0x00 prefix are skipped). Values are materialized.
   public func forEach(
     _ body: ([UInt8], [UInt8]) throws(DBError) -> Void
   ) throws(DBError) {
     try BTree.forEach(resolver: resolver, meta: meta) { (key, ref) throws(DBError) in
+      if key.first == Format.reservedKeyPrefix { return }
       try body([UInt8](key), try BTree.copyValue(ref, resolver: resolver))
     }
   }
@@ -333,6 +353,7 @@ public struct WriteTxn: ~Copyable {
 
   /// Inserts or replaces.
   public func put(_ key: [UInt8], _ value: [UInt8]) throws(DBError) {
+    try Database.checkUserKey(key)
     var failure: DBError?
     key.withUnsafeBytes { keyBytes in
       value.withUnsafeBytes { valueBytes in
@@ -349,6 +370,7 @@ public struct WriteTxn: ~Copyable {
   /// Returns true when the key existed.
   @discardableResult
   public func delete(_ key: [UInt8]) throws(DBError) -> Bool {
+    try Database.checkUserKey(key)
     var result: Result<Bool, DBError> = .success(false)
     key.withUnsafeBytes { keyBytes in
       do throws(DBError) {
@@ -362,6 +384,7 @@ public struct WriteTxn: ~Copyable {
 
   /// Reads through this transaction's own uncommitted writes.
   public func get(_ key: [UInt8]) throws(DBError) -> [UInt8]? {
+    try Database.checkUserKey(key)
     var result: Result<[UInt8]?, DBError> = .success(nil)
     key.withUnsafeBytes { keyBytes in
       do throws(DBError) {
