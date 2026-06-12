@@ -36,6 +36,7 @@ public final class Database: Sendable {
     var readers: [UInt64: Int] = [:]
   }
 
+  public let path: String
   let channel: FileChannel
   let pager: Pager
   let options: DatabaseOptions
@@ -46,7 +47,10 @@ public final class Database: Sendable {
   /// Queued group-commit requests awaiting the next drain.
   let pendingWrites = Mutex<[PendingWrite]>([])
 
-  private init(channel: FileChannel, pager: Pager, options: DatabaseOptions, meta: Meta) {
+  private init(
+    path: String, channel: FileChannel, pager: Pager, options: DatabaseOptions, meta: Meta
+  ) {
+    self.path = path
     self.channel = channel
     self.pager = pager
     self.options = options
@@ -78,7 +82,7 @@ public final class Database: Sendable {
       channel.close()
       throw error
     }
-    return Database(channel: channel, pager: pager, options: options, meta: meta)
+    return Database(path: path, channel: channel, pager: pager, options: options, meta: meta)
   }
 
   /// Marks the handle closed; new transactions fail. The mapping and file

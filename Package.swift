@@ -5,11 +5,13 @@ let package = Package(
   name: "ADSQL",
   platforms: [.macOS(.v26)],
   products: [
-    .library(name: "ADSQL", targets: ["ADSQL"])
+    .library(name: "ADSQL", targets: ["ADSQL"]),
+    .executable(name: "adsql", targets: ["ADSQLTool"]),
   ],
   targets: [
     .target(name: "ADSQLKernel"),
     .target(name: "ADSQL", dependencies: ["ADSQLKernel"]),
+    .executableTarget(name: "ADSQLTool", dependencies: ["ADSQL"]),
     .target(
       name: "ADSQLTestSupport",
       dependencies: ["ADSQLKernel"],

@@ -53,36 +53,13 @@ public enum KernelOps {
     return out
   }
 
-  /// The kernel-wide page liveness invariant: {metas} ∪ main-tree pages ∪
-  /// free-tree pages ∪ pages listed as free == [0, pageCount), disjoint.
+  /// The kernel-wide page liveness invariant, delegated to the kernel's
+  /// own Integrity checker (checksums included).
+  @discardableResult
   public static func checkLiveness(
     _ resolver: some PageResolver, _ meta: Meta
-  ) throws -> (live: Int, free: Int) {
-    let main = try BTree.validate(resolver: resolver, tree: meta.mainTree)
-    let free = try BTree.validate(resolver: resolver, tree: meta.freeTree)
-
-    var seen = Set<UInt64>([0, 1])
-    func claim(_ page: UInt64, _ what: String) throws {
-      guard page >= Format.firstDataPage, page < meta.pageCount else {
-        throw DBError.integrityFailure("\(what): page \(page) out of bounds")
-      }
-      guard seen.insert(page).inserted else {
-        throw DBError.integrityFailure("\(what): page \(page) claimed twice")
-      }
-    }
-    for page in main.reachablePages { try claim(page, "main tree") }
-    for page in free.reachablePages { try claim(page, "free tree") }
-    var listedCount = 0
-    for entry in try FreeList.allListedPages(resolver: resolver, tree: meta.freeTree) {
-      try claim(entry.page, "free entry gen \(entry.gen)")
-      listedCount += 1
-    }
-    guard seen.count == Int(meta.pageCount) else {
-      let missing = (0..<meta.pageCount).filter { !seen.contains($0) }
-      throw DBError.integrityFailure(
-        "leaked pages: \(missing.prefix(20)) (\(missing.count) of \(meta.pageCount))")
-    }
-    return (live: main.reachablePages.count + free.reachablePages.count, free: listedCount)
+  ) throws -> IntegrityReport {
+    try Integrity.check(resolver: resolver, meta: meta, verifyChecksums: false)
   }
 
   /// Applies an op to both the transaction and the model.
