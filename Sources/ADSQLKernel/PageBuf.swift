@@ -1,0 +1,28 @@
+/// A single owned, page-aligned 16 KiB buffer. Dirty pages live in these
+/// (keyed by page number in the write transaction's dirty table); ownership
+/// is unique so the backing memory is freed exactly once.
+public final class PageBuf {
+  public let raw: UnsafeMutableRawBufferPointer
+
+  public init(zeroed: Bool = true) {
+    let ptr = UnsafeMutableRawPointer.allocate(
+      byteCount: Format.pageSize, alignment: Format.pageSize)
+    self.raw = UnsafeMutableRawBufferPointer(start: ptr, count: Format.pageSize)
+    if zeroed {
+      raw.initializeMemory(as: UInt8.self, repeating: 0)
+    }
+  }
+
+  public convenience init(copying source: UnsafeRawBufferPointer) {
+    precondition(source.count == Format.pageSize)
+    self.init(zeroed: false)
+    raw.copyMemory(from: source)
+  }
+
+  deinit {
+    raw.deallocate()
+  }
+
+  @inline(__always)
+  public var readOnly: UnsafeRawBufferPointer { UnsafeRawBufferPointer(raw) }
+}
