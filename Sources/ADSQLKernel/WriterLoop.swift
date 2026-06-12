@@ -70,10 +70,12 @@ extension Database {
       }
       if batch.isEmpty { return }
 
+      readerTable.sweepStaleSlots()
+      let foreignMin = readerTable.minimumGeneration() ?? UInt64.max
       let snapshot: (Meta, UInt64)? = shared.withLock { state in
         guard !state.closed else { return nil }
-        let minReader = state.readers.keys.min() ?? UInt64.max
-        return (state.meta, state.meta.reclaimLimit(minReader: minReader))
+        let localMin = state.readers.keys.min() ?? UInt64.max
+        return (state.meta, state.meta.reclaimLimit(minReader: min(localMin, foreignMin)))
       }
       guard let (meta, reclaimLimit) = snapshot else {
         for item in batch { item.fail(.databaseClosed) }

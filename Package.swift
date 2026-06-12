@@ -9,7 +9,8 @@ let package = Package(
     .executable(name: "adsql", targets: ["ADSQLTool"]),
   ],
   targets: [
-    .target(name: "ADSQLKernel"),
+    .target(name: "ADCAtomics"),
+    .target(name: "ADSQLKernel", dependencies: ["ADCAtomics"]),
     .target(name: "ADSQL", dependencies: ["ADSQLKernel"]),
     .executableTarget(name: "ADSQLTool", dependencies: ["ADSQL"]),
     .systemLibrary(name: "CSQLite"),

@@ -34,12 +34,15 @@ public final class Database: Sendable {
     var closed = false
     /// generation → active read transaction count.
     var readers: [UInt64: Int] = [:]
+    /// Last minimum published to the cross-process slot (0 = none).
+    var publishedMin: UInt64 = 0
   }
 
   public let path: String
   let channel: FileChannel
   let pager: Pager
   let options: DatabaseOptions
+  let readerTable: ReaderTable
   let shared: Mutex<Shared>
   /// Writer exclusion: one serial queue shared by `writeSync` and the
   /// group-commit drain.
@@ -48,12 +51,14 @@ public final class Database: Sendable {
   let pendingWrites = Mutex<[PendingWrite]>([])
 
   private init(
-    path: String, channel: FileChannel, pager: Pager, options: DatabaseOptions, meta: Meta
+    path: String, channel: FileChannel, pager: Pager, options: DatabaseOptions,
+    readerTable: ReaderTable, meta: Meta
   ) {
     self.path = path
     self.channel = channel
     self.pager = pager
     self.options = options
+    self.readerTable = readerTable
     self.shared = Mutex(Shared(meta: meta))
   }
 
@@ -82,7 +87,18 @@ public final class Database: Sendable {
       channel.close()
       throw error
     }
-    return Database(path: path, channel: channel, pager: pager, options: options, meta: meta)
+    // Cross-process coordination: reader slot for every handle, the fcntl
+    // writer lock for read-write handles.
+    let readerTable: ReaderTable
+    do {
+      readerTable = try ReaderTable(databasePath: path, claimWriterLock: !options.readOnly)
+    } catch {
+      channel.close()
+      throw error
+    }
+    return Database(
+      path: path, channel: channel, pager: pager, options: options,
+      readerTable: readerTable, meta: meta)
   }
 
   /// Marks the handle closed; new transactions fail. The mapping and file
@@ -115,9 +131,21 @@ public final class Database: Sendable {
   }
 
   func beginRead() throws(DBError) -> Meta {
+    // Read-only handles have no writer in-process: refresh the committed
+    // meta from the mapped meta pages (checksums make torn reads safe).
+    let refreshed: Meta? =
+      if options.readOnly {
+        try? Meta.recover(meta0: pager.map.pageBytes(0), meta1: pager.map.pageBytes(1))
+      } else {
+        nil
+      }
     let meta: Meta? = shared.withLock { state in
       guard !state.closed else { return nil }
+      if let refreshed, refreshed.generation > state.meta.generation {
+        state.meta = refreshed
+      }
       state.readers[state.meta.generation, default: 0] += 1
+      publishMinLocked(&state)
       return state.meta
     }
     guard let meta else { throw DBError.databaseClosed }
@@ -133,6 +161,18 @@ public final class Database: Sendable {
           state.readers[generation] = count - 1
         }
       }
+      publishMinLocked(&state)
+    }
+  }
+
+  /// Mirrors the in-process minimum reader generation into this handle's
+  /// cross-process slot. Called with the state lock held, so slot order is
+  /// consistent with meta publication.
+  private func publishMinLocked(_ state: inout Shared) {
+    let minimum = state.readers.keys.min() ?? 0
+    if minimum != state.publishedMin {
+      readerTable.publish(minGeneration: minimum)
+      state.publishedMin = minimum
     }
   }
 
@@ -160,10 +200,12 @@ public final class Database: Sendable {
   private func performWrite<R>(
     _ body: (borrowing WriteTxn) throws(DBError) -> R
   ) throws(DBError) -> R {
+    readerTable.sweepStaleSlots()
+    let foreignMin = readerTable.minimumGeneration() ?? UInt64.max
     let snapshot: (Meta, UInt64)? = shared.withLock { state in
       guard !state.closed else { return nil }
-      let minReader = state.readers.keys.min() ?? UInt64.max
-      return (state.meta, state.meta.reclaimLimit(minReader: minReader))
+      let localMin = state.readers.keys.min() ?? UInt64.max
+      return (state.meta, state.meta.reclaimLimit(minReader: min(localMin, foreignMin)))
     }
     guard let (meta, reclaimLimit) = snapshot else { throw DBError.databaseClosed }
 
