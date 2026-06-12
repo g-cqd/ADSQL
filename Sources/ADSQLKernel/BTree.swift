@@ -233,13 +233,14 @@ public enum BTree {
   /// order, separator bounds, uniform leaf depth, overflow chain lengths.
   /// Returns the set of reachable pages for liveness accounting.
   public static func validate(
-    resolver: some PageResolver, meta: Meta
+    resolver: some PageResolver, meta: Meta, verifyChecksums: Bool = false
   ) throws(DBError) -> ValidationReport {
     var report = ValidationReport()
     if meta.rootPage != 0 {
       try validateNode(
         resolver: resolver, pageNo: meta.rootPage, level: meta.treeDepth,
-        lower: nil, upper: nil, isRoot: true, report: &report)
+        lower: nil, upper: nil, isRoot: true, verifyChecksums: verifyChecksums,
+        report: &report)
     }
     guard report.kvCount == meta.kvCount else {
       throw DBError.integrityFailure(
@@ -251,12 +252,16 @@ public enum BTree {
   private static func validateNode(
     resolver: some PageResolver, pageNo: UInt64, level: UInt16,
     lower: [UInt8]?, upper: [UInt8]?, isRoot: Bool = false,
+    verifyChecksums: Bool = false,
     report: inout ValidationReport
   ) throws(DBError) {
     guard report.reachablePages.insert(pageNo).inserted else {
       throw DBError.integrityFailure("page \(pageNo) reachable twice")
     }
     let page = try resolver.resolvePage(pageNo)
+    if verifyChecksums, !PageHeader.verifyChecksum(page, pageNo: pageNo) {
+      throw DBError.corruptPage(pageNo: pageNo)
+    }
     let count = PageHeader.cellCount(page)
 
     func checkOrderAndBounds() throws(DBError) {
@@ -285,13 +290,15 @@ public enum BTree {
       // leftmost child: (lower, key[0])
       try validateNode(
         resolver: resolver, pageNo: PageHeader.link(page), level: level - 1,
-        lower: lower, upper: [UInt8](Node.branchKey(page, 0)), report: &report)
+        lower: lower, upper: [UInt8](Node.branchKey(page, 0)),
+        verifyChecksums: verifyChecksums, report: &report)
       for i in 0..<count {
         let childLower = [UInt8](Node.branchKey(page, i))
         let childUpper = i + 1 < count ? [UInt8](Node.branchKey(page, i + 1)) : upper
         try validateNode(
           resolver: resolver, pageNo: Node.branchChild(page, i), level: level - 1,
-          lower: childLower, upper: childUpper, report: &report)
+          lower: childLower, upper: childUpper,
+          verifyChecksums: verifyChecksums, report: &report)
       }
       return
     }
@@ -316,6 +323,9 @@ public enum BTree {
           }
           report.overflowPages += 1
           let overflow = try resolver.resolvePage(chainPage)
+          if verifyChecksums, !PageHeader.verifyChecksum(overflow, pageNo: chainPage) {
+            throw DBError.corruptPage(pageNo: chainPage)
+          }
           guard PageHeader.pageType(overflow) == .overflow else {
             throw DBError.corruptPage(pageNo: chainPage)
           }
