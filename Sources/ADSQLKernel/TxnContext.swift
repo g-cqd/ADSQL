@@ -55,6 +55,14 @@ public final class TxnContext: PageResolver, OverflowPager {
   /// once concurrent readers move past this generation.
   public var pendingFree: [UInt64] = []
 
+  /// Group-commit nesting: stacked micro-transactions bump the epoch; pages
+  /// dirtied by earlier requests are cloned on first touch so a failing
+  /// request can restore them (see RequestUndo).
+  var requestEpoch: UInt32 = 0
+  var undoReplaced: [(pageNo: UInt64, previous: PageBuf)] = []
+  var undoAllocated: [UInt64] = []
+  var undoFreedOwned: [(pageNo: UInt64, buf: PageBuf)] = []
+
   public init(source: PageSource, meta: Meta, pool: [UInt64] = []) {
     self.source = source
     self.meta = meta
@@ -75,30 +83,66 @@ public final class TxnContext: PageResolver, OverflowPager {
   public func allocatePage() -> (pageNo: UInt64, buf: PageBuf) {
     let pageNo = allocator.allocate()
     let buf = PageBuf()
+    buf.requestEpoch = requestEpoch
     dirty[pageNo] = buf
+    if requestEpoch != 0 { undoAllocated.append(pageNo) }
     return (pageNo, buf)
   }
 
   /// COW fault-in: returns a mutable buffer for `pageNo`. If the page is
   /// committed, it is copied to a freshly allocated page number (the old one
-  /// goes to pendingFree) — COW-once-per-transaction.
+  /// goes to pendingFree) — COW-once-per-transaction. Under group commit,
+  /// pages owned by an *earlier request* are additionally cloned on first
+  /// touch so the current request can be rolled back alone.
   public func shadow(_ pageNo: UInt64) throws(DBError) -> (pageNo: UInt64, buf: PageBuf) {
-    if let buf = dirty[pageNo] { return (pageNo, buf) }
+    if let buf = dirty[pageNo] {
+      if requestEpoch != 0, buf.requestEpoch != requestEpoch {
+        let clone = PageBuf(copying: buf.readOnly)
+        clone.requestEpoch = requestEpoch
+        dirty[pageNo] = clone
+        undoReplaced.append((pageNo: pageNo, previous: buf))
+        return (pageNo, clone)
+      }
+      return (pageNo, buf)
+    }
     let copy = PageBuf(copying: try source.page(pageNo))
+    copy.requestEpoch = requestEpoch
     let newNo = allocator.allocate()
     dirty[newNo] = copy
     pendingFree.append(pageNo)
+    if requestEpoch != 0 { undoAllocated.append(newNo) }
     return (newNo, copy)
   }
 
   /// Releases a page this transaction no longer references.
   public func freePage(_ pageNo: UInt64) {
-    if dirty.removeValue(forKey: pageNo) != nil {
+    if let buf = dirty.removeValue(forKey: pageNo) {
       // Never visible to anyone: recycle immediately.
       allocator.pool.append(pageNo)
+      if requestEpoch != 0 { undoFreedOwned.append((pageNo: pageNo, buf: buf)) }
     } else {
       pendingFree.append(pageNo)
     }
+  }
+
+  // MARK: - Group-commit request nesting
+
+  /// Starts a new stacked micro-transaction scope.
+  func beginRequestScope() {
+    requestEpoch &+= 1
+    if requestEpoch == 0 { requestEpoch = 1 }
+    undoReplaced.removeAll(keepingCapacity: true)
+    undoAllocated.removeAll(keepingCapacity: true)
+    undoFreedOwned.removeAll(keepingCapacity: true)
+  }
+
+  /// Rolls back everything the current request scope did to the page state.
+  /// Scalar state (meta, pendingFree, pool, highWater) is restored by the
+  /// caller's TxnRestorePoint.
+  func rollbackRequestScope() {
+    for entry in undoReplaced { dirty[entry.pageNo] = entry.previous }
+    for pageNo in undoAllocated { dirty.removeValue(forKey: pageNo) }
+    for entry in undoFreedOwned { dirty[entry.pageNo] = entry.buf }
   }
 
   // MARK: - OverflowPager

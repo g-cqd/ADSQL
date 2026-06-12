@@ -3,6 +3,8 @@
 /// is unique so the backing memory is freed exactly once.
 public final class PageBuf {
   public let raw: UnsafeMutableRawBufferPointer
+  /// Which batch request last gained mutable access (group-commit nesting).
+  var requestEpoch: UInt32 = 0
 
   public init(zeroed: Bool = true) {
     let ptr = UnsafeMutableRawPointer.allocate(

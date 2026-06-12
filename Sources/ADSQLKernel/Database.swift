@@ -40,9 +40,11 @@ public final class Database: Sendable {
   let pager: Pager
   let options: DatabaseOptions
   let shared: Mutex<Shared>
-  /// Writer exclusion: one serial queue; the group-commit writer loop will
-  /// take over enqueueing in a later milestone.
+  /// Writer exclusion: one serial queue shared by `writeSync` and the
+  /// group-commit drain.
   let writeQueue = DispatchQueue(label: "adsql.writer", qos: .userInitiated)
+  /// Queued group-commit requests awaiting the next drain.
+  let pendingWrites = Mutex<[PendingWrite]>([])
 
   private init(channel: FileChannel, pager: Pager, options: DatabaseOptions, meta: Meta) {
     self.channel = channel
