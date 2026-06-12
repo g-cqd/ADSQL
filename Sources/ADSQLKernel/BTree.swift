@@ -17,12 +17,19 @@ public enum BTree {
 
   // MARK: - Lookup
 
+  @inline(__always)
   public static func get(
     resolver: some PageResolver, meta: Meta, key: UnsafeRawBufferPointer
   ) throws(DBError) -> ValueRef? {
-    guard meta.rootPage != 0 else { return nil }
-    var pageNo = meta.rootPage
-    var level = meta.treeDepth
+    try get(resolver: resolver, tree: meta.mainTree, key: key)
+  }
+
+  public static func get(
+    resolver: some PageResolver, tree: TreeHandle, key: UnsafeRawBufferPointer
+  ) throws(DBError) -> ValueRef? {
+    guard tree.rootPage != 0 else { return nil }
+    var pageNo = tree.rootPage
+    var level = tree.depth
     while level > 1 {
       let page = try resolver.resolvePage(pageNo)
       guard PageHeader.pageType(page) == .branch else {
@@ -58,8 +65,18 @@ public enum BTree {
 
   // MARK: - Insert / update
 
+  @inline(__always)
   public static func put(
     ctx: TxnContext, key: UnsafeRawBufferPointer, value: UnsafeRawBufferPointer
+  ) throws(DBError) {
+    var tree = ctx.meta.mainTree
+    try put(ctx: ctx, tree: &tree, key: key, value: value)
+    ctx.meta.mainTree = tree
+  }
+
+  public static func put(
+    ctx: TxnContext, tree: inout TreeHandle,
+    key: UnsafeRawBufferPointer, value: UnsafeRawBufferPointer
   ) throws(DBError) {
     guard !key.isEmpty else { throw DBError.keyEmpty }
     guard key.count <= Format.maxKeySize else { throw DBError.keyTooLarge(key.count) }
@@ -74,23 +91,23 @@ public enum BTree {
     }
 
     // Empty tree: the new leaf is the root.
-    if ctx.meta.rootPage == 0 {
+    if tree.rootPage == 0 {
       let (rootNo, buf) = ctx.allocatePage()
       PageHeader.initialize(buf.raw, type: .leaf)
       _ = Node.leafInsert(buf.raw, at: 0, key: key, value: leafValue)
-      ctx.meta.rootPage = rootNo
-      ctx.meta.treeDepth = 1
-      ctx.meta.kvCount += 1
+      tree.rootPage = rootNo
+      tree.depth = 1
+      tree.count += 1
       return
     }
 
     // Shadow the descent path top-down, repointing parents as pages move.
-    var (currentNo, currentBuf) = try ctx.shadow(ctx.meta.rootPage)
-    ctx.meta.rootPage = currentNo
+    var (currentNo, currentBuf) = try ctx.shadow(tree.rootPage)
+    tree.rootPage = currentNo
     var path: [(buf: PageBuf, slot: Int)] = []
-    path.reserveCapacity(Int(ctx.meta.treeDepth))
+    path.reserveCapacity(Int(tree.depth))
 
-    var level = ctx.meta.treeDepth
+    var level = tree.depth
     while level > 1 {
       let ro = currentBuf.readOnly
       guard PageHeader.pageType(ro) == .branch else {
@@ -124,7 +141,7 @@ public enum BTree {
       }
       Node.removeCell(currentBuf.raw, at: index)
     } else {
-      ctx.meta.kvCount += 1
+      tree.count += 1
     }
 
     if Node.leafInsert(currentBuf.raw, at: index, key: key, value: leafValue) {
@@ -136,13 +153,13 @@ public enum BTree {
     let separator = Node.splitLeafInserting(
       original: currentBuf.readOnly, at: index, key: key, value: leafValue,
       left: currentBuf.raw, right: rightBuf.raw)
-    insertSeparator(ctx, path: path, separator: separator, rightChild: rightNo)
+    insertSeparator(ctx, tree: &tree, path: path, separator: separator, rightChild: rightNo)
   }
 
   /// Propagates a split upward. `path` holds the shadowed branch chain from
   /// the root (exclusive of the split node); all buffers are transaction-owned.
   static func insertSeparator(
-    _ ctx: TxnContext, path: [(buf: PageBuf, slot: Int)],
+    _ ctx: TxnContext, tree: inout TreeHandle, path: [(buf: PageBuf, slot: Int)],
     separator: [UInt8], rightChild: UInt64
   ) {
     var separator = separator
@@ -171,24 +188,32 @@ public enum BTree {
     // Root split: grow the tree by one level.
     let (newRootNo, rootBuf) = ctx.allocatePage()
     PageHeader.initialize(rootBuf.raw, type: .branch)
-    PageHeader.setLink(rootBuf.raw, ctx.meta.rootPage)
+    PageHeader.setLink(rootBuf.raw, tree.rootPage)
     let ok = separator.withUnsafeBytes { sep in
       Node.branchInsert(rootBuf.raw, at: 0, key: sep, child: rightChild)
     }
     precondition(ok, "fresh root must fit one separator")
-    ctx.meta.rootPage = newRootNo
-    ctx.meta.treeDepth += 1
+    tree.rootPage = newRootNo
+    tree.depth += 1
   }
 
   // MARK: - Traversal (tests, integrity, future cursors build on this)
 
   /// In-order traversal of every (key, valueRef) pair.
+  @inline(__always)
   public static func forEach(
     resolver: some PageResolver, meta: Meta,
     _ body: (UnsafeRawBufferPointer, ValueRef) throws(DBError) -> Void
   ) throws(DBError) {
-    guard meta.rootPage != 0 else { return }
-    try walk(resolver: resolver, pageNo: meta.rootPage, level: meta.treeDepth, body)
+    try forEach(resolver: resolver, tree: meta.mainTree, body)
+  }
+
+  public static func forEach(
+    resolver: some PageResolver, tree: TreeHandle,
+    _ body: (UnsafeRawBufferPointer, ValueRef) throws(DBError) -> Void
+  ) throws(DBError) {
+    guard tree.rootPage != 0 else { return }
+    try walk(resolver: resolver, pageNo: tree.rootPage, level: tree.depth, body)
   }
 
   private static func walk(
@@ -232,19 +257,26 @@ public enum BTree {
   /// Full structural check of the tree under `meta`: page types, in-node key
   /// order, separator bounds, uniform leaf depth, overflow chain lengths.
   /// Returns the set of reachable pages for liveness accounting.
+  @inline(__always)
   public static func validate(
     resolver: some PageResolver, meta: Meta, verifyChecksums: Bool = false
   ) throws(DBError) -> ValidationReport {
+    try validate(resolver: resolver, tree: meta.mainTree, verifyChecksums: verifyChecksums)
+  }
+
+  public static func validate(
+    resolver: some PageResolver, tree: TreeHandle, verifyChecksums: Bool = false
+  ) throws(DBError) -> ValidationReport {
     var report = ValidationReport()
-    if meta.rootPage != 0 {
+    if tree.rootPage != 0 {
       try validateNode(
-        resolver: resolver, pageNo: meta.rootPage, level: meta.treeDepth,
+        resolver: resolver, pageNo: tree.rootPage, level: tree.depth,
         lower: nil, upper: nil, isRoot: true, verifyChecksums: verifyChecksums,
         report: &report)
     }
-    guard report.kvCount == meta.kvCount else {
+    guard report.kvCount == tree.count else {
       throw DBError.integrityFailure(
-        "kvCount mismatch: tree has \(report.kvCount), meta says \(meta.kvCount)")
+        "count mismatch: tree has \(report.kvCount), handle says \(tree.count)")
     }
     return report
   }

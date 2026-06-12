@@ -16,9 +16,11 @@ struct CommitReopenTests {
       let pager = try Pager(channel: channel, maxMapSize: 1 << 30)
       for txn in 0..<6 {
         let ctx = TxnContext(source: pager, meta: meta)
+        try FreeList.harvest(ctx: ctx, upTo: meta.generation)
         for op in OpScript.generate(seed: UInt64(txn), count: 300, keySpace: 500, deleteRatio: 20) {
           try KernelOps.apply(op, ctx: ctx, model: &model)
         }
+        try FreeList.serialize(ctx: ctx)
         meta = try Committer.commit(ctx: ctx, channel: channel, durability: .barrier)
         #expect(meta.generation == UInt64(txn) + 1)
       }
@@ -33,6 +35,7 @@ struct CommitReopenTests {
     let pager = try Pager(channel: channel, maxMapSize: 1 << 30)
     let resolver = CommittedResolver(source: pager)
     _ = try BTree.validate(resolver: resolver, meta: meta, verifyChecksums: true)
+    _ = try KernelOps.checkLiveness(resolver, meta)
 
     let scanned = try KernelOps.scanAll(resolver, meta)
     let expected = model.sortedPairs()
@@ -126,12 +129,16 @@ struct CrashInjectionTests {
 
     for txn in 0..<txnCount {
       let ctx = TxnContext(source: pager, meta: meta)
+      // Full production lifecycle: harvest, mutate, serialize, commit —
+      // page reuse under crash is exactly what this harness must prove safe.
+      try FreeList.harvest(ctx: ctx, upTo: meta.generation)
       let ops = OpScript.generate(
         seed: 0xC0FFEE + UInt64(txn), count: opsPerTxn, keySpace: 300,
         deleteRatio: 25, bigValueRatio: 5)
       for op in ops {
         try KernelOps.apply(op, ctx: ctx, model: &model)
       }
+      try FreeList.serialize(ctx: ctx)
       meta = try Committer.commit(ctx: ctx, channel: disk, durability: durability)
       history.modelByGeneration[meta.generation] = model
       history.lastGeneration = meta.generation
@@ -157,6 +164,7 @@ struct CrashInjectionTests {
     let pager = try Pager(channel: channel, maxMapSize: 1 << 30)
     let resolver = CommittedResolver(source: pager)
     _ = try BTree.validate(resolver: resolver, meta: meta, verifyChecksums: true)
+    _ = try KernelOps.checkLiveness(resolver, meta)
 
     let scanned = try KernelOps.scanAll(resolver, meta)
     let want = expected.sortedPairs()

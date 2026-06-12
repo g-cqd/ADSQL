@@ -14,21 +14,31 @@ extension BTree {
   }
 
   /// Returns true when the key existed.
+  @inline(__always)
   public static func delete(
     ctx: TxnContext, key: UnsafeRawBufferPointer
   ) throws(DBError) -> Bool {
+    var tree = ctx.meta.mainTree
+    let existed = try delete(ctx: ctx, tree: &tree, key: key)
+    ctx.meta.mainTree = tree
+    return existed
+  }
+
+  public static func delete(
+    ctx: TxnContext, tree: inout TreeHandle, key: UnsafeRawBufferPointer
+  ) throws(DBError) -> Bool {
     guard !key.isEmpty else { throw DBError.keyEmpty }
     guard key.count <= Format.maxKeySize else { throw DBError.keyTooLarge(key.count) }
-    guard ctx.meta.rootPage != 0 else { return false }
+    guard tree.rootPage != 0 else { return false }
 
     // Existence probe first: missing keys must not shadow anything.
-    guard try get(resolver: ctx, meta: ctx.meta, key: key) != nil else { return false }
+    guard try get(resolver: ctx, tree: tree, key: key) != nil else { return false }
 
-    var (currentNo, currentBuf) = try ctx.shadow(ctx.meta.rootPage)
-    ctx.meta.rootPage = currentNo
+    var (currentNo, currentBuf) = try ctx.shadow(tree.rootPage)
+    tree.rootPage = currentNo
     var path: [PathNode] = []
 
-    var level = ctx.meta.treeDepth
+    var level = tree.depth
     while level > 1 {
       let ro = currentBuf.readOnly
       let slot = Node.branchChildSlot(ro, key: key)
@@ -57,9 +67,11 @@ extension BTree {
       try Overflow.free(head: cell.overflowHead, pager: &pager)
     }
     Node.removeCell(currentBuf.raw, at: index)
-    ctx.meta.kvCount -= 1
+    tree.count -= 1
 
-    try rebalance(ctx, path: path, nodePageNo: currentNo, nodeBuf: currentBuf, level: path.count)
+    try rebalance(
+      ctx, tree: &tree, path: path, nodePageNo: currentNo, nodeBuf: currentBuf,
+      level: path.count)
     return true
   }
 
@@ -76,7 +88,7 @@ extension BTree {
   /// `level == path.count` means `node` is the leaf; otherwise
   /// `path[level]` *is* the node.
   private static func rebalance(
-    _ ctx: TxnContext, path: [PathNode],
+    _ ctx: TxnContext, tree: inout TreeHandle, path: [PathNode],
     nodePageNo: UInt64, nodeBuf: PageBuf, level: Int
   ) throws(DBError) {
     let ro = nodeBuf.readOnly
@@ -87,12 +99,12 @@ extension BTree {
       if isLeaf {
         if PageHeader.cellCount(ro) == 0 {
           ctx.freePage(nodePageNo)
-          ctx.meta.rootPage = 0
-          ctx.meta.treeDepth = 0
+          tree.rootPage = 0
+          tree.depth = 0
         }
       } else if PageHeader.cellCount(ro) == 0 {
-        ctx.meta.rootPage = PageHeader.link(ro)
-        ctx.meta.treeDepth -= 1
+        tree.rootPage = PageHeader.link(ro)
+        tree.depth -= 1
         ctx.freePage(nodePageNo)
       }
       return
@@ -111,7 +123,7 @@ extension BTree {
       // Right sibling exists: (left=node, right=sibling), parent cell slot+1.
       let rightNo = Node.branchChild(parentRO, slot + 1)
       try rebalancePair(
-        ctx, path: path, level: level,
+        ctx, tree: &tree, path: path, level: level,
         leftNo: nodePageNo, leftBuf: nodeBuf, leftIsTarget: true,
         rightNo: rightNo, rightBuf: nil,
         parentCellIndex: slot + 1, isLeaf: isLeaf)
@@ -119,7 +131,7 @@ extension BTree {
       // Only a left sibling: (left=sibling, right=node), parent cell `slot`.
       let leftNo = slot == 0 ? PageHeader.link(parentRO) : Node.branchChild(parentRO, slot - 1)
       try rebalancePair(
-        ctx, path: path, level: level,
+        ctx, tree: &tree, path: path, level: level,
         leftNo: leftNo, leftBuf: nil, leftIsTarget: false,
         rightNo: nodePageNo, rightBuf: nodeBuf,
         parentCellIndex: slot, isLeaf: isLeaf)
@@ -132,7 +144,7 @@ extension BTree {
   /// (underfull) side is `leftIsTarget ? left : right`; its buffer is already
   /// transaction-owned. The sibling's buffer is nil until shadowed on demand.
   private static func rebalancePair(
-    _ ctx: TxnContext, path: [PathNode], level: Int,
+    _ ctx: TxnContext, tree: inout TreeHandle, path: [PathNode], level: Int,
     leftNo: UInt64, leftBuf: PageBuf?, leftIsTarget: Bool,
     rightNo: UInt64, rightBuf: PageBuf?,
     parentCellIndex: Int, isLeaf: Bool
@@ -167,7 +179,7 @@ extension BTree {
       ctx.freePage(rightNo)
       Node.removeCell(parent.buf.raw, at: parentCellIndex)
       try rebalance(
-        ctx, path: path,
+        ctx, tree: &tree, path: path,
         nodePageNo: parent.pageNo, nodeBuf: parent.buf, level: level - 1)
       return
     }
@@ -228,7 +240,7 @@ extension BTree {
     }
 
     replaceSeparator(
-      ctx, path: path, parentLevel: level - 1,
+      ctx, tree: &tree, path: path, parentLevel: level - 1,
       cellIndex: parentCellIndex, newKey: newSeparator)
   }
 
@@ -236,7 +248,7 @@ extension BTree {
   /// preserved). Variable-length keys can overflow the parent — then it
   /// splits like any other branch insert.
   private static func replaceSeparator(
-    _ ctx: TxnContext, path: [PathNode], parentLevel: Int,
+    _ ctx: TxnContext, tree: inout TreeHandle, path: [PathNode], parentLevel: Int,
     cellIndex: Int, newKey: [UInt8]
   ) {
     let parent = path[parentLevel]
@@ -253,7 +265,7 @@ extension BTree {
         left: parent.buf.raw, right: newRightBuf.raw)
     }
     insertSeparator(
-      ctx, path: path[..<parentLevel].map { (buf: $0.buf, slot: $0.slot) },
+      ctx, tree: &tree, path: path[..<parentLevel].map { (buf: $0.buf, slot: $0.slot) },
       separator: upSeparator, rightChild: newRightNo)
   }
 

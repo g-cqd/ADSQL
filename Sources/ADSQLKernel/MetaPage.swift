@@ -15,10 +15,33 @@ public struct Meta: Equatable, Sendable {
   public var kvCount: UInt64
   public var treeDepth: UInt16
   public var flags: UInt16
+  public var freeDepth: UInt16
+  public var freeEntryCount: UInt64
 
   public static let empty = Meta(
     generation: 0, rootPage: 0, freeRootPage: 0,
-    pageCount: Format.firstDataPage, kvCount: 0, treeDepth: 0, flags: 0)
+    pageCount: Format.firstDataPage, kvCount: 0, treeDepth: 0, flags: 0,
+    freeDepth: 0, freeEntryCount: 0)
+
+  /// The user-visible key/value tree.
+  public var mainTree: TreeHandle {
+    get { TreeHandle(rootPage: rootPage, depth: treeDepth, count: kvCount) }
+    set {
+      rootPage = newValue.rootPage
+      treeDepth = newValue.depth
+      kvCount = newValue.count
+    }
+  }
+
+  /// The free-list tree (page reclamation bookkeeping).
+  public var freeTree: TreeHandle {
+    get { TreeHandle(rootPage: freeRootPage, depth: freeDepth, count: freeEntryCount) }
+    set {
+      freeRootPage = newValue.rootPage
+      freeDepth = newValue.depth
+      freeEntryCount = newValue.count
+    }
+  }
 
   /// Which meta page the *next* commit (this meta's generation) writes to.
   @inline(__always)
@@ -35,6 +58,8 @@ public struct Meta: Equatable, Sendable {
     static let kvCount = 48
     static let treeDepth = 56
     static let flags = 58
+    static let freeDepth = 60
+    static let freeEntryCount = 62
     static let reservedEnd = 120
     static let checksum = 120
   }
@@ -56,7 +81,9 @@ public struct Meta: Equatable, Sendable {
     buffer.storeLE64(kvCount, at: Offset.kvCount)
     buffer.storeLE16(treeDepth, at: Offset.treeDepth)
     buffer.storeLE16(flags, at: Offset.flags)
-    for i in (Offset.flags + 2)..<Offset.reservedEnd { buffer[i] = 0 }
+    buffer.storeLE16(freeDepth, at: Offset.freeDepth)
+    buffer.storeLE64(freeEntryCount, at: Offset.freeEntryCount)
+    for i in (Offset.freeEntryCount + 8)..<Offset.reservedEnd { buffer[i] = 0 }
     let digest = XXH64.hash(
       UnsafeRawBufferPointer(rebasing: buffer[0..<Offset.checksum]), seed: pageNo)
     buffer.storeLE64(digest, at: Offset.checksum)
@@ -90,7 +117,9 @@ public struct Meta: Equatable, Sendable {
         pageCount: buffer.loadLE64(Offset.pageCount),
         kvCount: buffer.loadLE64(Offset.kvCount),
         treeDepth: buffer.loadLE16(Offset.treeDepth),
-        flags: buffer.loadLE16(Offset.flags)))
+        flags: buffer.loadLE16(Offset.flags),
+        freeDepth: buffer.loadLE16(Offset.freeDepth),
+        freeEntryCount: buffer.loadLE64(Offset.freeEntryCount)))
   }
 
   public enum DecodeResult: Equatable, Sendable {
@@ -123,4 +152,21 @@ public struct Meta: Equatable, Sendable {
     if results.allSatisfy({ $0 == .notAMeta }) { throw DBError.badMagic }
     throw DBError.bothMetasInvalid
   }
+}
+
+/// Root reference of one COW B+tree within the file. The kernel hosts two
+/// today (main + free-list); the relational layer will host many.
+public struct TreeHandle: Equatable, Sendable {
+  /// 0 = empty tree.
+  public var rootPage: UInt64
+  public var depth: UInt16
+  public var count: UInt64
+
+  public init(rootPage: UInt64, depth: UInt16, count: UInt64) {
+    self.rootPage = rootPage
+    self.depth = depth
+    self.count = count
+  }
+
+  public static let empty = TreeHandle(rootPage: 0, depth: 0, count: 0)
 }

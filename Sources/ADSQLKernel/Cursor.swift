@@ -11,16 +11,20 @@
 /// recreated after further mutations.
 public struct Cursor<R: PageResolver>: ~Copyable {
   @usableFromInline let resolver: R
-  @usableFromInline let meta: Meta
+  @usableFromInline let tree: TreeHandle
   /// One frame per level, root first. Branch frames hold the child position
   /// (-1 = leftmost link); the final frame is the leaf cell index.
   @usableFromInline var stack: [(pageNo: UInt64, index: Int)] = []
   public private(set) var isValid = false
 
   public init(resolver: R, meta: Meta) {
+    self.init(resolver: resolver, tree: meta.mainTree)
+  }
+
+  public init(resolver: R, tree: TreeHandle) {
     self.resolver = resolver
-    self.meta = meta
-    self.stack.reserveCapacity(Int(meta.treeDepth) + 1)
+    self.tree = tree
+    self.stack.reserveCapacity(Int(tree.depth) + 1)
   }
 
   // MARK: - Positioning
@@ -35,10 +39,10 @@ public struct Cursor<R: PageResolver>: ~Copyable {
   public mutating func seek(_ key: UnsafeRawBufferPointer) throws(DBError) -> Bool {
     stack.removeAll(keepingCapacity: true)
     isValid = false
-    guard meta.rootPage != 0 else { return false }
+    guard tree.rootPage != 0 else { return false }
 
-    var pageNo = meta.rootPage
-    var level = meta.treeDepth
+    var pageNo = tree.rootPage
+    var level = tree.depth
     while level > 1 {
       let page = try resolver.resolvePage(pageNo)
       guard PageHeader.pageType(page) == .branch else {
@@ -67,8 +71,8 @@ public struct Cursor<R: PageResolver>: ~Copyable {
   public mutating func move(to edge: Edge) throws(DBError) -> Bool {
     stack.removeAll(keepingCapacity: true)
     isValid = false
-    guard meta.rootPage != 0 else { return false }
-    try descend(from: meta.rootPage, level: meta.treeDepth, edge: edge)
+    guard tree.rootPage != 0 else { return false }
+    try descend(from: tree.rootPage, level: tree.depth, edge: edge)
     let (leafNo, index) = stack[stack.count - 1]
     let leaf = try resolver.resolvePage(leafNo)
     isValid = index >= 0 && index < PageHeader.cellCount(leaf)
@@ -158,7 +162,7 @@ public struct Cursor<R: PageResolver>: ~Copyable {
   /// Pops to the nearest branch with an unvisited sibling in `direction`,
   /// then descends that subtree's near edge. Returns false past either end.
   private mutating func stepLeaf(direction: Int) throws(DBError) -> Bool {
-    let depth = Int(meta.treeDepth)
+    let depth = Int(tree.depth)
     stack.removeLast() // leaf frame
     while !stack.isEmpty {
       let frame = stack[stack.count - 1]

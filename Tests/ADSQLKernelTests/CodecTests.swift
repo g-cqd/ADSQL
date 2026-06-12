@@ -6,7 +6,8 @@ struct MetaCodecTests {
   func makeMeta(generation: UInt64) -> Meta {
     Meta(
       generation: generation, rootPage: 7, freeRootPage: 9,
-      pageCount: 42, kvCount: 12345, treeDepth: 3, flags: 0)
+      pageCount: 42, kvCount: 12345, treeDepth: 3, flags: 0,
+      freeDepth: 2, freeEntryCount: 6)
   }
 
   @Test func roundTrip() {

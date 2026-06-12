@@ -19,6 +19,10 @@ public struct PageAllocator {
   /// Reusable pages harvested from the free-list (older generations whose
   /// readers are gone) plus same-transaction fresh frees.
   public var pool: [UInt64]
+  /// While the free-list serializes itself at commit time, the pool is
+  /// frozen (its contents are being written out) and all allocation comes
+  /// from the high-water mark.
+  public var highWaterOnly = false
 
   public init(highWater: UInt64, pool: [UInt64] = []) {
     self.highWater = highWater
@@ -26,7 +30,7 @@ public struct PageAllocator {
   }
 
   public mutating func allocate() -> UInt64 {
-    if let reused = pool.popLast() { return reused }
+    if !highWaterOnly, let reused = pool.popLast() { return reused }
     defer { highWater += 1 }
     return highWater
   }

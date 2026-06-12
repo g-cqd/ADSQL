@@ -1,10 +1,14 @@
 import Darwin
+import Synchronization
 
 /// POSIX-backed storage channel. All calls are stateless per-fd operations
 /// (`pread`/`pwrite`/`fcntl`), safe to issue from any thread.
 public final class FileChannel: StorageChannel, @unchecked Sendable {
   public let fileDescriptor: Int32
   private let closeOnDeinit: Bool
+  /// Guards against double-close: a second close() on a recycled descriptor
+  /// number would tear down an unrelated file out from under another thread.
+  private let closed = Atomic<Bool>(false)
 
   public enum Mode: Sendable {
     case readOnly
@@ -150,6 +154,9 @@ public final class FileChannel: StorageChannel, @unchecked Sendable {
   }
 
   public func close() {
-    if fileDescriptor >= 0 { _ = Darwin.close(fileDescriptor) }
+    guard fileDescriptor >= 0 else { return }
+    let (exchanged, _) = closed.compareExchange(
+      expected: false, desired: true, ordering: .acquiringAndReleasing)
+    if exchanged { _ = Darwin.close(fileDescriptor) }
   }
 }
