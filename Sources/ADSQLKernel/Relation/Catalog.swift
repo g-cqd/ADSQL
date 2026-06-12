@@ -315,9 +315,9 @@ enum Catalog {
         name, columns: columns, primaryKey: primaryKey, foreignKeys: foreignKeys))
   }
 
-  // IndexRecord layout:
+  // IndexRecord layout (self-contained: single-record fetches need no scan):
   //   u8 recVersion || u32 LE indexId || u32 LE tableId || handle(18)
-  //   || u8 idxFlags(bit0 unique) || u8 colCount || column names
+  //   || u8 idxFlags(bit0 unique) || tableName || u8 colCount || column names
 
   static func encode(_ record: IndexRecord) -> [UInt8] {
     var out: [UInt8] = [recordVersion]
@@ -325,13 +325,14 @@ enum Catalog {
     withUnsafeBytes(of: record.tableId.littleEndian) { out.append(contentsOf: $0) }
     appendHandle(record.handle, to: &out)
     out.append(record.definition.unique ? 1 : 0)
+    appendName(record.definition.table, to: &out)
     out.append(UInt8(record.definition.columns.count))
     for column in record.definition.columns { appendName(column, to: &out) }
     return out
   }
 
   static func decodeIndex(
-    _ bytes: UnsafeRawBufferPointer, name: String, tableName: (UInt32) -> String?
+    _ bytes: UnsafeRawBufferPointer, name: String
   ) throws(DBError) -> IndexRecord {
     var offset = 0
     guard bytes.count >= 1, bytes[0] == recordVersion else {
@@ -346,17 +347,19 @@ enum Catalog {
       littleEndian: bytes.loadUnaligned(fromByteOffset: offset + 4, as: UInt32.self))
     offset += 8
     let handle = try readHandle(bytes, &offset)
-    guard offset + 2 <= bytes.count else {
+    guard offset < bytes.count else {
       throw DBError.integrityFailure("catalog: truncated index flags")
     }
     let unique = bytes[offset] & 1 != 0
-    let colCount = Int(bytes[offset + 1])
-    offset += 2
+    offset += 1
+    let table = try readName(bytes, &offset)
+    guard offset < bytes.count else {
+      throw DBError.integrityFailure("catalog: truncated index column count")
+    }
+    let colCount = Int(bytes[offset])
+    offset += 1
     var columns: [String] = []
     for _ in 0..<colCount { columns.append(try readName(bytes, &offset)) }
-    guard let table = tableName(tableId) else {
-      throw DBError.integrityFailure("catalog: index \(name) references unknown table \(tableId)")
-    }
     return IndexRecord(
       indexId: indexId, tableId: tableId, handle: handle,
       definition: IndexDefinition(name, on: table, columns: columns, unique: unique))

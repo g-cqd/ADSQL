@@ -59,12 +59,136 @@ extension ReadTxn {
     }
     return try Relation.loadState(resolver: resolver, mainTree: meta.mainTree).schema
   }
+
+  func tableRecord(_ name: String) throws(DBError) -> Catalog.TableRecord {
+    guard let record = try Relation.tableRecord(resolver, mainTree: meta.mainTree, name: name)
+    else { throw DBError.noSuchTable(name) }
+    return record
+  }
+
+  func indexRecord(_ name: String) throws(DBError) -> Catalog.IndexRecord {
+    guard let record = try Relation.indexRecord(resolver, mainTree: meta.mainTree, name: name)
+    else { throw DBError.noSuchIndex(name) }
+    return record
+  }
+
+  /// Point lookup by rowid.
+  public func row(in table: String, rowid: Int64) throws(DBError) -> Row? {
+    try Relation.readRow(resolver, table: try tableRecord(table), rowid: rowid)
+  }
+
+  /// Forward scan over a table in rowid order.
+  public func withRowCursor<R>(
+    table: String, _ body: (inout RowCursor<CommittedResolver>) throws(DBError) -> R
+  ) throws(DBError) -> R {
+    var cursor = try RowCursor(
+      resolver: resolver, table: try tableRecord(table), mode: .table,
+      lowerKey: nil, upperKey: nil)
+    return try body(&cursor)
+  }
+
+  /// Forward scan over an index within typed bounds.
+  public func withIndexCursor<R>(
+    index name: String, bounds: IndexBounds = .all,
+    _ body: (inout RowCursor<CommittedResolver>) throws(DBError) -> R
+  ) throws(DBError) -> R {
+    let index = try indexRecord(name)
+    let table = try tableRecord(index.definition.table)
+    let (lower, upper) = try Relation.scanBounds(bounds, index: index, table: table)
+    var cursor = try RowCursor(
+      resolver: resolver, table: table, mode: .index(index),
+      lowerKey: lower, upperKey: upper)
+    return try body(&cursor)
+  }
+
+  /// Unique-style point probe: rowid of the first entry matching all index
+  /// columns exactly.
+  public func firstRowid(index name: String, equals values: [Value]) throws(DBError) -> Int64? {
+    let index = try indexRecord(name)
+    let table = try tableRecord(index.definition.table)
+    return try Relation.firstRowid(resolver, index: index, table: table, equals: values)
+  }
 }
 
 extension WriteTxn {
   /// The schema as seen by this transaction (including its own DDL).
   public func schema() throws(DBError) -> Schema {
     try Relation.ensureState(ctx).schema
+  }
+
+  func tableRecord(_ name: String) throws(DBError) -> Catalog.TableRecord {
+    guard let record = try Relation.ensureState(ctx).tableRecords[name] else {
+      throw DBError.noSuchTable(name)
+    }
+    return record
+  }
+
+  func indexRecord(_ name: String) throws(DBError) -> Catalog.IndexRecord {
+    guard let record = try Relation.ensureState(ctx).indexRecords[name] else {
+      throw DBError.noSuchIndex(name)
+    }
+    return record
+  }
+
+  // MARK: DML
+
+  /// Inserts a row; returns its rowid (nil when `.ignore` skipped a
+  /// conflicting insert). Missing columns take their defaults.
+  @discardableResult
+  public func insert(
+    into table: String, _ values: [String: Value],
+    onConflict: ConflictPolicy = .abort
+  ) throws(DBError) -> Int64? {
+    try Relation.insert(ctx, into: table, values: values, onConflict: onConflict)
+  }
+
+  /// Updates the given columns of one row. Returns false when the rowid
+  /// does not exist.
+  @discardableResult
+  public func update(
+    _ table: String, rowid: Int64, set: [String: Value]
+  ) throws(DBError) -> Bool {
+    try Relation.update(ctx, table: table, rowid: rowid, set: set)
+  }
+
+  /// Deletes one row. Returns false when the rowid does not exist.
+  @discardableResult
+  public func delete(from table: String, rowid: Int64) throws(DBError) -> Bool {
+    try Relation.delete(ctx, from: table, rowid: rowid)
+  }
+
+  // MARK: Reads (through this transaction's own uncommitted state)
+
+  public func row(in table: String, rowid: Int64) throws(DBError) -> Row? {
+    try Relation.readRow(ctx, table: try tableRecord(table), rowid: rowid)
+  }
+
+  public func withRowCursor<R>(
+    table: String, _ body: (inout RowCursor<TxnContext>) throws(DBError) -> R
+  ) throws(DBError) -> R {
+    var cursor = try RowCursor(
+      resolver: ctx, table: try tableRecord(table), mode: .table,
+      lowerKey: nil, upperKey: nil)
+    return try body(&cursor)
+  }
+
+  public func withIndexCursor<R>(
+    index name: String, bounds: IndexBounds = .all,
+    _ body: (inout RowCursor<TxnContext>) throws(DBError) -> R
+  ) throws(DBError) -> R {
+    let index = try indexRecord(name)
+    let table = try tableRecord(index.definition.table)
+    let (lower, upper) = try Relation.scanBounds(bounds, index: index, table: table)
+    var cursor = try RowCursor(
+      resolver: ctx, table: table, mode: .index(index),
+      lowerKey: lower, upperKey: upper)
+    return try body(&cursor)
+  }
+
+  public func firstRowid(index name: String, equals values: [Value]) throws(DBError) -> Int64? {
+    let index = try indexRecord(name)
+    let table = try tableRecord(index.definition.table)
+    return try Relation.firstRowid(ctx, index: index, table: table, equals: values)
   }
 
   /// Creates a table. Transactional and crash-atomic like any other write.

@@ -22,8 +22,6 @@ public struct RelationState: Sendable {
   /// AUTOINCREMENT high-water marks touched this transaction.
   var sequences: [UInt32: UInt64] = [:]
   var sequenceBaselines: [UInt32: UInt64] = [:]
-  /// Per-table next-rowid cache (non-AUTOINCREMENT tables).
-  var nextRowids: [UInt32: Int64] = [:]
   /// Set by DDL: bump catalogVersion at serialization.
   var schemaDirty = false
 
@@ -113,10 +111,8 @@ enum Relation {
       state.tableRecords[name] = record
       state.handleBaselines[.table(record.tableId)] = record.handle
     }
-    var idToName: [UInt32: String] = [:]
-    for (name, record) in state.tableRecords { idToName[record.tableId] = name }
     try scanKind(resolver, mainTree, kind: Catalog.kindIndex) { name, valueBytes throws(DBError) in
-      let record = try Catalog.decodeIndex(valueBytes, name: name) { idToName[$0] }
+      let record = try Catalog.decodeIndex(valueBytes, name: name)
       state.indexRecords[name] = record
       state.handleBaselines[.index(record.indexId)] = record.handle
     }
@@ -260,7 +256,6 @@ enum Relation {
     state.handleBaselines.removeValue(forKey: .table(record.tableId))
     state.sequences.removeValue(forKey: record.tableId)
     state.sequenceBaselines.removeValue(forKey: record.tableId)
-    state.nextRowids.removeValue(forKey: record.tableId)
     state.schemaDirty = true
 
     ctx.meta.mainTree = main
@@ -306,13 +301,39 @@ enum Relation {
     ctx.relation = state
   }
 
-  /// Index backfill over a populated table (implemented with DML in PR3).
-  static func backfillIndex(
-    _ ctx: TxnContext, state: RelationState, table: Catalog.TableRecord,
-    definition: IndexDefinition
-  ) throws(DBError) -> TreeHandle {
-    throw DBError.invalidDefinition(
-      "createIndex on populated table arrives with the DML layer")
+  /// Single-record catalog fetches (read paths avoid full catalog loads).
+  static func tableRecord(
+    _ resolver: some PageResolver, mainTree: TreeHandle, name: String
+  ) throws(DBError) -> Catalog.TableRecord? {
+    guard let bytes = try getBytes(resolver, mainTree, key: Catalog.tableKey(name)) else {
+      return nil
+    }
+    var result: Result<Catalog.TableRecord, DBError> = .failure(.noSuchTable(name))
+    bytes.withUnsafeBytes { raw in
+      do throws(DBError) {
+        result = .success(try Catalog.decodeTable(raw, name: name))
+      } catch {
+        result = .failure(error)
+      }
+    }
+    return try result.get()
+  }
+
+  static func indexRecord(
+    _ resolver: some PageResolver, mainTree: TreeHandle, name: String
+  ) throws(DBError) -> Catalog.IndexRecord? {
+    guard let bytes = try getBytes(resolver, mainTree, key: Catalog.indexKey(name)) else {
+      return nil
+    }
+    var result: Result<Catalog.IndexRecord, DBError> = .failure(.noSuchIndex(name))
+    bytes.withUnsafeBytes { raw in
+      do throws(DBError) {
+        result = .success(try Catalog.decodeIndex(raw, name: name))
+      } catch {
+        result = .failure(error)
+      }
+    }
+    return try result.get()
   }
 
   /// Returns every page of a tree (nodes + overflow) to the transaction.
