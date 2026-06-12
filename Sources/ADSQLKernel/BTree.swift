@@ -239,7 +239,7 @@ public enum BTree {
     if meta.rootPage != 0 {
       try validateNode(
         resolver: resolver, pageNo: meta.rootPage, level: meta.treeDepth,
-        lower: nil, upper: nil, report: &report)
+        lower: nil, upper: nil, isRoot: true, report: &report)
     }
     guard report.kvCount == meta.kvCount else {
       throw DBError.integrityFailure(
@@ -250,7 +250,8 @@ public enum BTree {
 
   private static func validateNode(
     resolver: some PageResolver, pageNo: UInt64, level: UInt16,
-    lower: [UInt8]?, upper: [UInt8]?, report: inout ValidationReport
+    lower: [UInt8]?, upper: [UInt8]?, isRoot: Bool = false,
+    report: inout ValidationReport
   ) throws(DBError) {
     guard report.reachablePages.insert(pageNo).inserted else {
       throw DBError.integrityFailure("page \(pageNo) reachable twice")
@@ -297,6 +298,9 @@ public enum BTree {
 
     guard PageHeader.pageType(page) == .leaf else {
       throw DBError.corruptPage(pageNo: pageNo)
+    }
+    guard isRoot || count >= 1 else {
+      throw DBError.integrityFailure("empty non-root leaf \(pageNo)")
     }
     report.leafCount += 1
     try checkOrderAndBounds()
