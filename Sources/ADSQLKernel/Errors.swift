@@ -33,6 +33,12 @@ public enum DBError: Error, Equatable, Sendable {
   case foreignKeyViolation(table: String)
   case indexKeyTooLarge(index: String, size: Int)
   case invalidDefinition(String)
+
+  // SQL layer
+  case sqlSyntax(message: String, offset: Int)
+  case sqlUnsupported(String)
+  case sqlBind(String)
+  case sqlRuntime(String)
 }
 
 extension DBError: CustomStringConvertible {
@@ -72,6 +78,12 @@ extension DBError: CustomStringConvertible {
     case .indexKeyTooLarge(let index, let size):
       return "encoded key for index \(index) is \(size) bytes (max \(Format.maxKeySize))"
     case .invalidDefinition(let why): return "invalid definition: \(why)"
+    case .sqlSyntax(let message, let offset):
+      return "SQL syntax error at offset \(offset): \(message)"
+    case .sqlUnsupported(let construct):
+      return "SQL construct not supported: \(construct)"
+    case .sqlBind(let why): return "SQL bind error: \(why)"
+    case .sqlRuntime(let why): return "SQL runtime error: \(why)"
     }
   }
 }
