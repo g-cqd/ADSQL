@@ -54,9 +54,11 @@ public final class Database: Sendable {
   let options: DatabaseOptions
   let readerTable: ReaderTable
   let shared: Mutex<Shared>
-  /// Writer exclusion: one serial queue shared by `writeSync` and the
-  /// group-commit drain.
-  let writeQueue = DispatchQueue(label: "adsql.writer", qos: .userInitiated)
+  /// Writer exclusion: one dedicated large-stack serial thread shared by
+  /// `writeSync` and the group-commit drain. Same serial/FIFO contract the
+  /// `adsql.writer` queue had, but its big stack lets recursive trigger
+  /// chains nest far deeper without overflowing (see `WriterThread`).
+  let writerThread: WriterThread
   /// Queued group-commit requests awaiting the next drain.
   let pendingWrites = Mutex<[PendingWrite]>([])
   /// Latest-known schema snapshot, keyed by catalog version (MVCC-correct:
@@ -77,6 +79,21 @@ public final class Database: Sendable {
     self.options = options
     self.readerTable = readerTable
     self.shared = Mutex(Shared(meta: meta))
+    // An idle writer thread costs a control block plus ~1 lazily-committed
+    // stack page; the big reservation is virtual until trigger recursion uses
+    // it. Created here so every handle owns its serial writer for its lifetime.
+    self.writerThread = WriterThread()
+  }
+
+  /// Stops the writer thread. No retain cycle prevents this from running: the
+  /// pthread start-arg references `WriterThread` (via `Unmanaged`), not
+  /// `Database`. A group-commit drain job DOES capture `Database` (`[self]`), so
+  /// the worker can drop the last reference when it frees that closure — meaning
+  /// `deinit` (and this `shutdown()`) may run on the writer thread itself.
+  /// `WriterThread.shutdown()` handles that case by detaching instead of
+  /// self-joining; off the writer thread it joins synchronously.
+  deinit {
+    writerThread.shutdown()
   }
 
   public static func open(
@@ -213,7 +230,7 @@ public final class Database: Sendable {
   ) throws(DBError) -> R {
     guard !options.readOnly else { throw DBError.readOnlyDatabase }
     var result: Result<R, DBError>?
-    writeQueue.sync {
+    writerThread.sync {
       do throws(DBError) {
         result = .success(try performWrite(body))
       } catch {

@@ -172,7 +172,7 @@ extension Database {
   /// newest committed generation.
   public func snapshot(to destination: String) throws(DBError) {
     var result: Result<Void, DBError> = .success(())
-    writeQueue.sync {
+    writerThread.sync {
       let status = path.withCString { src in
         destination.withCString { dst in
           unsafe clonefile(src, dst, 0)

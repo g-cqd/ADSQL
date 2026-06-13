@@ -53,7 +53,7 @@ extension Database {
       return queue.count == 1
     }
     if scheduleDrain {
-      writeQueue.async { [self] in drainPendingWrites() }
+      writerThread.async { [self] in drainPendingWrites() }
     }
   }
 
