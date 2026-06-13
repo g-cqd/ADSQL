@@ -387,6 +387,15 @@ enum Relation {
     return try FTSIndex.nextRowid(ctx, statsHandle: record.stats)
   }
 
+  /// Clears an FTS table's index (the `'delete-all'` command).
+  static func ftsRemoveAll(_ ctx: TxnContext, name: String) throws(DBError) {
+    var state = try ensureState(ctx)
+    guard var record = state.ftsRecords[name] else { throw DBError.noSuchTable(name) }
+    try FTSIndex.removeAll(ctx, record: &record)
+    state.ftsRecords[name] = record
+    ctx.relation = state
+  }
+
   static func createIndex(_ ctx: TxnContext, _ definition: IndexDefinition) throws(DBError) {
     var state = try ensureState(ctx)
     guard state.indexRecords[definition.name] == nil else {

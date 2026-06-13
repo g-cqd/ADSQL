@@ -119,6 +119,17 @@ enum FTSIndex {
     return true
   }
 
+  /// Clears the whole index (`'delete-all'`): frees the three trees and resets
+  /// the record's handles to empty. Global/per-doc stats vanish with the trees.
+  static func removeAll(_ ctx: TxnContext, record: inout Catalog.FTSRecord) throws(DBError) {
+    try Relation.freeTree(ctx, handle: record.dict)
+    try Relation.freeTree(ctx, handle: record.postings)
+    try Relation.freeTree(ctx, handle: record.stats)
+    record.dict = .empty
+    record.postings = .empty
+    record.stats = .empty
+  }
+
   /// Next auto docid: max docid in the stats tree + 1 (1 when empty). The global
   /// `[0x00]` row sorts first, so the last key — when present — is a doc key.
   static func nextRowid(_ resolver: some PageResolver, statsHandle: TreeHandle) throws(DBError) -> Int64 {

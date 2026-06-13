@@ -101,4 +101,95 @@ struct FTSIndexTests {
       try run(db, "INSERT INTO fts(rowid, title) VALUES(6, 'z') RETURNING rowid")
     }
   }
+
+  // MARK: F2c — content modes + the 'delete' idiom
+
+  @Test func externalContentSyncsViaDeleteIdiom() throws {
+    let dir = TempDir()
+    defer { dir.cleanup() }
+    let path = dir.file("ftsext.adsql")
+    do {
+      let db = try Database.open(at: path)
+      defer { db.close() }
+      try run(db, "CREATE VIRTUAL TABLE ft USING fts5(title, content='documents', content_rowid='id')")
+      try run(db, "INSERT INTO ft(rowid, title) VALUES(1, 'alpha beta')")
+      try run(db, "INSERT INTO ft(rowid, title) VALUES(2, 'beta gamma')")
+      try db.writeSync { (txn) throws(DBError) in
+        #expect(try txn.ftsPostings("ft", term: term("beta"))?.map(\.docid) == [1, 2])
+        #expect(try txn.ftsGlobalStats("ft").docCount == 2)
+      }
+      // How the AFTER DELETE trigger will sync: the 'delete' command idiom.
+      try run(db, "INSERT INTO ft(ft, rowid, title) VALUES('delete', 1, 'alpha beta')")
+      try db.writeSync { (txn) throws(DBError) in
+        #expect(try txn.ftsPostings("ft", term: term("beta"))?.map(\.docid) == [2])
+        #expect(try txn.ftsPostings("ft", term: term("alpha")) == nil)
+        #expect(try txn.ftsGlobalStats("ft").docCount == 1)
+      }
+    }
+    let reopened = try Database.open(at: path)
+    defer { reopened.close() }
+    try reopened.writeSync { (txn) throws(DBError) in
+      #expect(try txn.ftsPostings("ft", term: term("beta"))?.map(\.docid) == [2])
+    }
+  }
+
+  @Test func contentlessSyncsViaDeleteIdiom() throws {
+    let dir = TempDir()
+    defer { dir.cleanup() }
+    let db = try Database.open(at: dir.file("ftscl.adsql"))
+    defer { db.close() }
+    try run(db, "CREATE VIRTUAL TABLE ft USING fts5(body, content='', contentless_delete=1)")
+    try run(db, "INSERT INTO ft(rowid, body) VALUES(1, 'hello world')")
+    try run(db, "INSERT INTO ft(rowid, body) VALUES(2, 'world peace')")
+    try run(db, "INSERT INTO ft(ft, rowid, body) VALUES('delete', 1, 'hello world')")
+    try db.writeSync { (txn) throws(DBError) in
+      #expect(try txn.ftsPostings("ft", term: term("world"))?.map(\.docid) == [2])
+      #expect(try txn.ftsPostings("ft", term: term("hello")) == nil)
+      #expect(try txn.ftsGlobalStats("ft").docCount == 1)
+    }
+  }
+
+  @Test func deleteAllClearsIndex() throws {
+    let dir = TempDir()
+    defer { dir.cleanup() }
+    let path = dir.file("ftsall.adsql")
+    do {
+      let db = try Database.open(at: path)
+      defer { db.close() }
+      try run(db, "CREATE VIRTUAL TABLE fts USING fts5(body)")
+      try run(db, "INSERT INTO fts(rowid, body) VALUES(1, 'alpha')")
+      try run(db, "INSERT INTO fts(rowid, body) VALUES(2, 'beta')")
+      try run(db, "INSERT INTO fts(fts) VALUES('delete-all')")
+      try db.writeSync { (txn) throws(DBError) in
+        #expect(try txn.ftsPostings("fts", term: term("alpha")) == nil)
+        #expect(try txn.ftsGlobalStats("fts").docCount == 0)
+      }
+      // The table is reusable after a clear.
+      try run(db, "INSERT INTO fts(rowid, body) VALUES(3, 'gamma')")
+    }
+    let reopened = try Database.open(at: path)
+    defer { reopened.close() }
+    try reopened.writeSync { (txn) throws(DBError) in
+      #expect(try txn.ftsPostings("fts", term: term("gamma"))?.map(\.docid) == [3])
+      #expect(try txn.ftsPostings("fts", term: term("alpha")) == nil)
+    }
+  }
+
+  @Test func idiomDeleteMatchesPlainDeleteAndRejectsUnknownCommand() throws {
+    let dir = TempDir()
+    defer { dir.cleanup() }
+    let db = try Database.open(at: dir.file("ftscmd.adsql"))
+    defer { db.close() }
+    try run(db, "CREATE VIRTUAL TABLE fts USING fts5(title, tokenize='porter unicode61')")
+    try run(db, "INSERT INTO fts(rowid, title) VALUES(1, 'running')")
+    try run(db, "INSERT INTO fts(rowid, title) VALUES(2, 'running')")
+    #expect(throws: DBError.self) { try run(db, "INSERT INTO fts(fts, rowid) VALUES('rebuild', 1)") }
+    // Idiom delete (doc 1) and plain delete (doc 2) leave the index empty.
+    try run(db, "INSERT INTO fts(fts, rowid, title) VALUES('delete', 1, 'running')")
+    try run(db, "DELETE FROM fts WHERE rowid = 2")
+    try db.writeSync { (txn) throws(DBError) in
+      #expect(try txn.ftsPostings("fts", term: term("run")) == nil)
+      #expect(try txn.ftsGlobalStats("fts").docCount == 0)
+    }
+  }
 }

@@ -307,6 +307,10 @@ extension WriteTxn {
     try Relation.ftsNextRowid(ctx, name: table)
   }
 
+  public func ftsRemoveAll(_ table: String) throws(DBError) {
+    try Relation.ftsRemoveAll(ctx, name: table)
+  }
+
   private func ftsRecord(_ name: String) throws(DBError) -> Catalog.FTSRecord {
     guard let record = try Relation.ensureState(ctx).ftsRecords[name] else {
       throw DBError.noSuchTable(name)

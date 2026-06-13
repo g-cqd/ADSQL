@@ -398,6 +398,11 @@ enum Writer {
     guard let definition = try txn.schema().ftsTables[insert.table] else {
       throw DBError.noSuchTable(insert.table)
     }
+    // The fts5 command idiom: a first column named after the table carries a
+    // command ('delete' / 'delete-all') in its value rather than row content.
+    if insert.columns.first == insert.table {
+      return try ftsCommand(insert, txn: txn, params: params)
+    }
     // Map each INSERT column to an FTS column index, or the implicit rowid slot.
     let targetNames = insert.columns.isEmpty ? definition.columns : insert.columns
     var rowidSlot: Int?
@@ -450,6 +455,43 @@ enum Writer {
       for values in try runSelectInTxn(select, txn: txn, params: params) { try indexRow(values) }
     }
     return ([], RunResult(changes: changes, lastInsertRowid: lastRowid))
+  }
+
+  /// The fts5 command idiom (`INSERT INTO fts(fts, …) VALUES('delete'|'delete-all', …)`).
+  /// `'delete'` removes the named rowid (driven by the stored forward record);
+  /// `'delete-all'` clears the index. Other commands are unsupported.
+  private static func ftsCommand(
+    _ insert: SQLInsert, txn: borrowing WriteTxn, params: SQLParameters
+  ) throws(DBError) -> (rows: [SQLRow], result: RunResult) {
+    guard case .values(let rows) = insert.source else {
+      throw DBError.sqlUnsupported("FTS command requires VALUES")
+    }
+    let paramsEnv = SQLEvalEnv.parametersOnly { p throws(DBError) in try params.lookup(p) }
+    let rowidPosition = insert.columns.firstIndex { $0.lowercased() == "rowid" }
+    var changes = 0
+    for rowExprs in rows {
+      guard rowExprs.count == insert.columns.count else {
+        throw DBError.sqlBind("FTS command: \(rowExprs.count) values for \(insert.columns.count) columns")
+      }
+      var values: [Value] = []
+      values.reserveCapacity(rowExprs.count)
+      for expr in rowExprs { values.append(try SQLEval.evaluate(expr, paramsEnv)) }
+      guard case .text(let command) = values[0] else {
+        throw DBError.sqlBind("FTS command must be a text value")
+      }
+      switch command {
+      case "delete":
+        guard let rowidPosition else {
+          throw DBError.sqlBind("FTS 'delete' requires a rowid column")
+        }
+        if try txn.ftsRemove(insert.table, docid: ftsRowid(values[rowidPosition])) { changes += 1 }
+      case "delete-all":
+        try txn.ftsRemoveAll(insert.table)
+      default:
+        throw DBError.sqlUnsupported("FTS command '\(command)'")
+      }
+    }
+    return ([], RunResult(changes: changes, lastInsertRowid: 0))
   }
 
   static func deleteFTS(
