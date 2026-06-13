@@ -28,82 +28,82 @@ public enum PageHeader {
 
   @inline(__always)
   public static func pageType(_ page: UnsafeRawBufferPointer) -> PageType? {
-    PageType(rawValue: page[Offset.pageType])
+    unsafe PageType(rawValue: page[Offset.pageType])
   }
   @inline(__always)
   public static func cellCount(_ page: UnsafeRawBufferPointer) -> Int {
-    Int(page.loadLE16(Offset.cellCount))
+    unsafe Int(page.loadLE16(Offset.cellCount))
   }
   @inline(__always)
   public static func cellAreaStart(_ page: UnsafeRawBufferPointer) -> Int {
-    Int(page.loadLE16(Offset.cellAreaStart))
+    unsafe Int(page.loadLE16(Offset.cellAreaStart))
   }
   @inline(__always)
   public static func fragmentedBytes(_ page: UnsafeRawBufferPointer) -> Int {
-    Int(page.loadLE16(Offset.fragmentedBytes))
+    unsafe Int(page.loadLE16(Offset.fragmentedBytes))
   }
   /// Branch: leftmost child. Overflow: next page in the chain (0 = end).
   @inline(__always)
   public static func link(_ page: UnsafeRawBufferPointer) -> UInt64 {
-    page.loadLE64(Offset.link)
+    unsafe page.loadLE64(Offset.link)
   }
   /// Overflow pages reuse the cellCount field as their payload length.
   @inline(__always)
   public static func overflowDataLen(_ page: UnsafeRawBufferPointer) -> Int {
-    cellCount(page)
+    unsafe cellCount(page)
   }
 
   @inline(__always)
   public static func slotOffset(_ page: UnsafeRawBufferPointer, _ index: Int) -> Int {
-    Int(page.loadLE16(Format.nodeHeaderSize + index * Format.slotSize))
+    unsafe Int(page.loadLE16(Format.nodeHeaderSize + index * Format.slotSize))
   }
 
   /// Free space between the end of the slot array and cellAreaStart.
   @inline(__always)
   public static func freeSpace(_ page: UnsafeRawBufferPointer) -> Int {
-    cellAreaStart(page) - (Format.nodeHeaderSize + cellCount(page) * Format.slotSize)
+    unsafe cellAreaStart(page) - (Format.nodeHeaderSize + cellCount(page) * Format.slotSize)
   }
 
   // MARK: Writes
 
   public static func initialize(_ page: UnsafeMutableRawBufferPointer, type: PageType) {
     precondition(page.count == Format.pageSize)
-    page.initializeMemory(as: UInt8.self, repeating: 0)
-    page[Offset.pageType] = type.rawValue
-    page.storeLE16(UInt16(Format.pageSize), at: Offset.cellAreaStart)
+    unsafe page.initializeMemory(as: UInt8.self, repeating: 0)
+    unsafe page[Offset.pageType] = type.rawValue
+    unsafe page.storeLE16(UInt16(Format.pageSize), at: Offset.cellAreaStart)
   }
 
   @inline(__always)
   public static func setCellCount(_ page: UnsafeMutableRawBufferPointer, _ value: Int) {
-    page.storeLE16(UInt16(value), at: Offset.cellCount)
+    unsafe page.storeLE16(UInt16(value), at: Offset.cellCount)
   }
   @inline(__always)
   public static func setCellAreaStart(_ page: UnsafeMutableRawBufferPointer, _ value: Int) {
-    page.storeLE16(UInt16(value), at: Offset.cellAreaStart)
+    unsafe page.storeLE16(UInt16(value), at: Offset.cellAreaStart)
   }
   @inline(__always)
   public static func setFragmentedBytes(_ page: UnsafeMutableRawBufferPointer, _ value: Int) {
-    page.storeLE16(UInt16(value), at: Offset.fragmentedBytes)
+    unsafe page.storeLE16(UInt16(value), at: Offset.fragmentedBytes)
   }
   @inline(__always)
   public static func setLink(_ page: UnsafeMutableRawBufferPointer, _ value: UInt64) {
-    page.storeLE64(value, at: Offset.link)
+    unsafe page.storeLE64(value, at: Offset.link)
   }
   @inline(__always)
   public static func setSlotOffset(_ page: UnsafeMutableRawBufferPointer, _ index: Int, _ value: Int) {
-    page.storeLE16(UInt16(value), at: Format.nodeHeaderSize + index * Format.slotSize)
+    unsafe page.storeLE16(UInt16(value), at: Format.nodeHeaderSize + index * Format.slotSize)
   }
 
   // MARK: Checksums
 
   /// Stamps the page checksum. Called exactly once per dirty page at commit.
   public static func stampChecksum(_ page: UnsafeMutableRawBufferPointer, pageNo: UInt64) {
-    let body = UnsafeRawBufferPointer(rebasing: UnsafeRawBufferPointer(page)[8...])
-    page.storeLE64(XXH64.hash(body, seed: pageNo), at: Offset.checksum)
+    let body = unsafe UnsafeRawBufferPointer(rebasing: UnsafeRawBufferPointer(page)[8...])
+    unsafe page.storeLE64(XXH64.hash(body, seed: pageNo), at: Offset.checksum)
   }
 
   public static func verifyChecksum(_ page: UnsafeRawBufferPointer, pageNo: UInt64) -> Bool {
-    let body = UnsafeRawBufferPointer(rebasing: page[8...])
-    return page.loadLE64(Offset.checksum) == XXH64.hash(body, seed: pageNo)
+    let body = unsafe UnsafeRawBufferPointer(rebasing: page[8...])
+    return unsafe page.loadLE64(Offset.checksum) == XXH64.hash(body, seed: pageNo)
   }
 }

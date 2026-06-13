@@ -33,7 +33,7 @@ extension StorageChannel {
     var failure: DBError?
     bytes.withUnsafeBytes { raw in
       do throws(DBError) {
-        try pwrite(raw, at: offset)
+        unsafe try pwrite(raw, at: offset)
       } catch {
         failure = error
       }
@@ -47,7 +47,7 @@ extension StorageChannel {
     var failure: DBError?
     out.withUnsafeMutableBytes { raw in
       do throws(DBError) {
-        try pread(into: raw, at: offset)
+        unsafe try pread(into: raw, at: offset)
       } catch {
         failure = error
       }

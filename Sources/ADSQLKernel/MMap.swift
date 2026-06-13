@@ -11,21 +11,21 @@ import Darwin
 /// The database file is never truncated while mapped (free pages are recycled
 /// instead; compaction is an offline copy), which is what makes handing out
 /// borrowed views of mapped pages sound.
-public final class MMap: @unchecked Sendable {
+@safe public final class MMap: @unchecked Sendable {
   public let base: UnsafeRawPointer
   public let capacity: Int
 
   public init(fileDescriptor: Int32, capacity: Int) throws(DBError) {
-    let ptr = mmap(nil, capacity, PROT_READ, MAP_SHARED, fileDescriptor, 0)
-    guard let ptr, ptr != MAP_FAILED else { try throwErrno("mmap(\(capacity))") }
-    self.base = UnsafeRawPointer(ptr)
+    let ptr = unsafe mmap(nil, capacity, PROT_READ, MAP_SHARED, fileDescriptor, 0)
+    guard let ptr = unsafe ptr, unsafe ptr != MAP_FAILED else { try throwErrno("mmap(\(capacity))") }
+    unsafe self.base = UnsafeRawPointer(ptr)
     self.capacity = capacity
     // B+tree descent is random access; don't let read-ahead pollute the cache.
-    _ = madvise(UnsafeMutableRawPointer(mutating: ptr), capacity, MADV_RANDOM)
+    _ = unsafe madvise(UnsafeMutableRawPointer(mutating: ptr), capacity, MADV_RANDOM)
   }
 
   deinit {
-    _ = munmap(UnsafeMutableRawPointer(mutating: base), capacity)
+    _ = unsafe munmap(UnsafeMutableRawPointer(mutating: base), capacity)
   }
 
   /// Borrowed view of one page. The caller must guarantee `pageNo` lies
@@ -34,11 +34,11 @@ public final class MMap: @unchecked Sendable {
   @inline(__always)
   public func pageBytes(_ pageNo: UInt64) -> UnsafeRawBufferPointer {
     let offset = Int(pageNo) * Format.pageSize
-    return UnsafeRawBufferPointer(start: base + offset, count: Format.pageSize)
+    return unsafe UnsafeRawBufferPointer(start: base + offset, count: Format.pageSize)
   }
 
   @inline(__always)
   public func bytes(at offset: Int, count: Int) -> UnsafeRawBufferPointer {
-    UnsafeRawBufferPointer(start: base + offset, count: count)
+    unsafe UnsafeRawBufferPointer(start: base + offset, count: count)
   }
 }

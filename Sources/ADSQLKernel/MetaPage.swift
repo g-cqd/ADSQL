@@ -79,24 +79,24 @@ public struct Meta: Equatable, Sendable {
   public func encode(into buffer: UnsafeMutableRawBufferPointer, pageNo: UInt64) {
     precondition(buffer.count == Format.pageSize)
     Format.magicBytes.withUnsafeBytes { magic in
-      UnsafeMutableRawBufferPointer(rebasing: buffer[Offset.magic..<Offset.formatVersion])
+      unsafe UnsafeMutableRawBufferPointer(rebasing: buffer[Offset.magic..<Offset.formatVersion])
         .copyMemory(from: magic)
     }
-    buffer.storeLE32(Format.formatVersion, at: Offset.formatVersion)
-    buffer.storeLE32(UInt32(Format.pageSize), at: Offset.pageSize)
-    buffer.storeLE64(generation, at: Offset.generation)
-    buffer.storeLE64(rootPage, at: Offset.rootPage)
-    buffer.storeLE64(freeRootPage, at: Offset.freeRootPage)
-    buffer.storeLE64(pageCount, at: Offset.pageCount)
-    buffer.storeLE64(kvCount, at: Offset.kvCount)
-    buffer.storeLE16(treeDepth, at: Offset.treeDepth)
-    buffer.storeLE16(flags, at: Offset.flags)
-    buffer.storeLE16(freeDepth, at: Offset.freeDepth)
-    buffer.storeLE64(freeEntryCount, at: Offset.freeEntryCount)
-    for i in (Offset.freeEntryCount + 8)..<Offset.reservedEnd { buffer[i] = 0 }
-    let digest = XXH64.hash(
+    unsafe buffer.storeLE32(Format.formatVersion, at: Offset.formatVersion)
+    unsafe buffer.storeLE32(UInt32(Format.pageSize), at: Offset.pageSize)
+    unsafe buffer.storeLE64(generation, at: Offset.generation)
+    unsafe buffer.storeLE64(rootPage, at: Offset.rootPage)
+    unsafe buffer.storeLE64(freeRootPage, at: Offset.freeRootPage)
+    unsafe buffer.storeLE64(pageCount, at: Offset.pageCount)
+    unsafe buffer.storeLE64(kvCount, at: Offset.kvCount)
+    unsafe buffer.storeLE16(treeDepth, at: Offset.treeDepth)
+    unsafe buffer.storeLE16(flags, at: Offset.flags)
+    unsafe buffer.storeLE16(freeDepth, at: Offset.freeDepth)
+    unsafe buffer.storeLE64(freeEntryCount, at: Offset.freeEntryCount)
+    for i in (Offset.freeEntryCount + 8)..<Offset.reservedEnd { unsafe buffer[i] = 0 }
+    let digest = unsafe XXH64.hash(
       UnsafeRawBufferPointer(rebasing: buffer[0..<Offset.checksum]), seed: pageNo)
-    buffer.storeLE64(digest, at: Offset.checksum)
+    unsafe buffer.storeLE64(digest, at: Offset.checksum)
   }
 
   /// Strict decode: magic, format version, page size, and checksum must all
@@ -108,18 +108,18 @@ public struct Meta: Equatable, Sendable {
   ) -> DecodeResult {
     precondition(buffer.count >= Format.metaHeaderSize)
     let magicOK = Format.magicBytes.withUnsafeBytes { magic in
-      memcmp(buffer.baseAddress!, magic.baseAddress!, 8) == 0
+      unsafe memcmp(buffer.baseAddress!, magic.baseAddress!, 8) == 0
     }
     guard magicOK else { return .notAMeta }
-    let version = buffer.loadLE32(Offset.formatVersion)
+    let version = unsafe buffer.loadLE32(Offset.formatVersion)
     guard version == Format.formatVersion else { return .unsupportedVersion(version) }
-    let pageSize = buffer.loadLE32(Offset.pageSize)
+    let pageSize = unsafe buffer.loadLE32(Offset.pageSize)
     guard pageSize == UInt32(Format.pageSize) else { return .unsupportedPageSize(pageSize) }
-    let stored = buffer.loadLE64(Offset.checksum)
-    let computed = XXH64.hash(
+    let stored = unsafe buffer.loadLE64(Offset.checksum)
+    let computed = unsafe XXH64.hash(
       UnsafeRawBufferPointer(rebasing: buffer[0..<Offset.checksum]), seed: pageNo)
     guard stored == computed else { return .corrupt }
-    return .valid(
+    return unsafe .valid(
       Meta(
         generation: buffer.loadLE64(Offset.generation),
         rootPage: buffer.loadLE64(Offset.rootPage),
@@ -145,7 +145,7 @@ public struct Meta: Equatable, Sendable {
   public static func recover(
     meta0: UnsafeRawBufferPointer, meta1: UnsafeRawBufferPointer
   ) throws(DBError) -> Meta {
-    let results = [decode(from: meta0, pageNo: 0), decode(from: meta1, pageNo: 1)]
+    let results = unsafe [decode(from: meta0, pageNo: 0), decode(from: meta1, pageNo: 1)]
     // Structural rejections take priority: opening a different format or an
     // incompatible version should say so, not "corrupt".
     for result in results {

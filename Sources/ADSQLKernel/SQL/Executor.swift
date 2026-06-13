@@ -13,7 +13,7 @@
 /// and never copies the whole record. The rowid-alias column reads back from
 /// the rowid, and columns beyond the stored count fall to their schema default
 /// (mirroring `Relation.materializeRow`).
-final class RowSlot {
+@safe final class RowSlot {
   private let columns: [ColumnDefinition]
   private let aliasIndex: Int?
   private(set) var rowid: Int64 = 0

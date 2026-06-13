@@ -3,7 +3,7 @@
 /// mutated in place), so committed pages are never touched and readers on
 /// older generations stay consistent without locks.
 public enum BTree {
-  public enum ValueRef {
+  @safe public enum ValueRef {
     case inline(UnsafeRawBufferPointer)
     case overflow(head: UInt64, length: Int)
 

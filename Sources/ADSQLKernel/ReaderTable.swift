@@ -18,7 +18,7 @@ import Darwin
 /// Writer exclusion: an fcntl(F_SETLK) write lock on header byte 0 held for
 /// the life of a read-write handle. Stale readers (dead pids) are swept by
 /// the writer at transaction start.
-final class ReaderTable: @unchecked Sendable {
+@safe final class ReaderTable: @unchecked Sendable {
   private let fd: Int32
   private let base: UnsafeMutableRawPointer
   private(set) var slotIndex: Int = -1

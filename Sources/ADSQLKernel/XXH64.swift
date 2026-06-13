@@ -32,10 +32,10 @@ public enum XXH64 {
     var h: UInt64
 
     @inline(__always) func u64(_ at: Int) -> UInt64 {
-      UInt64(littleEndian: bytes.loadUnaligned(fromByteOffset: at, as: UInt64.self))
+      unsafe UInt64(littleEndian: bytes.loadUnaligned(fromByteOffset: at, as: UInt64.self))
     }
     @inline(__always) func u32(_ at: Int) -> UInt32 {
-      UInt32(littleEndian: bytes.loadUnaligned(fromByteOffset: at, as: UInt32.self))
+      unsafe UInt32(littleEndian: bytes.loadUnaligned(fromByteOffset: at, as: UInt32.self))
     }
 
     if len >= 32 {
@@ -72,7 +72,7 @@ public enum XXH64 {
       offset += 4
     }
     while offset < len {
-      h ^= UInt64(bytes[offset]) &* p5
+      unsafe h ^= UInt64(bytes[offset]) &* p5
       h = rotl(h, 11) &* p1
       offset += 1
     }
@@ -87,6 +87,6 @@ public enum XXH64 {
 
   @inlinable
   public static func hash(_ bytes: [UInt8], seed: UInt64 = 0) -> UInt64 {
-    bytes.withUnsafeBytes { hash($0, seed: seed) }
+    bytes.withUnsafeBytes { unsafe hash($0, seed: seed) }
   }
 }

@@ -41,7 +41,7 @@ public enum Node {
 
   // MARK: - Cell decoding
 
-  public struct LeafCell {
+  @safe public struct LeafCell {
     public var key: UnsafeRawBufferPointer
     /// Inline payload, or nil when the value lives in an overflow chain.
     public var inlineValue: UnsafeRawBufferPointer?
@@ -153,7 +153,7 @@ public enum Node {
 
   // MARK: - Cell encoding
 
-  public enum LeafValue {
+  @safe public enum LeafValue {
     case inline(UnsafeRawBufferPointer)
     case overflow(head: UInt64, length: UInt32)
 

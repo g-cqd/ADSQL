@@ -34,7 +34,7 @@ public struct Row: Equatable, Sendable {
 ///
 /// Noncopyable and delivered `borrowing`: its bytes are a view into a mapped
 /// page valid only for the callback that receives it, so it cannot escape.
-public struct RowView: ~Copyable {
+@safe public struct RowView: ~Copyable {
   public let rowid: Int64
   let definition: TableDefinition
   let span: UnsafeRawBufferPointer
