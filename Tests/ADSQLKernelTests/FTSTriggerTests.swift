@@ -427,8 +427,58 @@ struct FTSTriggerTests {
     #expect(rows == [[.integer(2)]])
   }
 
+  // MARK: - Deep-but-bounded recursion (the real headroom proof)
+
+  /// (4a) Builds a chain t1→t2→…→t(maxDepth+1) via `maxDepth` AFTER-INSERT
+  /// triggers (each inserts into the next table), then a single INSERT cascades
+  /// through ALL `maxDepth` levels and completes WITHOUT crashing. A stack
+  /// overflow is a hard crash that cannot be caught, so a test that nests to the
+  /// cap and returns is the only real proof the dedicated writer thread's stack
+  /// has the measured headroom. Must pass under both debug and ThreadSanitizer.
+  @Test func deepTriggerChainCompletes() throws {
+    let dir = TempDir()
+    defer { dir.cleanup() }
+    let db = try Database.open(at: dir.file("deepchain.adsql"))
+    defer { db.close() }
+
+    let depth = Int(TriggerEngine.maxDepth)
+    // `depth` chain triggers over `depth + 1` tables: chain_i AFTER INSERT ON
+    // t_i inserts into t_{i+1}. The top-level INSERT into t1 fires chain1 at
+    // triggerDepth 0, chain2 at 1, …, chain(depth) at triggerDepth depth-1 —
+    // the deepest the guard permits before tripping. So the cascade nests the
+    // FULL `maxDepth` executor frames (chain(depth) inserts into t(depth+1),
+    // which has no trigger, so it stops exactly at the cap without tripping it).
+    for i in 1...(depth + 1) {
+      try db.prepare("CREATE TABLE t\(i)(id INTEGER PRIMARY KEY, n INTEGER)").run()
+    }
+    for i in 1...depth {
+      try db.prepare("""
+        CREATE TRIGGER chain\(i) AFTER INSERT ON t\(i) BEGIN
+          INSERT INTO t\(i + 1)(id, n) VALUES(new.id, new.n + 1);
+        END
+        """).run()
+    }
+
+    // One INSERT cascades through every level and returns normally.
+    try db.prepare("INSERT INTO t1(id, n) VALUES(1, 0)").run()
+
+    // Every table received exactly one row; the last carries the accumulated
+    // hop count, proving the cascade ran end to end through all maxDepth levels.
+    for i in 1...(depth + 1) {
+      let count = try db.prepare("SELECT COUNT(*) FROM t\(i)").all()[0][0]
+      #expect(count == .integer(1), "t\(i) should hold exactly one row")
+    }
+    let tail = try db.prepare("SELECT n FROM t\(depth + 1)").all()[0][0]
+    #expect(tail == .integer(Int64(depth)), "tail hop count proves full cascade")
+
+    _ = try db.verifyIntegrity(deep: true)
+  }
+
   // MARK: - Recursion guard
 
+  /// (4b) A self-referential trigger forms an unbounded chain; the depth guard
+  /// must cut it off at `maxDepth` with a clean error AND roll the whole
+  /// statement back (no partial chain persisted).
   @Test func selfReferentialTriggerErrorsRatherThanLooping() throws {
     let dir = TempDir()
     defer { dir.cleanup() }
@@ -436,7 +486,8 @@ struct FTSTriggerTests {
     defer { db.close() }
     try db.prepare("CREATE TABLE t(id INTEGER PRIMARY KEY, n INTEGER)").run()
     // Each INSERT fires a trigger that INSERTs again with a different rowid:
-    // an unbounded chain, which the depth guard must cut off with an error.
+    // an unbounded chain, which the depth guard must cut off with an error at
+    // the new (raised) `maxDepth` rather than overflowing the writer's stack.
     try db.prepare("""
       CREATE TRIGGER loop AFTER INSERT ON t BEGIN
         INSERT INTO t(id, n) VALUES(new.id + 1, new.n + 1);
@@ -451,8 +502,117 @@ struct FTSTriggerTests {
         return
       }
     }
-    // The whole statement rolled back: no partial chain persisted.
+    // The whole statement rolled back: no partial chain persisted, regardless
+    // of how many levels the guard allowed before tripping.
     let count = try db.prepare("SELECT COUNT(*) FROM t").all()[0][0]
     #expect(count == .integer(0))
   }
+}
+
+// MARK: - (4c) Concurrent writer stress
+
+/// Hammers one Database with many concurrent writers via BOTH write paths
+/// (`writeSync` on detached tasks and async `write`) and asserts the
+/// `WriterThread` serial executor preserves the DispatchQueue contract:
+/// mutual exclusion (every write lands; no lost/torn updates) and FIFO/atomic
+/// application (a per-write running counter ends exactly at the write count).
+/// Must be TSan-clean.
+@Suite("Writer thread stress", .serialized)
+struct WriterThreadStressTests {
+  /// Each write reads a counter, increments it, writes it back — all inside one
+  /// exclusive transaction. If the executor ever ran two writes concurrently or
+  /// out of order against the same state, the final counter would fall short.
+  @Test func concurrentWritesStayExclusiveAndComplete() async throws {
+    let dir = TempDir()
+    defer { dir.cleanup() }
+    let db = try Database.open(at: dir.file("stress.adsql"))
+    defer { db.close() }
+
+    let counterKey: [UInt8] = [0xC0]
+    try db.writeSync { (txn) throws(DBError) in
+      try txn.put(counterKey, le64(0))
+    }
+
+    let syncWriters = 8
+    let syncPerWriter = 64
+    let asyncWrites = 256
+    let totalIncrements = syncWriters * syncPerWriter + asyncWrites
+
+    // increment helper, run inside the exclusive write txn.
+    @Sendable func bump(_ txn: borrowing WriteTxn) throws(DBError) {
+      let current = try txn.get(counterKey).map(decodeLE64) ?? 0
+      try txn.put(counterKey, le64(current + 1))
+    }
+
+    try await withThrowingTaskGroup(of: Void.self) { tasks in
+      // Synchronous writers on detached threads (the writeSync path).
+      for _ in 0..<syncWriters {
+        tasks.addTask {
+          for _ in 0..<syncPerWriter {
+            try await Task.detached {
+              try db.writeSync { (txn) throws(DBError) in try bump(txn) }
+            }.value
+          }
+        }
+      }
+      // Async group-commit writers (the write path).
+      for i in 0..<asyncWrites {
+        tasks.addTask {
+          try await db.write { (txn) throws(DBError) in
+            try bump(txn)
+            // Also land a unique key so we can independently count writes.
+            try txn.put(Array("w-\(i)".utf8), [UInt8(i & 0xFF)])
+          }
+        }
+      }
+      try await tasks.waitForAll()
+    }
+
+    // Mutual exclusion + atomicity: no increment was lost.
+    let final = try db.read { (txn) throws(DBError) in
+      try txn.get(counterKey).map(decodeLE64) ?? 0
+    }
+    #expect(final == UInt64(totalIncrements), "lost or torn update: \(final) != \(totalIncrements)")
+
+    // Every async writer's unique key is present (all writes durably landed).
+    let asyncLanded = try db.read { (txn) throws(DBError) in
+      var found = 0
+      for i in 0..<asyncWrites where try txn.contains(Array("w-\(i)".utf8)) { found += 1 }
+      return found
+    }
+    #expect(asyncLanded == asyncWrites)
+
+    _ = try db.verifyIntegrity(deep: true)
+  }
+
+  /// Regression for the writer-thread teardown self-join. A group-commit drain
+  /// captures `Database` strongly (`[self]`), so the worker can drop the last
+  /// reference when it frees that closure — running `Database.deinit` →
+  /// `WriterThread.shutdown()` ON the writer thread. `shutdown()` must detach
+  /// there instead of `pthread_join`-ing itself; otherwise this loop deadlocks.
+  /// Open → one async `write` → drop the handle, many times, so `deinit`
+  /// repeatedly races the in-flight drain's final release on the writer thread.
+  @Test func handleTeardownRacingInFlightDrainDoesNotDeadlock() async throws {
+    let dir = TempDir()
+    defer { dir.cleanup() }
+    for i in 0..<200 {
+      let db = try Database.open(at: dir.file("teardown-\(i).adsql"))
+      try await db.write { (txn) throws(DBError) in try txn.put([0x01], le64(UInt64(i))) }
+      // `db` leaves scope here: its `deinit` races the drain job's `body = nil`
+      // release on the writer thread. A regression would hang on a self-join.
+    }
+  }
+}
+
+private func le64(_ value: UInt64) -> [UInt8] {
+  var v = value.littleEndian
+  return withUnsafeBytes(of: &v) { Array($0) }
+}
+
+private func decodeLE64(_ bytes: [UInt8]) -> UInt64 {
+  var v: UInt64 = 0
+  withUnsafeMutableBytes(of: &v) { dst in
+    dst.copyBytes(from: bytes.prefix(8))
+  }
+  return UInt64(littleEndian: v)
 }

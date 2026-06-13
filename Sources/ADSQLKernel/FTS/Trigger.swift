@@ -21,13 +21,26 @@ struct TriggerFrame: Sendable {
 
 enum TriggerEngine {
   /// Maximum trigger recursion depth — a runaway self-referential trigger trips
-  /// this with a clean error instead of overflowing the stack. SQLite caps at
-  /// 1000, but each level here re-enters the *full* write executor (a far larger
-  /// per-level frame than SQLite's), and the writer runs on a 512 KiB Dispatch
-  /// stack. Measurement puts the overflow ceiling near 20 levels normally and
-  /// ~9 under ThreadSanitizer's inflated frames; 6 sits safely below both while
-  /// dwarfing any real chain (FTS sync is depth 1, multi-hop A→B→C is depth 3).
-  static let maxDepth: UInt32 = 6
+  /// this with a clean error instead of overflowing the stack. Each level
+  /// re-enters the *full* write executor (`fire` → `Writer.execute` → DML →
+  /// `fire`), a far larger per-level frame than SQLite's; the cap is set by the
+  /// writer's stack, not by SQLite parity.
+  ///
+  /// Write execution runs on `WriterThread`, a dedicated pthread with a
+  /// `WriterThread.stackSize` (16 MiB) stack, so depth is decoupled from the
+  /// caller's stack. Measured per-level growth (address-of-local delta between
+  /// consecutive `fire` entries, i.e. one full executor cycle): ~29.0 KiB in a
+  /// debug build, ~33.7 KiB under ThreadSanitizer (the worst case). At depth
+  /// 100 that peaks at ~3.3 MiB under TSan ≈ 20% of the 16 MiB stack — a ~4.9×
+  /// margin (well inside the ≥2.5× budget). The deep-but-bounded test
+  /// (`deepTriggerChainCompletes`) actually nests `maxDepth` levels under both
+  /// debug and TSan and completes, which is the real proof the headroom exists
+  /// (a stack overflow is a hard crash that cannot be caught).
+  ///
+  /// SQLite-parity recursion (1000) is reachable by raising the single
+  /// `WriterThread.stackSize` constant (~128 MiB virtual — lazily committed, so
+  /// it costs nothing until used); it remains a knob.
+  static let maxDepth: UInt32 = 100
 
   /// Fires every AFTER trigger registered for `(table, event)`, in name order,
   /// against the supplied NEW/OLD row. No-op when the table has no such trigger
