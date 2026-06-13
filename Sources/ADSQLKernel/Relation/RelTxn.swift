@@ -357,6 +357,21 @@ extension WriteTxn {
     try FTSMatch.evaluate(FTSQuery.parse(query), record: ftsRecord(table), resolver: ctx)
   }
 
+  /// The bm25f score (F4a) of `docid` for a MATCH query string, under per-column
+  /// `weights` (defaulting to all-ones for plain bm25). Negative: smaller is more
+  /// relevant. Exposed for the scorer unit tests; the SQL `rank`/`bm25()` surface
+  /// computes the same score in the executor.
+  public func ftsScore(
+    _ table: String, _ query: String, weights: [Double]? = nil, docid: Int64
+  ) throws(DBError) -> Double {
+    let record = try ftsRecord(table)
+    let columns = record.definition.columns.count
+    let resolved = weights ?? [Double](repeating: 1.0, count: columns)
+    return try FTSScorer.score(
+      FTSQuery.parse(query), record: record, resolver: ctx, docid: docid,
+      weights: resolved, global: try FTSIndex.globalStats(ctx, record))
+  }
+
   /// Drops a table, its indexes, and every page they own.
   public func dropTable(_ name: String) throws(DBError) {
     try Relation.dropTable(ctx, name: name)
