@@ -59,6 +59,60 @@ extension Relation {
     return (row, explicitRowid)
   }
 
+  /// Like `assembleRow`, but values arrive positionally: `columnSlots[i]` is the
+  /// schema column index `values[i]` targets. Avoids the per-row dictionary —
+  /// `provided[index]` replaces the name lookup `values[column.name]`. The
+  /// caller validates the slots once (a slot out of range traps; INSERT
+  /// validates column names before building slots).
+  static func assembleRowOrdered(
+    table: Catalog.TableRecord, columnSlots: [Int], values: [Value]
+  ) throws(DBError) -> (row: [Value], explicitRowid: Int64?) {
+    let definition = table.definition
+    let aliasIndex = definition.rowidAliasIndex
+    var provided = [Value?](repeating: nil, count: definition.columns.count)
+    for i in columnSlots.indices { provided[columnSlots[i]] = values[i] }
+    var explicitRowid: Int64?
+    var row: [Value] = []
+    row.reserveCapacity(definition.columns.count)
+
+    for (index, column) in definition.columns.enumerated() {
+      var value: Value
+      if let supplied = provided[index] {
+        value = supplied
+      } else {
+        switch column.defaultValue {
+        case .value(let v): value = v
+        case .datetimeNow: value = .text(CivilTime.utcNowString())
+        case nil: value = .null
+        }
+      }
+      if case .real(let d) = value, d.isNaN {
+        value = .null // SQLite stores NaN as NULL
+      }
+      if index == aliasIndex {
+        if case .integer(let id) = value {
+          explicitRowid = id
+        } else if !value.isNull {
+          throw DBError.typeMismatch(
+            table: definition.name, column: column.name,
+            expected: "INTEGER", got: value.typeName)
+        }
+        row.append(.null)
+        continue
+      }
+      if !value.isNull, let type = value.columnType, type != column.type {
+        throw DBError.typeMismatch(
+          table: definition.name, column: column.name,
+          expected: column.type.name, got: value.typeName)
+      }
+      if value.isNull && column.notNull {
+        throw DBError.notNullViolation(table: definition.name, column: column.name)
+      }
+      row.append(value)
+    }
+    return (row, explicitRowid)
+  }
+
   /// Decoded row padded to the schema (missing trailing columns become
   /// DEFAULT/NULL) with the rowid alias filled in.
   static func materializeRow(
@@ -223,11 +277,45 @@ extension Relation {
     _ ctx: TxnContext, into tableName: String, values: [String: Value],
     onConflict: ConflictPolicy
   ) throws(DBError) -> Int64? {
+    let state = try ensureState(ctx)
+    guard let table = state.tableRecords[tableName] else {
+      throw DBError.noSuchTable(tableName)
+    }
+    let (row, explicitRowid) = try assembleRow(table: table, values: values)
+    return try insertCore(
+      ctx, into: tableName, row: row, explicitRowid: explicitRowid, onConflict: onConflict)
+  }
+
+  /// Inserts column-ordered values without building a name→value dictionary.
+  /// `columnSlots[i]` is the schema column index that `values[i]` targets
+  /// (computed once per statement by the caller); columns no slot points at
+  /// take their defaults. Same semantics as `insert(_:into:values:)`.
+  static func insertAssembled(
+    _ ctx: TxnContext, into tableName: String, columnSlots: [Int], values: [Value],
+    onConflict: ConflictPolicy
+  ) throws(DBError) -> Int64? {
+    let state = try ensureState(ctx)
+    guard let table = state.tableRecords[tableName] else {
+      throw DBError.noSuchTable(tableName)
+    }
+    let (row, explicitRowid) = try assembleRowOrdered(
+      table: table, columnSlots: columnSlots, values: values)
+    return try insertCore(
+      ctx, into: tableName, row: row, explicitRowid: explicitRowid, onConflict: onConflict)
+  }
+
+  /// Conflict resolution + record/index writes shared by every insert form.
+  /// `row` is fully assembled (defaults, types, NaN→NULL already applied) and
+  /// `explicitRowid` is set iff the caller supplied the rowid-alias column.
+  private static func insertCore(
+    _ ctx: TxnContext, into tableName: String, row: [Value], explicitRowid: Int64?,
+    onConflict: ConflictPolicy
+  ) throws(DBError) -> Int64? {
     var state = try ensureState(ctx)
     guard var table = state.tableRecords[tableName] else {
       throw DBError.noSuchTable(tableName)
     }
-    var (row, explicitRowid) = try assembleRow(table: table, values: values)
+    var row = row
 
     let rowid: Int64
     if let explicitRowid {

@@ -120,8 +120,10 @@ public struct RelationalModelStore: Sendable {
     into name: String, _ values: [String: Value], onConflict: ConflictPolicy
   ) -> Outcome {
     guard var table = tables[name],
-      var (row, explicit) = assemble(table: name, values: values)
+      let assembled = assemble(table: name, values: values)
     else { return .ignored }
+    var row = assembled.row
+    let explicit = assembled.explicitRowid
 
     let rowid: Int64
     if let explicit {

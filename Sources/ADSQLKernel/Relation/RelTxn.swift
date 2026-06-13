@@ -216,6 +216,18 @@ extension WriteTxn {
     try Relation.insert(ctx, into: table, values: values, onConflict: onConflict)
   }
 
+  /// Inserts positionally: `columnSlots[i]` is the schema column index that
+  /// `values[i]` targets (compute once per statement). Skips the name→value
+  /// dictionary; same defaults/typing/conflict semantics as `insert`.
+  @discardableResult
+  public func insertAssembled(
+    into table: String, columnSlots: [Int], values: [Value],
+    onConflict: ConflictPolicy = .abort
+  ) throws(DBError) -> Int64? {
+    try Relation.insertAssembled(
+      ctx, into: table, columnSlots: columnSlots, values: values, onConflict: onConflict)
+  }
+
   /// Updates the given columns of one row. Returns false when the rowid
   /// does not exist.
   @discardableResult

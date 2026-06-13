@@ -53,6 +53,7 @@ struct SQLInsertTests {
       "INSERT INTO items(id, key, name) VALUES(1, 'a', 'Alpha')",
       "INSERT INTO items(id, key, name) VALUES(2, 'b', 'Beta'), (3, 'c', 'Gamma')",
       "INSERT INTO items VALUES(4, 'd', 'Delta', 7)",
+      "INSERT INTO items(key, qty, id) VALUES('f', 9, 7)",  // columns out of schema order
       "INSERT INTO items(id, key) VALUES(5, 'e')",  // qty defaults to 0
       "INSERT OR IGNORE INTO items(id, key, name) VALUES(6, 'a', 'dup')",  // key conflict → skipped
       "INSERT OR REPLACE INTO items(id, key, name) VALUES(99, 'b', 'Beta2')",  // replaces key 'b'
@@ -151,5 +152,60 @@ struct SQLInsertTests {
     }
     // The aborted statement left no trace.
     #expect(try db.prepare("SELECT COUNT(*) FROM items").all()[0].values == [.integer(1)])
+  }
+
+  /// `insertAssembled` (positional, no dictionary) is byte-for-byte equivalent
+  /// to the dictionary `insert`: same defaults, column reordering, rowid-alias
+  /// auto-assignment, and NaN→NULL. The SQL INSERT path now routes through it,
+  /// but this pins the relational API directly.
+  @Test func insertAssembledMatchesDictInsert() throws {
+    let dir = TempDir()
+    defer { dir.cleanup() }
+    let dictDB = try Database.open(at: dir.file("dict.adsql"))
+    let asmDB = try Database.open(at: dir.file("asm.adsql"))
+    defer { dictDB.close(); asmDB.close() }
+    for db in [dictDB, asmDB] {
+      try db.writeSync { (txn) throws(DBError) in
+        try txn.createTable(InsertFixture.definition)
+        try txn.createIndex(
+          IndexDefinition("u_key", on: "items", columns: ["key"], unique: true))
+      }
+    }
+
+    let def = InsertFixture.definition
+    let rows: [(cols: [String], vals: [Value])] = [
+      (["id", "key", "name", "qty"], [.integer(1), .text("a"), .text("Alpha"), .integer(5)]),
+      (["key", "qty", "id"], [.text("b"), .integer(9), .integer(2)]),  // reordered
+      (["id", "key"], [.integer(3), .text("c")]),  // qty defaults to 0
+      (["key", "name"], [.text("d"), .text("Delta")]),  // id auto-assigned
+      (["id", "key", "qty"], [.integer(5), .text("e"), .real(.nan)]),  // NaN → NULL
+    ]
+    for row in rows {
+      var dict: [String: Value] = [:]
+      for (i, name) in row.cols.enumerated() { dict[name] = row.vals[i] }
+      let slots = row.cols.map { def.columnIndex(of: $0)! }
+      let dictRowid = try dictDB.writeSync { (txn) throws(DBError) in
+        try txn.insert(into: "items", dict)
+      }
+      let asmRowid = try asmDB.writeSync { (txn) throws(DBError) in
+        try txn.insertAssembled(into: "items", columnSlots: slots, values: row.vals)
+      }
+      #expect(dictRowid == asmRowid, "\(row.cols)")
+    }
+
+    func dump(_ db: Database) throws -> [[Value]] {
+      try db.prepare("SELECT id, key, name, qty FROM items ORDER BY id").all().map(\.values)
+    }
+    #expect(try dump(dictDB) == dump(asmDB))
+
+    // Error parity: NOT NULL (key omitted) and type mismatch (text into id).
+    for db in [dictDB, asmDB] {
+      #expect(throws: DBError.self) {
+        try db.writeSync { (txn) throws(DBError) in
+          try txn.insertAssembled(
+            into: "items", columnSlots: [def.columnIndex(of: "id")!], values: [.integer(9)])
+        }
+      }
+    }
   }
 }

@@ -89,8 +89,13 @@ enum Writer {
     }
 
     let columnNames = insert.columns.isEmpty ? definition.columns.map(\.name) : insert.columns
-    for name in columnNames where definition.columnIndex(of: name) == nil {
-      throw DBError.noSuchColumn(table: insert.table, column: name)
+    var columnSlots: [Int] = []
+    columnSlots.reserveCapacity(columnNames.count)
+    for name in columnNames {
+      guard let slot = definition.columnIndex(of: name) else {
+        throw DBError.noSuchColumn(table: insert.table, column: name)
+      }
+      columnSlots.append(slot)
     }
 
     let paramsEnv = SQLEvalEnv.parametersOnly { p throws(DBError) in try params.lookup(p) }
@@ -114,16 +119,19 @@ enum Writer {
         throw DBError.sqlBind(
           "\(rowValues.count) values for \(columnNames.count) columns in INSERT")
       }
-      var values: [String: Value] = [:]
-      for (index, value) in rowValues.enumerated() { values[columnNames[index]] = value }
       if let upsert {
+        var values: [String: Value] = [:]
+        for (index, value) in rowValues.enumerated() { values[columnNames[index]] = value }
         try applyUpsert(
           values, target: upsert.target, sets: upsert.sets, table: insert.table,
           definition: definition, schema: schema, txn: txn, params: params,
           changes: &changes, lastRowid: &lastRowid, record: recordReturning)
         return
       }
-      guard let rowid = try txn.insert(into: insert.table, values, onConflict: conflict) else {
+      guard
+        let rowid = try txn.insertAssembled(
+          into: insert.table, columnSlots: columnSlots, values: rowValues, onConflict: conflict)
+      else {
         return  // OR IGNORE skipped a conflicting row
       }
       changes += 1
