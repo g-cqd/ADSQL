@@ -188,7 +188,9 @@ public enum FreeList {
     // converges immediately.
     while try drainPendingFree() {
       rounds += 1
-      precondition(rounds <= 8, "free-list serialization did not converge")
+      guard rounds <= 8 else {
+        throw DBError.integrityFailure("free-list serialization did not converge (phase 1)")
+      }
     }
 
     // Phase 2: freeze the pool and persist the leftover as generation 0
@@ -208,7 +210,9 @@ public enum FreeList {
     }
     while try drainPendingFree() {
       rounds += 1
-      precondition(rounds <= 12, "free-list serialization did not converge")
+      guard rounds <= 12 else {
+        throw DBError.integrityFailure("free-list serialization did not converge (phase 2)")
+      }
     }
 
     ctx.meta.freeTree = free

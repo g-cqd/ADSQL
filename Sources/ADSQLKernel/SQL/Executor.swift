@@ -754,13 +754,15 @@ enum SelectExecutor {
     }
     if compound.limit != nil || compound.offset != nil {
       let env = SQLEvalEnv.parametersOnly { p throws(DBError) in try params.lookup(p) }
+      // Cap so `lower + limit` below can't overflow (Swift `+` traps).
+      let bound = Int.max / 4
       var offset = 0
       if let offsetExpr = compound.offset, let value = try boundValue(offsetExpr, env), value > 0 {
-        offset = Int(clamping: value)
+        offset = min(Int(clamping: value), bound)
       }
       var limit: Int?
       if let limitExpr = compound.limit, let value = try boundValue(limitExpr, env), value >= 0 {
-        limit = Int(clamping: value)
+        limit = min(Int(clamping: value), bound)
       }
       let lower = min(offset, result.count)
       let upper = limit.map { min(lower + $0, result.count) } ?? result.count
@@ -899,11 +901,15 @@ enum SelectExecutor {
     guard plan.limit != nil || plan.offset != nil else { return nil }
     let env = SQLEvalEnv.parametersOnly { parameter throws(DBError) in try params.lookup(parameter) }
 
+    // Cap each at Int.max/4 so downstream `offset + limit` / `lower + limit`
+    // additions can never overflow (Swift `+` traps on overflow). The cap is
+    // ~2.3×10^18 — unbounded for any real dataset, so behavior is unchanged.
+    let bound = Int.max / 4
     var limit: Int?
     if let limitExpr = plan.limit {
       // SQLite: NULL or negative LIMIT means unbounded.
       if let value = try boundValue(limitExpr, env), value >= 0 {
-        limit = Int(clamping: value)
+        limit = min(Int(clamping: value), bound)
       } else {
         limit = nil
       }
@@ -911,7 +917,7 @@ enum SelectExecutor {
     var offset = 0
     if let offsetExpr = plan.offset {
       if let value = try boundValue(offsetExpr, env), value > 0 {
-        offset = Int(clamping: value)
+        offset = min(Int(clamping: value), bound)
       }
     }
     return (offset, limit)

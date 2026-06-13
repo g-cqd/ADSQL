@@ -256,6 +256,18 @@ struct SQLSelectTests {
     #expect(all.dropFirst().allSatisfy { $0.header === all[0].header })
   }
 
+  @Test func extremeLimitOffsetDoesNotTrap() throws {
+    let dir = TempDir()
+    defer { dir.cleanup() }
+    let (db, _) = try DocsFixture.make(dir, "limit-overflow.adsql")
+    defer { db.close() }
+    // `offset + limit` would overflow-trap unsanitized; the bind-site clamp
+    // keeps these safe. Offset past the end → no rows; huge limit → all rows.
+    let maxInt = "9223372036854775807"
+    #expect(try db.prepare("SELECT id FROM docs LIMIT \(maxInt) OFFSET \(maxInt)").all().isEmpty)
+    #expect(try db.prepare("SELECT id FROM docs LIMIT \(maxInt)").all().count == 30)
+  }
+
   @Test func parameterBinding() throws {
     let dir = TempDir()
     defer { dir.cleanup() }

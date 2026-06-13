@@ -25,6 +25,17 @@ struct SQLParserStatementTests {
     if case .expr(let e, _, _) = s.columns[2] { #expect(e == .literal(.blob([]))) }
   }
 
+  @Test func deeplyNestedExpressionRejectedNotOverflow() throws {
+    // Hostile nesting must fail with a syntax error, never overflow the stack.
+    // (Manual do/catch — `#expect(throws: DBError.self)` hits the Swift 6.4
+    // typed-throws cast miscompile noted at the top of this file.)
+    let n = 5000
+    let sql = "SELECT " + String(repeating: "(", count: n) + "1" + String(repeating: ")", count: n)
+    var threw = false
+    do { _ = try parse(sql) } catch { threw = true }
+    #expect(threw)
+  }
+
   @Test func selectCoreShapes() throws {
     let s = try selectOf("""
       SELECT d.id, d.key AS path, COALESCE(r.display_name, d.framework) framework

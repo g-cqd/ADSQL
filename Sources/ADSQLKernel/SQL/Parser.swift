@@ -5,6 +5,21 @@ struct SQLParser {
   let sql: [UInt8]
   let tokens: [SQLToken]
   var pos = 0
+  /// Bounds recursive-descent expression nesting so hostile input
+  /// (`((((…))))`, `NOT NOT …`, `- - …`) fails with a syntax error instead of
+  /// overflowing the stack.
+  var exprDepth = 0
+  /// Conservative so the deepest legal nesting is safe even on a small
+  /// (512 KiB Dispatch-thread) stack in a debug build, where each nesting
+  /// level spends ~a dozen precedence-chain frames. Ample for real SQL.
+  static let maxExprDepth = 24
+
+  mutating func enterExprNesting() throws(DBError) {
+    exprDepth += 1
+    guard exprDepth <= Self.maxExprDepth else {
+      throw DBError.sqlSyntax(message: "expression nesting too deep", offset: current.offset)
+    }
+  }
 
   static func parseScript(_ sql: String) throws(DBError) -> [SQLStatementAST] {
     var parser = SQLParser(sql: Array(sql.utf8), tokens: try SQLLexer.tokenize(sql))
@@ -756,7 +771,9 @@ struct SQLParser {
   // MARK: - Expressions (precedence climbing)
 
   mutating func expression() throws(DBError) -> SQLExpr {
-    try orExpr()
+    try enterExprNesting()
+    defer { exprDepth -= 1 }
+    return try orExpr()
   }
 
   mutating func orExpr() throws(DBError) -> SQLExpr {
@@ -777,6 +794,8 @@ struct SQLParser {
 
   mutating func notExpr() throws(DBError) -> SQLExpr {
     if matchKeyword("NOT") {
+      try enterExprNesting()
+      defer { exprDepth -= 1 }
       return .unary(.not, try notExpr())
     }
     return try equality()
@@ -943,9 +962,15 @@ struct SQLParser {
         if let v = Int64("-" + text) { return .literal(.integer(v)) }
         return .literal(.real(-(Double(text) ?? 0)))
       }
+      try enterExprNesting()
+      defer { exprDepth -= 1 }
       return .unary(.negate, try unary())
     }
-    if matchSymbol("+") { return try unary() }
+    if matchSymbol("+") {
+      try enterExprNesting()
+      defer { exprDepth -= 1 }
+      return try unary()
+    }
     return try primary()
   }
 

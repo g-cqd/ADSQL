@@ -78,6 +78,10 @@ import Darwin
       holdsWriterLock = true
     }
 
+    // Reclaim slots left by crashed processes before claiming our own, so a
+    // pure read-only deployment (which never runs the writer-side sweep) can't
+    // be locked out by stale slots after a crash.
+    sweepStaleSlots()
     try claimSlot()
   }
 
