@@ -122,6 +122,54 @@ public struct RowCursor<R: PageResolver>: ~Copyable {
     return (entry.rowid, recordBytes)
   }
 
+  /// Zero-copy push iteration: invokes `body(rowid, recordSpan)` for each row
+  /// in bounds, where `recordSpan` is a view into the mapped page valid only
+  /// for that call (no per-row record copy for inline values; overflow values
+  /// are assembled once and spanned). `body` returns false to stop early.
+  public mutating func forEachRecordSpan(
+    _ body: (Int64, UnsafeRawBufferPointer) throws(DBError) -> Bool
+  ) throws(DBError) {
+    while !exhausted {
+      let step: Bool? = try cursor.withCurrent { (key, ref) throws(DBError) -> Bool? in
+        if let upperKey {
+          let inBounds = upperKey.withUnsafeBytes { upper in
+            Node.compare(key, UnsafeRawBufferPointer(rebasing: upper[...])) < 0
+          }
+          guard inBounds else { return nil }  // past the upper bound: stop
+        }
+        guard let rowid = KeyCodec.rowid(fromSuffixOf: key) else {
+          throw DBError.integrityFailure("malformed key in \(table.definition.name)")
+        }
+        switch mode {
+        case .table:
+          return try BTree.withValueBytes(ref, resolver: resolver) { span throws(DBError) in
+            try body(rowid, span)
+          }
+        case .index:
+          let proceed: Bool? = try Relation.withRowValue(
+            resolver, table.handle, key: KeyCodec.rowKey(rowid)
+          ) { rowRef throws(DBError) in
+            try BTree.withValueBytes(rowRef, resolver: resolver) { span throws(DBError) in
+              try body(rowid, span)
+            }
+          }
+          guard let proceed else {
+            throw DBError.integrityFailure(
+              "dangling index entry: \(table.definition.name) rowid \(rowid)")
+          }
+          return proceed
+        }
+      } ?? nil
+
+      guard let proceed = step else {
+        exhausted = true  // cursor invalid or past the bound
+        return
+      }
+      if !proceed { return }  // body requested early-exit
+      exhausted = !(try cursor.next())
+    }
+  }
+
   /// The next fully materialized row, or nil at the end of the bounds.
   public mutating func next() throws(DBError) -> Row? {
     guard let (rowid, recordBytes) = try nextRecord() else { return nil }

@@ -63,6 +63,31 @@ public enum BTree {
     }
   }
 
+  /// Zero-copy access to a value's bytes: an inline value is handed to `body`
+  /// as the mapped page span directly; an overflow value is assembled once and
+  /// spanned. The span is valid only for the duration of `body`.
+  public static func withValueBytes<R>(
+    _ ref: ValueRef, resolver: some PageResolver,
+    _ body: (UnsafeRawBufferPointer) throws(DBError) -> R
+  ) throws(DBError) -> R {
+    switch ref {
+    case .inline(let bytes):
+      return try body(bytes)
+    case .overflow(let head, let length):
+      let assembled = try Overflow.read(
+        head: head, length: length, pager: ReadOnlyOverflowPager(resolver: resolver))
+      var result: Result<R, DBError>?
+      assembled.withUnsafeBytes { raw in
+        do throws(DBError) {
+          result = .success(try body(raw))
+        } catch {
+          result = .failure(error)
+        }
+      }
+      return try result!.get()
+    }
+  }
+
   // MARK: - Insert / update
 
   @inline(__always)

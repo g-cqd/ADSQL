@@ -71,6 +71,26 @@ enum Relation {
     return try result.get()
   }
 
+  /// Zero-copy point read: looks up `key` and hands its value to `body` as a
+  /// mapped page span (no record copy); returns nil when the key is absent.
+  /// The span is valid only for the duration of `body`.
+  static func withRowValue<R>(
+    _ resolver: some PageResolver, _ tree: TreeHandle, key: [UInt8],
+    _ body: (BTree.ValueRef) throws(DBError) -> R
+  ) throws(DBError) -> R? {
+    var result: Result<R?, DBError> = .success(nil)
+    key.withUnsafeBytes { keyBytes in
+      do throws(DBError) {
+        if let ref = try BTree.get(resolver: resolver, tree: tree, key: keyBytes) {
+          result = .success(try body(ref))
+        }
+      } catch {
+        result = .failure(error)
+      }
+    }
+    return try result.get()
+  }
+
   static func getBytes(
     _ resolver: some PageResolver, _ tree: TreeHandle, key: [UInt8]
   ) throws(DBError) -> [UInt8]? {

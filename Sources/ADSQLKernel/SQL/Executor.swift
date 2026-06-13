@@ -5,17 +5,19 @@
 /// null-extends LEFT non-matches and applies ON during matching, WHERE after.
 /// Results are fully materialized before the transaction closure returns.
 
-/// On-demand row view over copied record bytes. Decodes a column only when
-/// the evaluator asks for it and caches the result, so a scan that filters on
-/// one column never pays to materialize the rest of a rejected row. The
-/// rowid-alias column reads back from the rowid, and columns beyond the
-/// stored count fall to their schema default (mirroring
-/// `Relation.materializeRow`).
+/// On-demand row view over a record's bytes *in place* — the bytes are an
+/// `UnsafeRawBufferPointer` into the mapped page (or dirty page buffer), set
+/// per row by `load` and valid only for the current scan-body scope. Decodes a
+/// column only when the evaluator asks for it and caches the result, so a scan
+/// that filters on one column never materializes the rest of a rejected row,
+/// and never copies the whole record. The rowid-alias column reads back from
+/// the rowid, and columns beyond the stored count fall to their schema default
+/// (mirroring `Relation.materializeRow`).
 final class RowSlot {
   private let columns: [ColumnDefinition]
   private let aliasIndex: Int?
   private(set) var rowid: Int64 = 0
-  private var record: [UInt8] = []
+  private var span = UnsafeRawBufferPointer(start: nil, count: 0)
   private var offsets: [Int]?
   private var cache: [Value?]
 
@@ -25,10 +27,12 @@ final class RowSlot {
     self.cache = Array(repeating: nil, count: table.columns.count)
   }
 
-  /// Re-points the slot at a new row; clears the per-column decode cache.
-  func load(rowid: Int64, record: [UInt8]) {
+  /// Re-points the slot at a new row's record span; clears the decode cache.
+  /// The span must stay valid for as long as the slot is read (the scan driver
+  /// guarantees this within the per-row body).
+  func load(rowid: Int64, span: UnsafeRawBufferPointer) {
     self.rowid = rowid
-    self.record = record
+    self.span = span
     self.offsets = nil
     for index in cache.indices { cache[index] = nil }
   }
@@ -58,29 +62,12 @@ final class RowSlot {
       case .datetimeNow, nil: return .null
       }
     }
-    let start = offsets[index]
-    var result: Result<Value, DBError> = .success(.null)
-    record.withUnsafeBytes { raw in
-      do throws(DBError) {
-        result = .success(try RecordCodec.decodeCell(raw, at: start))
-      } catch {
-        result = .failure(error)
-      }
-    }
-    return try result.get()
+    return try RecordCodec.decodeCell(span, at: offsets[index])
   }
 
   private func ensureOffsets() throws(DBError) -> [Int] {
     if let offsets { return offsets }
-    var result: Result<[Int], DBError> = .success([])
-    record.withUnsafeBytes { raw in
-      do throws(DBError) {
-        result = .success(try RecordCodec.cellOffsets(raw))
-      } catch {
-        result = .failure(error)
-      }
-    }
-    let computed = try result.get()
+    let computed = try RecordCodec.cellOffsets(span)
     offsets = computed
     return computed
   }
@@ -139,8 +126,8 @@ enum SelectExecutor {
       context: context, env: env, residual: plan.whereExpr, outputs: plan.outputs,
       orderBy: plan.orderBy, collectKeys: collectKeys, sliceEnd: sliceEnd,
       dedupRowids: dedupRowids)
-    try forEachRow(source, table: table, resolver: resolver) { rowid, record throws(DBError) in
-      try accumulator.consume(rowid: rowid, record: record)
+    try forEachRow(source, table: table, resolver: resolver) { rowid, span throws(DBError) in
+      try accumulator.consume(rowid: rowid, span: span)
     }
 
     var rows = accumulator.rows
@@ -197,12 +184,12 @@ enum SelectExecutor {
       self.seenRowids = dedupRowids ? [] : nil
     }
 
-    func consume(rowid: Int64, record: [UInt8]) throws(DBError) -> Bool {
+    func consume(rowid: Int64, span: UnsafeRawBufferPointer) throws(DBError) -> Bool {
       if seenRowids != nil {
         if seenRowids!.contains(rowid) { return true }
         seenRowids!.insert(rowid)
       }
-      context.load(0, rowid: rowid, record: record)
+      context.load(0, rowid: rowid, span: span)
       if let residual {
         if SQLEval.truth(try SQLEval.evaluate(residual, env)) != .yes { return true }
       }
@@ -221,34 +208,35 @@ enum SelectExecutor {
     }
   }
 
-  /// Drives a row source, invoking `body` per `(rowid, record)`. `body`
-  /// returns false to stop early.
+  /// Drives a row source, invoking `body` per `(rowid, recordSpan)`. The span
+  /// is a zero-copy view into the mapped page, valid only for the duration of
+  /// the `body` call; `body` returns false to stop early.
   private static func forEachRow<R: PageResolver>(
     _ source: RowSource, table: Catalog.TableRecord, resolver: R,
-    _ body: (Int64, [UInt8]) throws(DBError) -> Bool
+    _ body: (Int64, UnsafeRawBufferPointer) throws(DBError) -> Bool
   ) throws(DBError) {
     switch source {
     case .table:
       var cursor = try RowCursor(
         resolver: resolver, table: table, mode: .table, lowerKey: nil, upperKey: nil)
-      while let (rowid, record) = try cursor.nextRecord() {
-        if !(try body(rowid, record)) { return }
-      }
+      try cursor.forEachRecordSpan(body)
     case .rowids(let rowids):
       for rowid in rowids {
-        guard
-          let record = try Relation.getBytes(resolver, table.handle, key: KeyCodec.rowKey(rowid))
-        else { continue }
-        if !(try body(rowid, record)) { return }
+        let outcome: Bool? = try Relation.withRowValue(
+          resolver, table.handle, key: KeyCodec.rowKey(rowid)
+        ) { ref throws(DBError) in
+          try BTree.withValueBytes(ref, resolver: resolver) { span throws(DBError) in
+            try body(rowid, span)
+          }
+        }
+        if outcome == false { return }  // nil = no such row → skip
       }
     case .index(let index, let boundsList):
       for bounds in boundsList {
         let (lower, upper) = try Relation.scanBounds(bounds, index: index, table: table)
         var cursor = try RowCursor(
           resolver: resolver, table: table, mode: .index(index), lowerKey: lower, upperKey: upper)
-        while let (rowid, record) = try cursor.nextRecord() {
-          if !(try body(rowid, record)) { return }
-        }
+        try cursor.forEachRecordSpan(body)
       }
     }
   }
@@ -294,8 +282,8 @@ enum SelectExecutor {
     guard plan.isJoin else {
       let source = try resolveSource(plan, table: tables[0], index: index, env: paramsEnv)
       try forEachRow(source, table: tables[0], resolver: resolver) {
-        rowid, record throws(DBError) in
-        context.load(0, rowid: rowid, record: record)
+        rowid, span throws(DBError) in
+        context.load(0, rowid: rowid, span: span)
         if try passesWhere() { try body() }
         return true
       }
@@ -310,8 +298,8 @@ enum SelectExecutor {
       let join = plan.joins[depth - 1]
       var matched = false
       try forEachRow(.table, table: tables[depth], resolver: resolver) {
-        rowid, record throws(DBError) in
-        context.load(depth, rowid: rowid, record: record)
+        rowid, span throws(DBError) in
+        context.load(depth, rowid: rowid, span: span)
         if SQLEval.truth(try SQLEval.evaluate(join.on, env)) == .yes {
           matched = true
           try descend(depth + 1)
@@ -326,8 +314,8 @@ enum SelectExecutor {
 
     let outerSource = try resolveSource(plan, table: tables[0], index: index, env: paramsEnv)
     try forEachRow(outerSource, table: tables[0], resolver: resolver) {
-      rowid, record throws(DBError) in
-      context.load(0, rowid: rowid, record: record)
+      rowid, span throws(DBError) in
+      context.load(0, rowid: rowid, span: span)
       try descend(1)
       return true
     }
@@ -664,9 +652,9 @@ enum SelectExecutor {
       self.nullExtended = Array(repeating: false, count: definitions.count)
     }
 
-    func load(_ table: Int, rowid: Int64, record: [UInt8]) {
+    func load(_ table: Int, rowid: Int64, span: UnsafeRawBufferPointer) {
       nullExtended[table] = false
-      slots[table].load(rowid: rowid, record: record)
+      slots[table].load(rowid: rowid, span: span)
     }
     func setNull(_ table: Int) { nullExtended[table] = true }
 

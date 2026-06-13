@@ -368,16 +368,24 @@ struct LazyRowDecodeTests {
       stored = Array(stored.prefix(storedCount))
       let record = RecordCodec.encode(stored)
 
-      slot.load(rowid: rowid, record: record)
-      let lazy = try slot.materialize()
       let full = try Self.materialize(record, rowid: rowid, storedCount: storedCount)
-      #expect(lazy.count == full.count)
-      for i in lazy.indices {
-        #expect(valueMatchesExact(lazy[i], full[i]), "column \(i): \(lazy[i]) vs \(full[i])")
+      var failure: DBError?
+      record.withUnsafeBytes { raw in
+        slot.load(rowid: rowid, span: raw)
+        do throws(DBError) {
+          let lazy = try slot.materialize()
+          #expect(lazy.count == full.count)
+          for i in lazy.indices {
+            #expect(valueMatchesExact(lazy[i], full[i]), "column \(i): \(lazy[i]) vs \(full[i])")
+          }
+          // Re-read a couple of columns to exercise the decode cache.
+          #expect(valueMatchesExact(try slot.value(at: 0), .integer(rowid)))
+          #expect(valueMatchesExact(try slot.value(at: 2), full[2]))
+        } catch {
+          failure = error
+        }
       }
-      // Re-read a couple of columns to exercise the decode cache.
-      #expect(valueMatchesExact(try slot.value(at: 0), .integer(rowid)))
-      #expect(valueMatchesExact(try slot.value(at: 2), full[2]))
+      if let failure { throw failure }
     }
   }
 
