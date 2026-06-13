@@ -10,7 +10,12 @@ let package = Package(
   ],
   targets: [
     .target(name: "ADCAtomics"),
-    .target(name: "ADSQLKernel", dependencies: ["ADCAtomics"]),
+    .target(
+      name: "ADSQLKernel", dependencies: ["ADCAtomics"],
+      // SE-0458: every unsafe construct in the kernel is now explicitly marked
+      // `unsafe` (or encapsulated by a `@safe` type), so the compiler enforces
+      // that any new unsafe use is called out.
+      swiftSettings: [.strictMemorySafety()]),
     .target(name: "ADSQL", dependencies: ["ADSQLKernel"]),
     .executableTarget(name: "ADSQLTool", dependencies: ["ADSQL"]),
     .systemLibrary(name: "CSQLite"),
