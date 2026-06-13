@@ -341,6 +341,12 @@ extension WriteTxn {
     try FTSIndex.docStats(ctx, ftsRecord(table), docid: docid)
   }
 
+  /// Evaluates a MATCH query string against an FTS table → matching docids
+  /// (ascending). Boolean membership only; ranking arrives in F4.
+  public func ftsMatch(_ table: String, _ query: String) throws(DBError) -> [Int64] {
+    try FTSMatch.evaluate(FTSQuery.parse(query), record: ftsRecord(table), resolver: ctx)
+  }
+
   /// Drops a table, its indexes, and every page they own.
   public func dropTable(_ name: String) throws(DBError) {
     try Relation.dropTable(ctx, name: name)

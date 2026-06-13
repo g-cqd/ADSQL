@@ -177,6 +177,38 @@ enum FTSIndex {
     return FTSDocStats(fieldLengths: try decodeForward(bytes).fieldLengths)
   }
 
+  /// Every dictionary term that starts with `prefix` (for `foo*` queries). The
+  /// dict tree is keyed by raw term bytes, so a seek + ascending walk while the
+  /// key still carries the prefix enumerates the range.
+  static func termsMatchingPrefix(
+    _ resolver: some PageResolver, _ record: Catalog.FTSRecord, prefix: [UInt8]
+  ) throws(DBError) -> [[UInt8]] {
+    var terms: [[UInt8]] = []
+    var cursor = Cursor(resolver: resolver, tree: record.dict)
+    var positioned = false
+    var failure: DBError?
+    prefix.withUnsafeBytes { raw in
+      do throws(DBError) {
+        _ = unsafe try cursor.seek(raw)
+        positioned = cursor.isValid
+      } catch {
+        failure = error
+      }
+    }
+    if let failure { throw failure }
+    while positioned {
+      let proceed: Bool? = unsafe try cursor.withCurrent { (key, _) throws(DBError) in
+        let term = unsafe [UInt8](key)
+        guard term.starts(with: prefix) else { return false }
+        terms.append(term)
+        return true
+      }
+      guard proceed == true else { break }
+      positioned = try cursor.next()
+    }
+    return terms
+  }
+
   // MARK: - Helpers
 
   private static func decodePostings(
