@@ -25,6 +25,22 @@ public enum Varint {
     return nil
   }
 
+  /// Safe `[UInt8]` overload (bounds-checked, no `unsafe`) for callers that
+  /// decode from arrays — e.g. the FTS postings/stats codecs.
+  public static func read(_ bytes: [UInt8], _ offset: inout Int) -> UInt64? {
+    var result: UInt64 = 0
+    var shift: UInt64 = 0
+    while offset < bytes.count {
+      let byte = bytes[offset]
+      offset += 1
+      result |= UInt64(byte & 0x7F) << shift
+      if byte & 0x80 == 0 { return result }
+      shift += 7
+      if shift > 63 { return nil }
+    }
+    return nil
+  }
+
   @inline(__always)
   public static func zigzag(_ value: Int64) -> UInt64 {
     UInt64(bitPattern: (value << 1) ^ (value >> 63))
