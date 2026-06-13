@@ -287,8 +287,16 @@ enum Writer {
     for binding in plan.binding.tables { tables.append(try txn.tableRecord(binding.table)) }
     var index: Catalog.IndexRecord?
     if let name = plan.access.indexName { index = try txn.indexRecord(name) }
+    var joinIndexes: [Catalog.IndexRecord?] = []
+    for join in plan.joins {
+      if let name = join.access.indexName {
+        joinIndexes.append(try txn.indexRecord(name))
+      } else {
+        joinIndexes.append(nil)
+      }
+    }
     return try SelectExecutor.run(
-      plan, tables: tables, index: index, resolver: txn.ctx, params: params)
+      plan, tables: tables, index: index, joinIndexes: joinIndexes, resolver: txn.ctx, params: params)
   }
 
   // MARK: - UPDATE (two-phase)

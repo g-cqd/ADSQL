@@ -100,6 +100,28 @@ enum Planner {
       rowidOrderSatisfiesOrderBy: rowidOrder)
   }
 
+  /// Index/rowid access for a join's inner table from `inner.col = <outer expr>`
+  /// equalities (the values are evaluated per outer row at execution). Mirrors
+  /// the leading-table equality-prefix logic; order is irrelevant for a probe.
+  /// Returns `.tableScan` when no equality hits the rowid alias or an index.
+  static func planJoin(
+    equalities: [(column: Int, value: SQLExpr)],
+    inner: TableBinding, indexes: [IndexDefinition], definition: TableDefinition
+  ) -> AccessPlan {
+    guard !equalities.isEmpty else { return .tableScan }
+    let constraints = equalities.map { Constraint.eq(column: $0.column, value: $0.value, source: $0.value) }
+    if let aliasIndex = inner.rowidAliasIndex, let eq = firstEquality(constraints, column: aliasIndex) {
+      return .rowid([eq.value])
+    }
+    if let chosen = chooseIndex(
+      constraints, orderBy: [], source: inner, indexes: indexes,
+      definition: definition, rowidOrder: false)
+    {
+      return chosen.plan
+    }
+    return .tableScan
+  }
+
   // MARK: - Index selection
 
   private static func chooseIndex(

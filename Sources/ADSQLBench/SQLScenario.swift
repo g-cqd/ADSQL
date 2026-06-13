@@ -98,6 +98,20 @@ enum SQLScenario {
       precondition(result.count > 0 && result.count <= 24)
     }
     print("  [adsql] sql distinct    \(distinctHist.summary())")
+
+    // Indexed equi-join: each outer row probes the unique-key index for its
+    // match (index-nested-loop). The unindexed O(M·N) baseline is unrunnable
+    // at this scale.
+    let join = try db.prepare(
+      "SELECT COUNT(*) FROM documents a JOIN documents b ON b.key = a.key")
+    var joinHist = LatencyHistogram()
+    for _ in 0..<10 {
+      let start = nowNanos()
+      let result = try join.all()
+      joinHist.record(nowNanos() - start)
+      precondition(result[0].values == [.integer(Int64(rows))])
+    }
+    print("  [adsql] sql join        \(joinHist.summary())")
   }
 
   // MARK: - SQLite (SQL surface)
@@ -198,5 +212,19 @@ enum SQLScenario {
       distinctHist.record(nowNanos() - start)
     }
     print("  [sqlite] sql distinct    \(distinctHist.summary())")
+
+    var join: OpaquePointer?
+    sqlite3_prepare_v3(
+      db, "SELECT COUNT(*) FROM documents a JOIN documents b ON b.key = a.key",
+      -1, UInt32(SQLITE_PREPARE_PERSISTENT), &join, nil)
+    defer { sqlite3_finalize(join) }
+    var joinHist = LatencyHistogram()
+    for _ in 0..<10 {
+      let start = nowNanos()
+      sqlite3_reset(join)
+      while sqlite3_step(join) == SQLITE_ROW {}
+      joinHist.record(nowNanos() - start)
+    }
+    print("  [sqlite] sql join        \(joinHist.summary())")
   }
 }

@@ -53,6 +53,12 @@ struct BoundJoin: Sendable {
   let kind: SQLJoinKind
   let table: Int
   let on: SQLExpr
+  /// Index-nested-loop access for this inner table: the index/rowid probe whose
+  /// equality values are *outer* expressions (evaluated per outer row). A
+  /// superset of the ON-matching rows — ON is still re-applied at the leaf — so
+  /// it never changes results, only how many inner rows are touched.
+  /// `.tableScan` = full inner scan (no usable equality on an indexed column).
+  let access: AccessPlan
 }
 
 /// All tables in a query's FROM/JOIN list, with column resolution across them.
@@ -227,12 +233,26 @@ enum Binder {
       return TableBinding(reference: reference, definition: definition)
     }
     var tables: [TableBinding] = [try bind(from)]
-    var joins: [BoundJoin] = []
+    var rawJoins: [(kind: SQLJoinKind, depth: Int, on: SQLExpr)] = []
     for join in select.joins {
       tables.append(try bind(join.table))
-      joins.append(BoundJoin(kind: join.kind, table: tables.count - 1, on: join.on))
+      rawJoins.append((join.kind, tables.count - 1, join.on))
     }
     let binding = QueryBinding(tables: tables)
+
+    // Index-nested-loop access per inner table: each ON conjunct of the form
+    // `inner.col = <expr over outer tables>` is a *necessary* match condition,
+    // so probing it is a valid superset (ON is re-applied at the leaf). Falls
+    // back to a full inner scan when no such equality hits an indexed column.
+    var joins: [BoundJoin] = []
+    for raw in rawJoins {
+      let inner = tables[raw.depth]
+      let equalities = joinEqualities(raw.on, binding: binding, innerDepth: raw.depth)
+      let access = Planner.planJoin(
+        equalities: equalities, inner: inner,
+        indexes: schema.indexes(on: inner.table), definition: schema.tables[inner.table]!)
+      joins.append(BoundJoin(kind: raw.kind, table: raw.depth, on: raw.on, access: access))
+    }
 
     // Aggregate calls in outputs/HAVING/ORDER BY are rewritten to slot
     // references; `aggregates` collects the distinct ones to accumulate.
@@ -326,6 +346,75 @@ enum Binder {
     let kept = conjuncts(expr).filter { conjunct in !covered.contains { $0 == conjunct } }
     guard let first = kept.first else { return nil }
     return kept.dropFirst().reduce(first) { .binary(.and, $0, $1) }
+  }
+
+  /// Equalities `inner.col = <outer expr>` from a join's ON, binding-aware: the
+  /// column side must resolve (in the full query binding) to the inner table at
+  /// `innerDepth`, and the value side must reference only strictly-earlier
+  /// tables (evaluable per outer row). Each is a necessary match condition.
+  private static func joinEqualities(
+    _ on: SQLExpr, binding: QueryBinding, innerDepth: Int
+  ) -> [(column: Int, value: SQLExpr)] {
+    func conj(_ e: SQLExpr) -> [SQLExpr] {
+      if case .binary(.and, let l, let r) = e { return conj(l) + conj(r) }
+      return [e]
+    }
+    var out: [(column: Int, value: SQLExpr)] = []
+    for clause in conj(on) {
+      guard case .binary(.eq, let lhs, let rhs) = clause else { continue }
+      if let column = innerColumn(lhs, binding: binding, depth: innerDepth),
+        referencesOnlyBelow(rhs, depth: innerDepth, binding: binding)
+      {
+        out.append((column, rhs))
+      } else if let column = innerColumn(rhs, binding: binding, depth: innerDepth),
+        referencesOnlyBelow(lhs, depth: innerDepth, binding: binding)
+      {
+        out.append((column, lhs))
+      }
+    }
+    return out
+  }
+
+  private static func innerColumn(
+    _ expr: SQLExpr, binding: QueryBinding, depth: Int
+  ) -> Int? {
+    guard case .column(let qualifier, let name, _) = expr,
+      let (table, column) = binding.resolve(qualifier: qualifier, name: name), table == depth
+    else { return nil }
+    return column
+  }
+
+  /// Every column reference resolves to a table strictly before `depth` (and no
+  /// subqueries/aggregates); literals and parameters are stable.
+  private static func referencesOnlyBelow(
+    _ expr: SQLExpr, depth: Int, binding: QueryBinding
+  ) -> Bool {
+    func below(_ e: SQLExpr) -> Bool { referencesOnlyBelow(e, depth: depth, binding: binding) }
+    switch expr {
+    case .literal, .parameter:
+      return true
+    case .column(let qualifier, let name, _):
+      guard let (table, _) = binding.resolve(qualifier: qualifier, name: name) else { return false }
+      return table < depth
+    case .scalarSubquery, .inJSONEach, .aggregateResult:
+      return false
+    case .collate(let inner, _), .cast(let inner, _), .unary(_, let inner):
+      return below(inner)
+    case .isNull(let inner, _):
+      return below(inner)
+    case .binary(_, let lhs, let rhs):
+      return below(lhs) && below(rhs)
+    case .like(let subject, let pattern, _):
+      return below(subject) && below(pattern)
+    case .inList(let subject, let items, _):
+      return below(subject) && items.allSatisfy(below)
+    case .caseWhen(let operand, let whens, let elseExpr):
+      return (operand.map(below) ?? true)
+        && whens.allSatisfy { below($0.condition) && below($0.result) }
+        && (elseExpr.map(below) ?? true)
+    case .function(_, let args, _, _):
+      return args.allSatisfy(below)
+    }
   }
 
   private static func appendAllColumns(_ table: TableBinding, to outputs: inout [BoundOutput]) {

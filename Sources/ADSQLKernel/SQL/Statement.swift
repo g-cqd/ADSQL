@@ -188,6 +188,14 @@ public final class Statement: Sendable {
     for binding in plan.binding.tables { tables.append(try txn.tableRecord(binding.table)) }
     var index: Catalog.IndexRecord?
     if let name = plan.access.indexName { index = try txn.indexRecord(name) }
+    var joinIndexes: [Catalog.IndexRecord?] = []
+    for join in plan.joins {
+      if let name = join.access.indexName {
+        joinIndexes.append(try txn.indexRecord(name))
+      } else {
+        joinIndexes.append(nil)
+      }
+    }
     // Capture Copyable snapshot handles (not the noncopyable txn) so the
     // escaping correlated-subquery runner can re-enter the executor.
     let resolver = txn.resolver
@@ -200,7 +208,8 @@ public final class Statement: Sendable {
         outerContext: outerContext, outerBinding: outerBinding)
     }
     return try SelectExecutor.run(
-      plan, tables: tables, index: index, resolver: txn.resolver, params: params, subquery: runner)
+      plan, tables: tables, index: index, joinIndexes: joinIndexes, resolver: txn.resolver,
+      params: params, subquery: runner)
   }
 
   /// Runs one correlated scalar subquery against the current outer row,
@@ -226,14 +235,22 @@ public final class Statement: Sendable {
     if let name = plan.access.indexName {
       index = try resolveIndex(name, resolver: resolver, meta: meta, cache: schemaCache)
     }
+    var joinIndexes: [Catalog.IndexRecord?] = []
+    for join in plan.joins {
+      if let name = join.access.indexName {
+        joinIndexes.append(try resolveIndex(name, resolver: resolver, meta: meta, cache: schemaCache))
+      } else {
+        joinIndexes.append(nil)
+      }
+    }
     let runner: SelectExecutor.SubqueryRunner = { sub, context, binding throws(DBError) in
       try runScalarSubquery(
         sub, resolver: resolver, meta: meta, schemaCache: schemaCache, params: params,
         outerContext: context, outerBinding: binding)
     }
     let rows = try SelectExecutor.run(
-      plan, tables: tables, index: index, resolver: resolver, params: params,
-      outer: (outerContext, outerBinding), subquery: runner)
+      plan, tables: tables, index: index, joinIndexes: joinIndexes, resolver: resolver,
+      params: params, outer: (outerContext, outerBinding), subquery: runner)
     return rows.first?.values.first ?? .null
   }
 

@@ -110,19 +110,20 @@
 enum SelectExecutor {
   static func run<R: PageResolver>(
     _ plan: BoundSelect, tables: [Catalog.TableRecord], index: Catalog.IndexRecord?,
+    joinIndexes: [Catalog.IndexRecord?] = [],
     resolver: R, params: SQLParameters,
     outer: (context: RowContext, binding: QueryBinding)? = nil,
     subquery: @escaping SubqueryRunner = rejectSubquery
   ) throws(DBError) -> [SQLRow] {
     if plan.isAggregated {
       return try runAggregated(
-        plan, tables: tables, index: index, resolver: resolver, params: params,
-        outer: outer, subquery: subquery)
+        plan, tables: tables, index: index, joinIndexes: joinIndexes, resolver: resolver,
+        params: params, outer: outer, subquery: subquery)
     }
     if plan.isJoin {
       return try runJoin(
-        plan, tables: tables, index: index, resolver: resolver, params: params,
-        outer: outer, subquery: subquery)
+        plan, tables: tables, index: index, joinIndexes: joinIndexes, resolver: resolver,
+        params: params, outer: outer, subquery: subquery)
     }
     let table = tables[0]
     let context = RowContext(definitions: tables.map(\.definition))
@@ -351,14 +352,26 @@ enum SelectExecutor {
     _ plan: BoundSelect, table: Catalog.TableRecord, index: Catalog.IndexRecord?,
     env paramsEnv: SQLEvalEnv
   ) throws(DBError) -> RowSource {
-    switch plan.access {
+    try resolveAccess(plan.access, index: index, table: table, env: paramsEnv)
+  }
+
+  /// Resolves an access plan into a row source against `env`. For the leading
+  /// table `env` is parameters-only; for an index-nested-loop inner table it is
+  /// the full row env (the probe values are outer columns, evaluated per outer
+  /// row). An unconvertible/absent probe falls back to a scan — still correct
+  /// via the residual (single-table WHERE, or the join's ON re-applied).
+  private static func resolveAccess(
+    _ access: AccessPlan, index: Catalog.IndexRecord?, table: Catalog.TableRecord,
+    env: SQLEvalEnv
+  ) throws(DBError) -> RowSource {
+    switch access {
     case .tableScan:
       return .table
     case .rowid(let exprs):
-      return .rowids(try evaluateRowids(exprs, paramsEnv))
+      return .rowids(try evaluateRowids(exprs, env))
     case .index(_, let probes, _):
       guard let index else { return .table }
-      switch try buildIndexBounds(probes, index: index, table: table, env: paramsEnv) {
+      switch try buildIndexBounds(probes, index: index, table: table, env: env) {
       case .scan: return .table
       case .bounds(let list): return .index(index, list)
       }
@@ -374,6 +387,7 @@ enum SelectExecutor {
   /// LEFT emits one null-extended row when the right side has no match.
   private static func forEachFilteredRow<R: PageResolver>(
     _ plan: BoundSelect, tables: [Catalog.TableRecord], index: Catalog.IndexRecord?,
+    joinIndexes: [Catalog.IndexRecord?],
     resolver: R, context: RowContext, env: SQLEvalEnv, paramsEnv: SQLEvalEnv,
     _ body: () throws(DBError) -> Void
   ) throws(DBError) {
@@ -400,7 +414,15 @@ enum SelectExecutor {
       }
       let join = plan.joins[depth - 1]
       var matched = false
-      unsafe try forEachRow(.table, table: tables[depth], resolver: resolver) {
+      // Index-nested-loop: probe the inner table's index with the outer row's
+      // value (a superset); the ON below is the residual. Falls back to a full
+      // inner scan when `join.access` is `.tableScan`.
+      // A missing index record (caller didn't resolve one) degrades an
+      // `.index` probe to a scan; `.rowid` probes need no record.
+      let joinIndex = depth - 1 < joinIndexes.count ? joinIndexes[depth - 1] : nil
+      let innerSource = try resolveAccess(
+        join.access, index: joinIndex, table: tables[depth], env: env)
+      unsafe try forEachRow(innerSource, table: tables[depth], resolver: resolver) {
         rowid, span throws(DBError) in
         unsafe context.load(depth, rowid: rowid, span: span)
         if SQLEval.truth(try SQLEval.evaluate(join.on, env)) == .yes {
@@ -426,6 +448,7 @@ enum SelectExecutor {
 
   private static func runJoin<R: PageResolver>(
     _ plan: BoundSelect, tables: [Catalog.TableRecord], index: Catalog.IndexRecord?,
+    joinIndexes: [Catalog.IndexRecord?],
     resolver: R, params: SQLParameters,
     outer: (context: RowContext, binding: QueryBinding)?, subquery: @escaping SubqueryRunner
   ) throws(DBError) -> [SQLRow] {
@@ -437,7 +460,7 @@ enum SelectExecutor {
     var rows: [[Value]] = []
     var sortKeys: [[Value]] = []
     try forEachFilteredRow(
-      plan, tables: tables, index: index, resolver: resolver,
+      plan, tables: tables, index: index, joinIndexes: joinIndexes, resolver: resolver,
       context: context, env: env, paramsEnv: paramsEnv
     ) { () throws(DBError) in
       var projected: [Value] = []
@@ -471,6 +494,7 @@ enum SelectExecutor {
 
   private static func runAggregated<R: PageResolver>(
     _ plan: BoundSelect, tables: [Catalog.TableRecord], index: Catalog.IndexRecord?,
+    joinIndexes: [Catalog.IndexRecord?],
     resolver: R, params: SQLParameters,
     outer: (context: RowContext, binding: QueryBinding)?, subquery: @escaping SubqueryRunner
   ) throws(DBError) -> [SQLRow] {
@@ -493,7 +517,7 @@ enum SelectExecutor {
     }
 
     try forEachFilteredRow(
-      plan, tables: tables, index: index, resolver: resolver,
+      plan, tables: tables, index: index, joinIndexes: joinIndexes, resolver: resolver,
       context: context, env: scanEnv, paramsEnv: paramsEnv
     ) { () throws(DBError) in
       let key: GroupKey
