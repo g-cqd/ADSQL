@@ -331,16 +331,26 @@ public enum Node {
 
   // MARK: - Splits
 
-  /// Copied image of every cell on a page, in slot order.
-  static func cellImages(_ page: UnsafeRawBufferPointer) -> [[UInt8]] {
-    let count = unsafe PageHeader.cellCount(page)
-    var cells: [[UInt8]] = []
-    cells.reserveCapacity(count + 1)
-    for i in 0..<count {
-      let offset = unsafe PageHeader.slotOffset(page, i)
-      unsafe cells.append([UInt8](page[offset..<offset + cellLength(page, i)]))
-    }
-    return cells
+  /// Raw bytes (header + payload) of the cell at slot `i`, viewed in place.
+  @inline(__always)
+  static func cellBytes(_ page: UnsafeRawBufferPointer, _ i: Int) -> UnsafeRawBufferPointer {
+    let offset = unsafe PageHeader.slotOffset(page, i)
+    return unsafe UnsafeRawBufferPointer(rebasing: page[offset..<offset + cellLength(page, i)])
+  }
+
+  /// Key bytes of a standalone leaf-cell buffer, viewed in place.
+  @inline(__always)
+  static func leafCellKeyBytes(_ cell: UnsafeRawBufferPointer) -> UnsafeRawBufferPointer {
+    let keyStart = unsafe cell[0] & leafOverflowFlag == 0 ? 5 : 15
+    let keyLen = unsafe Int(cell.loadLE16(1))
+    return unsafe UnsafeRawBufferPointer(rebasing: cell[keyStart..<keyStart + keyLen])
+  }
+
+  /// Key bytes of a standalone branch-cell buffer, viewed in place.
+  @inline(__always)
+  static func branchCellKeyBytes(_ cell: UnsafeRawBufferPointer) -> UnsafeRawBufferPointer {
+    let keyLen = unsafe Int(cell.loadLE16(0))
+    return unsafe UnsafeRawBufferPointer(rebasing: cell[10..<10 + keyLen])
   }
 
   static func keyOfCellImage(_ cell: [UInt8], type: PageType) -> [UInt8] {
@@ -357,36 +367,26 @@ public enum Node {
     }
   }
 
-  static func rebuild(
-    _ page: UnsafeMutableRawBufferPointer, type: PageType, cells: ArraySlice<[UInt8]>,
-    leftmostChild: UInt64
-  ) {
-    unsafe PageHeader.initialize(page, type: type)
-    unsafe PageHeader.setLink(page, leftmostChild)
-    var writeEnd = Format.pageSize
-    var slot = 0
-    for cell in cells {
-      writeEnd -= cell.count
-      cell.withUnsafeBytes { unsafe copyBytes(into: page, at: writeEnd, from: $0) }
-      unsafe PageHeader.setSlotOffset(page, slot, writeEnd)
-      slot += 1
+  /// Split point over the logical cells (the original page's cells with a
+  /// `newCellSize` cell inserted at `index`): smallest prefix carrying ≥ half
+  /// the bytes, clamped so both sides are non-empty. Mirrors the historical
+  /// `splitPoint` but reads cell sizes from the page in place (no per-cell
+  /// allocation).
+  static func splitPointBySize(
+    _ original: UnsafeRawBufferPointer, count: Int, newCellSize: Int, insertAt index: Int
+  ) -> Int {
+    let logical = count + 1
+    func sizeOf(_ p: Int) -> Int {
+      unsafe p == index ? newCellSize : cellLength(original, p < index ? p : p - 1)
     }
-    unsafe PageHeader.setCellCount(page, slot)
-    unsafe PageHeader.setCellAreaStart(page, writeEnd)
-  }
-
-  /// Picks the split point: smallest prefix carrying at least half the bytes,
-  /// clamped so both sides are non-empty.
-  static func splitPoint(_ cells: [[UInt8]]) -> Int {
-    let total = cells.reduce(0) { $0 + $1.count + Format.slotSize }
+    var total = 0
+    for p in 0..<logical { total += sizeOf(p) + Format.slotSize }
     var acc = 0
-    for (i, cell) in cells.enumerated() {
-      acc += cell.count + Format.slotSize
-      if acc * 2 >= total {
-        return min(max(i + 1, 1), cells.count - 1)
-      }
+    for p in 0..<logical {
+      acc += sizeOf(p) + Format.slotSize
+      if acc * 2 >= total { return min(max(p + 1, 1), logical - 1) }
     }
-    return cells.count - 1
+    return logical - 1
   }
 
   /// Splits a full leaf while inserting (key, value) at `index`.
@@ -397,30 +397,61 @@ public enum Node {
     key: UnsafeRawBufferPointer, value: LeafValue,
     left: UnsafeMutableRawBufferPointer, right: UnsafeMutableRawBufferPointer
   ) -> [UInt8] {
-    var cells = unsafe cellImages(original)
-    var newCell = [UInt8](repeating: 0, count: leafCellSize(keyLen: key.count, value: value))
-    newCell.withUnsafeMutableBytes { raw in
-      unsafe encodeLeafCell(
-        into: UnsafeMutableRawBufferPointer(mutating: UnsafeRawBufferPointer(raw)), at: 0,
-        key: key, value: value)
-    }
-    cells.insert(newCell, at: index)
+    let count = unsafe PageHeader.cellCount(original)
+    let logical = count + 1
+    let newSize = leafCellSize(keyLen: key.count, value: value)
     // Append/prepend bias: a key inserted at a leaf edge is the signature of a
     // sequential (often bulk) load. A 50/50 split there strands the just-filled
     // side at ~50% forever; keeping it packed and starting the new side with the
     // single edge cell yields ~100% fill on monotonic loads (random inserts land
     // interior and fall back to the balanced split).
     let split: Int
-    if index == cells.count - 1 {
-      split = cells.count - 1
+    if index == logical - 1 {
+      split = logical - 1
     } else if index == 0 {
       split = 1
     } else {
-      split = splitPoint(cells)
+      split = unsafe splitPointBySize(original, count: count, newCellSize: newSize, insertAt: index)
     }
-    unsafe rebuild(left, type: .leaf, cells: cells[..<split], leftmostChild: 0)
-    unsafe rebuild(right, type: .leaf, cells: cells[split...], leftmostChild: 0)
-    return keyOfCellImage(cells[split], type: .leaf)
+
+    var newCell = [UInt8](repeating: 0, count: newSize)
+    newCell.withUnsafeMutableBytes { raw in
+      unsafe encodeLeafCell(
+        into: UnsafeMutableRawBufferPointer(mutating: UnsafeRawBufferPointer(raw)), at: 0,
+        key: key, value: value)
+    }
+    // `left` may alias `original`; snapshot the source once (one 16 KiB copy,
+    // like `compact`) so the cell-by-cell copy never reads a half-overwritten
+    // page — and no per-cell `[UInt8]` is materialized.
+    let scratch = unsafe PageBuf(copying: original)
+    let src = unsafe scratch.readOnly
+    return newCell.withUnsafeBytes { (newBytes: UnsafeRawBufferPointer) -> [UInt8] in
+      unsafe PageHeader.initialize(left, type: .leaf)
+      unsafe PageHeader.initialize(right, type: .leaf)
+      var leftEnd = Format.pageSize, rightEnd = Format.pageSize
+      var leftSlot = 0, rightSlot = 0
+      var separator: [UInt8] = []
+      for p in 0..<logical {
+        let bytes = unsafe p == index ? newBytes : cellBytes(src, p < index ? p : p - 1)
+        if p < split {
+          leftEnd -= bytes.count
+          unsafe copyBytes(into: left, at: leftEnd, from: bytes)
+          unsafe PageHeader.setSlotOffset(left, leftSlot, leftEnd)
+          leftSlot += 1
+        } else {
+          if p == split { separator = unsafe [UInt8](leafCellKeyBytes(bytes)) }
+          rightEnd -= bytes.count
+          unsafe copyBytes(into: right, at: rightEnd, from: bytes)
+          unsafe PageHeader.setSlotOffset(right, rightSlot, rightEnd)
+          rightSlot += 1
+        }
+      }
+      unsafe PageHeader.setCellCount(left, leftSlot)
+      unsafe PageHeader.setCellAreaStart(left, leftEnd)
+      unsafe PageHeader.setCellCount(right, rightSlot)
+      unsafe PageHeader.setCellAreaStart(right, rightEnd)
+      return separator
+    }
   }
 
   /// Splits a full branch while inserting (key, child) at cell position
@@ -432,19 +463,52 @@ public enum Node {
     left: UnsafeMutableRawBufferPointer, right: UnsafeMutableRawBufferPointer
   ) -> [UInt8] {
     let leftmost = unsafe PageHeader.link(original)
-    var cells = unsafe cellImages(original)
-    var newCell = [UInt8](repeating: 0, count: branchCellSize(keyLen: key.count))
+    let count = unsafe PageHeader.cellCount(original)
+    let logical = count + 1
+    let newSize = branchCellSize(keyLen: key.count)
+    let mid = unsafe splitPointBySize(original, count: count, newCellSize: newSize, insertAt: index)
+
+    var newCell = [UInt8](repeating: 0, count: newSize)
     newCell.withUnsafeMutableBytes { raw in
       unsafe encodeBranchCell(
         into: UnsafeMutableRawBufferPointer(mutating: UnsafeRawBufferPointer(raw)), at: 0,
         key: key, child: child)
     }
-    cells.insert(newCell, at: index)
-    let mid = splitPoint(cells)
-    let separator = keyOfCellImage(cells[mid], type: .branch)
-    let promotedChild = cells[mid].withUnsafeBytes { unsafe $0.loadLE64(2) }
-    unsafe rebuild(left, type: .branch, cells: cells[..<mid], leftmostChild: leftmost)
-    unsafe rebuild(right, type: .branch, cells: cells[(mid + 1)...], leftmostChild: promotedChild)
-    return separator
+    let scratch = unsafe PageBuf(copying: original)
+    let src = unsafe scratch.readOnly
+    return newCell.withUnsafeBytes { (newBytes: UnsafeRawBufferPointer) -> [UInt8] in
+      // The middle cell is promoted: its key is the separator and its child
+      // becomes the right page's leftmost link; it lands on neither page.
+      let midCell = unsafe mid == index ? newBytes : cellBytes(src, mid < index ? mid : mid - 1)
+      let separator = unsafe [UInt8](branchCellKeyBytes(midCell))
+      let promotedChild = unsafe midCell.loadLE64(2)
+
+      unsafe PageHeader.initialize(left, type: .branch)
+      unsafe PageHeader.setLink(left, leftmost)
+      var leftEnd = Format.pageSize, leftSlot = 0
+      for p in 0..<mid {
+        let bytes = unsafe p == index ? newBytes : cellBytes(src, p < index ? p : p - 1)
+        leftEnd -= bytes.count
+        unsafe copyBytes(into: left, at: leftEnd, from: bytes)
+        unsafe PageHeader.setSlotOffset(left, leftSlot, leftEnd)
+        leftSlot += 1
+      }
+      unsafe PageHeader.setCellCount(left, leftSlot)
+      unsafe PageHeader.setCellAreaStart(left, leftEnd)
+
+      unsafe PageHeader.initialize(right, type: .branch)
+      unsafe PageHeader.setLink(right, promotedChild)
+      var rightEnd = Format.pageSize, rightSlot = 0
+      for p in (mid + 1)..<logical {
+        let bytes = unsafe p == index ? newBytes : cellBytes(src, p < index ? p : p - 1)
+        rightEnd -= bytes.count
+        unsafe copyBytes(into: right, at: rightEnd, from: bytes)
+        unsafe PageHeader.setSlotOffset(right, rightSlot, rightEnd)
+        rightSlot += 1
+      }
+      unsafe PageHeader.setCellCount(right, rightSlot)
+      unsafe PageHeader.setCellAreaStart(right, rightEnd)
+      return separator
+    }
   }
 }
