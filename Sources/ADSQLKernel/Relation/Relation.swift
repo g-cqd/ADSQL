@@ -355,6 +355,38 @@ enum Relation {
     ctx.relation = state
   }
 
+  // MARK: - FTS maintenance (self-contained; F2b)
+
+  /// Indexes a document into an FTS table. Mutates the record's three tree
+  /// handles; `serializeState` persists them like any other catalog change.
+  static func ftsAdd(
+    _ ctx: TxnContext, name: String, docid: Int64, columnTexts: [String]
+  ) throws(DBError) {
+    var state = try ensureState(ctx)
+    guard var record = state.ftsRecords[name] else { throw DBError.noSuchTable(name) }
+    try FTSIndex.add(ctx, record: &record, docid: docid, columnTexts: columnTexts)
+    state.ftsRecords[name] = record
+    ctx.relation = state
+  }
+
+  /// Removes a document from an FTS table; returns false when it wasn't present.
+  @discardableResult
+  static func ftsRemove(_ ctx: TxnContext, name: String, docid: Int64) throws(DBError) -> Bool {
+    var state = try ensureState(ctx)
+    guard var record = state.ftsRecords[name] else { throw DBError.noSuchTable(name) }
+    let removed = try FTSIndex.remove(ctx, record: &record, docid: docid)
+    state.ftsRecords[name] = record
+    ctx.relation = state
+    return removed
+  }
+
+  /// The next auto docid for an FTS table (max stored docid + 1).
+  static func ftsNextRowid(_ ctx: TxnContext, name: String) throws(DBError) -> Int64 {
+    let state = try ensureState(ctx)
+    guard let record = state.ftsRecords[name] else { throw DBError.noSuchTable(name) }
+    return try FTSIndex.nextRowid(ctx, statsHandle: record.stats)
+  }
+
   static func createIndex(_ ctx: TxnContext, _ definition: IndexDefinition) throws(DBError) {
     var state = try ensureState(ctx)
     guard state.indexRecords[definition.name] == nil else {

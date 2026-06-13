@@ -88,6 +88,9 @@ enum Writer {
     _ insert: SQLInsert, txn: borrowing WriteTxn, params: SQLParameters
   ) throws(DBError) -> (rows: [SQLRow], result: RunResult) {
     let schema = try txn.schema()
+    if schema.ftsTables[insert.table] != nil {
+      return try insertFTS(insert, txn: txn, params: params)
+    }
     guard let definition = schema.tables[insert.table] else {
       throw DBError.noSuchTable(insert.table)
     }
@@ -357,6 +360,9 @@ enum Writer {
     _ delete: SQLDelete, txn: borrowing WriteTxn, params: SQLParameters
   ) throws(DBError) -> (rows: [SQLRow], result: RunResult) {
     let schema = try txn.schema()
+    if schema.ftsTables[delete.table] != nil {
+      return try deleteFTS(delete, txn: txn, params: params)
+    }
     guard let definition = schema.tables[delete.table] else {
       throw DBError.noSuchTable(delete.table)
     }
@@ -378,6 +384,126 @@ enum Writer {
       changes += 1
     }
     return (returningRows, RunResult(changes: changes, lastInsertRowid: 0))
+  }
+
+  // MARK: - FTS write (self-contained; F2b)
+
+  static func insertFTS(
+    _ insert: SQLInsert, txn: borrowing WriteTxn, params: SQLParameters
+  ) throws(DBError) -> (rows: [SQLRow], result: RunResult) {
+    guard insert.returning.isEmpty else { throw DBError.sqlUnsupported("RETURNING on an FTS table") }
+    guard insert.conflict == .abort else {
+      throw DBError.sqlUnsupported("INSERT OR …/upsert on an FTS table")
+    }
+    guard let definition = try txn.schema().ftsTables[insert.table] else {
+      throw DBError.noSuchTable(insert.table)
+    }
+    // Map each INSERT column to an FTS column index, or the implicit rowid slot.
+    let targetNames = insert.columns.isEmpty ? definition.columns : insert.columns
+    var rowidSlot: Int?
+    var ftsColumnForSlot: [Int?] = []
+    ftsColumnForSlot.reserveCapacity(targetNames.count)
+    for (position, name) in targetNames.enumerated() {
+      if name.lowercased() == "rowid" {
+        rowidSlot = position
+        ftsColumnForSlot.append(nil)
+      } else if let column = definition.columns.firstIndex(of: name) {
+        ftsColumnForSlot.append(column)
+      } else {
+        throw DBError.noSuchColumn(table: insert.table, column: name)
+      }
+    }
+
+    let paramsEnv = SQLEvalEnv.parametersOnly { p throws(DBError) in try params.lookup(p) }
+    var changes = 0
+    var lastRowid: Int64 = 0
+
+    func indexRow(_ values: [Value]) throws(DBError) {
+      guard values.count == targetNames.count else {
+        throw DBError.sqlBind("\(values.count) values for \(targetNames.count) columns in INSERT")
+      }
+      var texts = [String](repeating: "", count: definition.columns.count)
+      var explicitRowid: Int64?
+      for (position, value) in values.enumerated() {
+        if position == rowidSlot {
+          explicitRowid = try ftsRowid(value)
+        } else if let column = ftsColumnForSlot[position] {
+          texts[column] = ftsText(value)
+        }
+      }
+      let docid: Int64
+      if let explicitRowid { docid = explicitRowid } else { docid = try txn.ftsNextRowid(insert.table) }
+      try txn.ftsAdd(insert.table, docid: docid, columnTexts: texts)
+      changes += 1
+      lastRowid = docid
+    }
+
+    switch insert.source {
+    case .values(let rows):
+      for rowExprs in rows {
+        var values: [Value] = []
+        values.reserveCapacity(rowExprs.count)
+        for expr in rowExprs { values.append(try SQLEval.evaluate(expr, paramsEnv)) }
+        try indexRow(values)
+      }
+    case .select(let select):
+      for values in try runSelectInTxn(select, txn: txn, params: params) { try indexRow(values) }
+    }
+    return ([], RunResult(changes: changes, lastInsertRowid: lastRowid))
+  }
+
+  static func deleteFTS(
+    _ delete: SQLDelete, txn: borrowing WriteTxn, params: SQLParameters
+  ) throws(DBError) -> (rows: [SQLRow], result: RunResult) {
+    guard delete.returning.isEmpty else { throw DBError.sqlUnsupported("RETURNING on an FTS table") }
+    let paramsEnv = SQLEvalEnv.parametersOnly { p throws(DBError) in try params.lookup(p) }
+    let docids = try ftsDeleteDocids(delete.whereExpr, env: paramsEnv)
+    var changes = 0
+    for docid in docids where try txn.ftsRemove(delete.table, docid: docid) { changes += 1 }
+    return ([], RunResult(changes: changes, lastInsertRowid: 0))
+  }
+
+  /// Extracts docids from `WHERE rowid = expr` / `rowid IN (exprs)`; other shapes
+  /// are unsupported (apple-docs deletes FTS rows by rowid).
+  private static func ftsDeleteDocids(
+    _ predicate: SQLExpr?, env: SQLEvalEnv
+  ) throws(DBError) -> [Int64] {
+    guard let predicate else {
+      throw DBError.sqlUnsupported("DELETE FROM fts requires WHERE rowid = …")
+    }
+    func isRowid(_ expr: SQLExpr) -> Bool {
+      if case .column(_, let name, _) = expr { return name.lowercased() == "rowid" }
+      return false
+    }
+    switch predicate {
+    case .binary(.eq, let lhs, let rhs):
+      if isRowid(lhs) { return [try ftsRowid(try SQLEval.evaluate(rhs, env))] }
+      if isRowid(rhs) { return [try ftsRowid(try SQLEval.evaluate(lhs, env))] }
+    case .inList(let target, let items, let negated) where !negated && isRowid(target):
+      var docids: [Int64] = []
+      for item in items { docids.append(try ftsRowid(try SQLEval.evaluate(item, env))) }
+      return docids
+    default:
+      break
+    }
+    throw DBError.sqlUnsupported("FTS DELETE supports only WHERE rowid = … or rowid IN (…)")
+  }
+
+  private static func ftsRowid(_ value: Value) throws(DBError) -> Int64 {
+    guard case .integer(let rowid) = value else {
+      throw DBError.sqlBind("FTS rowid must be an integer")
+    }
+    return rowid
+  }
+
+  private static func ftsText(_ value: Value) -> String {
+    switch value {
+    case .text(let text): return text
+    case .null: return ""
+    case .integer(let v): return String(v)
+    case .real(let v): return String(v)
+    case .blob: return ""
+    }
   }
 
   /// Phase 1 of UPDATE/DELETE: every rowid (with its current values) whose row

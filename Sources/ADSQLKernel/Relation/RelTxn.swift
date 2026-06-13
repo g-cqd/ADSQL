@@ -292,6 +292,44 @@ extension WriteTxn {
     try Relation.createVirtualTable(ctx, definition)
   }
 
+  // MARK: FTS maintenance + reads (F2b)
+
+  public func ftsAdd(_ table: String, docid: Int64, columnTexts: [String]) throws(DBError) {
+    try Relation.ftsAdd(ctx, name: table, docid: docid, columnTexts: columnTexts)
+  }
+
+  @discardableResult
+  public func ftsRemove(_ table: String, docid: Int64) throws(DBError) -> Bool {
+    try Relation.ftsRemove(ctx, name: table, docid: docid)
+  }
+
+  public func ftsNextRowid(_ table: String) throws(DBError) -> Int64 {
+    try Relation.ftsNextRowid(ctx, name: table)
+  }
+
+  private func ftsRecord(_ name: String) throws(DBError) -> Catalog.FTSRecord {
+    guard let record = try Relation.ensureState(ctx).ftsRecords[name] else {
+      throw DBError.noSuchTable(name)
+    }
+    return record
+  }
+
+  public func ftsPostings(_ table: String, term: [UInt8]) throws(DBError) -> [FTSPosting]? {
+    try FTSIndex.postings(ctx, ftsRecord(table), term: term)
+  }
+
+  public func ftsDocumentFrequency(_ table: String, term: [UInt8]) throws(DBError) -> UInt64 {
+    try FTSIndex.documentFrequency(ctx, ftsRecord(table), term: term)
+  }
+
+  public func ftsGlobalStats(_ table: String) throws(DBError) -> FTSGlobalStats {
+    try FTSIndex.globalStats(ctx, ftsRecord(table))
+  }
+
+  public func ftsDocStats(_ table: String, docid: Int64) throws(DBError) -> FTSDocStats? {
+    try FTSIndex.docStats(ctx, ftsRecord(table), docid: docid)
+  }
+
   /// Drops a table, its indexes, and every page they own.
   public func dropTable(_ name: String) throws(DBError) {
     try Relation.dropTable(ctx, name: name)
