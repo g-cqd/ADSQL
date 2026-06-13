@@ -33,17 +33,17 @@ public enum Committer {
     let pageNos = ctx.dirty.keys.sorted()
     var index = 0
     while index < pageNos.count {
-      var run: [UnsafeRawBufferPointer] = []
+      var run: [UnsafeRawBufferPointer] = unsafe []
       let startPage = pageNos[index]
       var nextExpected = startPage
       while index < pageNos.count, pageNos[index] == nextExpected {
         let buf = ctx.dirty[pageNos[index]]!
-        PageHeader.stampChecksum(buf.raw, pageNo: pageNos[index])
-        run.append(buf.readOnly)
+        unsafe PageHeader.stampChecksum(buf.raw, pageNo: pageNos[index])
+        unsafe run.append(buf.readOnly)
         nextExpected += 1
         index += 1
       }
-      try channel.pwritev(run, at: Int(startPage) * Format.pageSize)
+      unsafe try channel.pwritev(run, at: Int(startPage) * Format.pageSize)
     }
 
     // The pre-meta sync only needs ORDERING (data before meta) — even for
@@ -53,8 +53,8 @@ public enum Committer {
 
     let metaBuf = PageBuf()
     let metaPageNo = newMeta.pageNo
-    newMeta.encode(into: metaBuf.raw, pageNo: metaPageNo)
-    try channel.pwrite(metaBuf.readOnly, at: Int(metaPageNo) * Format.pageSize)
+    unsafe newMeta.encode(into: metaBuf.raw, pageNo: metaPageNo)
+    unsafe try channel.pwrite(metaBuf.readOnly, at: Int(metaPageNo) * Format.pageSize)
 
     // `.full` must make THIS commit power-loss durable before returning.
     // `.barrier` needs no trailing barrier: the next commit's barrier
@@ -88,7 +88,7 @@ public enum Recovery {
     meta0.withUnsafeBytes { m0 in
       meta1.withUnsafeBytes { m1 in
         do throws(DBError) {
-          recovered = .success(try Meta.recover(meta0: m0, meta1: m1))
+          recovered = unsafe .success(try Meta.recover(meta0: m0, meta1: m1))
         } catch {
           recovered = .failure(error)
         }
@@ -101,10 +101,10 @@ public enum Recovery {
     let meta = Meta.empty
     try channel.preallocate(minimumSize: Int(Format.metaPageCount) * Format.pageSize)
     let buf = PageBuf()
-    meta.encode(into: buf.raw, pageNo: 0)
-    try channel.pwrite(buf.readOnly, at: 0)
+    unsafe meta.encode(into: buf.raw, pageNo: 0)
+    unsafe try channel.pwrite(buf.readOnly, at: 0)
     let zero = PageBuf()
-    try channel.pwrite(zero.readOnly, at: Format.pageSize)
+    unsafe try channel.pwrite(zero.readOnly, at: Format.pageSize)
     // Creation is durable regardless of profile: one-time cost.
     try channel.sync(.full)
     return meta

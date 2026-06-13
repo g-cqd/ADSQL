@@ -21,7 +21,7 @@ public enum BTree {
   public static func get(
     resolver: some PageResolver, meta: Meta, key: UnsafeRawBufferPointer
   ) throws(DBError) -> ValueRef? {
-    try get(resolver: resolver, tree: meta.mainTree, key: key)
+    unsafe try get(resolver: resolver, tree: meta.mainTree, key: key)
   }
 
   public static func get(
@@ -31,21 +31,21 @@ public enum BTree {
     var pageNo = tree.rootPage
     var level = tree.depth
     while level > 1 {
-      let page = try resolver.resolvePage(pageNo)
-      guard PageHeader.pageType(page) == .branch else {
+      let page = unsafe try resolver.resolvePage(pageNo)
+      guard unsafe PageHeader.pageType(page) == .branch else {
         throw DBError.corruptPage(pageNo: pageNo)
       }
-      pageNo = Node.descendTarget(page, key: key)
+      pageNo = unsafe Node.descendTarget(page, key: key)
       level -= 1
     }
-    let leaf = try resolver.resolvePage(pageNo)
-    guard PageHeader.pageType(leaf) == .leaf else {
+    let leaf = unsafe try resolver.resolvePage(pageNo)
+    guard unsafe PageHeader.pageType(leaf) == .leaf else {
       throw DBError.corruptPage(pageNo: pageNo)
     }
-    let (index, exact) = Node.search(leaf, key: key)
+    let (index, exact) = unsafe Node.search(leaf, key: key)
     guard exact else { return nil }
-    let cell = Node.leafCell(leaf, index)
-    if let inline = cell.inlineValue { return .inline(inline) }
+    let cell = unsafe Node.leafCell(leaf, index)
+    if let inline = unsafe cell.inlineValue { return unsafe .inline(inline) }
     return .overflow(head: cell.overflowHead, length: Int(cell.overflowLength))
   }
 
@@ -56,7 +56,7 @@ public enum BTree {
   ) throws(DBError) -> [UInt8] {
     switch ref {
     case .inline(let bytes):
-      return [UInt8](bytes)
+      return unsafe [UInt8](bytes)
     case .overflow(let head, let length):
       return try Overflow.read(
         head: head, length: length, pager: ReadOnlyOverflowPager(resolver: resolver))
@@ -72,14 +72,14 @@ public enum BTree {
   ) throws(DBError) -> R {
     switch ref {
     case .inline(let bytes):
-      return try body(bytes)
+      return unsafe try body(bytes)
     case .overflow(let head, let length):
       let assembled = try Overflow.read(
         head: head, length: length, pager: ReadOnlyOverflowPager(resolver: resolver))
       var result: Result<R, DBError>?
       assembled.withUnsafeBytes { raw in
         do throws(DBError) {
-          result = .success(try body(raw))
+          result = unsafe .success(try body(raw))
         } catch {
           result = .failure(error)
         }
@@ -95,7 +95,7 @@ public enum BTree {
     ctx: TxnContext, key: UnsafeRawBufferPointer, value: UnsafeRawBufferPointer
   ) throws(DBError) {
     var tree = ctx.meta.mainTree
-    try put(ctx: ctx, tree: &tree, key: key, value: value)
+    unsafe try put(ctx: ctx, tree: &tree, key: key, value: value)
     ctx.meta.mainTree = tree
   }
 
@@ -103,23 +103,23 @@ public enum BTree {
     ctx: TxnContext, tree: inout TreeHandle,
     key: UnsafeRawBufferPointer, value: UnsafeRawBufferPointer
   ) throws(DBError) {
-    guard !key.isEmpty else { throw DBError.keyEmpty }
+    guard unsafe !key.isEmpty else { throw DBError.keyEmpty }
     guard key.count <= Format.maxKeySize else { throw DBError.keyTooLarge(key.count) }
 
     var pager = ctx
     let leafValue: Node.LeafValue
     if Node.shouldInline(keyLen: key.count, valueLen: value.count) {
-      leafValue = .inline(value)
+      leafValue = unsafe .inline(value)
     } else {
-      let head = try Overflow.write(value, pager: &pager)
+      let head = unsafe try Overflow.write(value, pager: &pager)
       leafValue = .overflow(head: head, length: UInt32(value.count))
     }
 
     // Empty tree: the new leaf is the root.
     if tree.rootPage == 0 {
       let (rootNo, buf) = ctx.allocatePage()
-      PageHeader.initialize(buf.raw, type: .leaf)
-      _ = Node.leafInsert(buf.raw, at: 0, key: key, value: leafValue)
+      unsafe PageHeader.initialize(buf.raw, type: .leaf)
+      _ = unsafe Node.leafInsert(buf.raw, at: 0, key: key, value: leafValue)
       tree.rootPage = rootNo
       tree.depth = 1
       tree.count += 1
@@ -134,18 +134,18 @@ public enum BTree {
 
     var level = tree.depth
     while level > 1 {
-      let ro = currentBuf.readOnly
-      guard PageHeader.pageType(ro) == .branch else {
+      let ro = unsafe currentBuf.readOnly
+      guard unsafe PageHeader.pageType(ro) == .branch else {
         throw DBError.corruptPage(pageNo: currentNo)
       }
-      let slot = Node.branchChildSlot(ro, key: key)
-      let childNo = slot < 0 ? PageHeader.link(ro) : Node.branchChild(ro, slot)
+      let slot = unsafe Node.branchChildSlot(ro, key: key)
+      let childNo = unsafe slot < 0 ? PageHeader.link(ro) : Node.branchChild(ro, slot)
       let (newChildNo, childBuf) = try ctx.shadow(childNo)
       if newChildNo != childNo {
         if slot < 0 {
-          PageHeader.setLink(currentBuf.raw, newChildNo)
+          unsafe PageHeader.setLink(currentBuf.raw, newChildNo)
         } else {
-          Node.branchSetChild(currentBuf.raw, at: slot, child: newChildNo)
+          unsafe Node.branchSetChild(currentBuf.raw, at: slot, child: newChildNo)
         }
       }
       path.append((currentBuf, slot))
@@ -153,29 +153,29 @@ public enum BTree {
       level -= 1
     }
 
-    let ro = currentBuf.readOnly
-    guard PageHeader.pageType(ro) == .leaf else {
+    let ro = unsafe currentBuf.readOnly
+    guard unsafe PageHeader.pageType(ro) == .leaf else {
       throw DBError.corruptPage(pageNo: currentNo)
     }
-    let (index, exact) = Node.search(ro, key: key)
+    let (index, exact) = unsafe Node.search(ro, key: key)
     if exact {
       // Replace: drop the old cell (and its overflow chain) first.
-      let old = Node.leafCell(ro, index)
-      if old.inlineValue == nil {
+      let old = unsafe Node.leafCell(ro, index)
+      if unsafe old.inlineValue == nil {
         try Overflow.free(head: old.overflowHead, pager: &pager)
       }
-      Node.removeCell(currentBuf.raw, at: index)
+      unsafe Node.removeCell(currentBuf.raw, at: index)
     } else {
       tree.count += 1
     }
 
-    if Node.leafInsert(currentBuf.raw, at: index, key: key, value: leafValue) {
+    if unsafe Node.leafInsert(currentBuf.raw, at: index, key: key, value: leafValue) {
       return
     }
 
     // Leaf overflowed: split (left half stays on the shadowed page).
     let (rightNo, rightBuf) = ctx.allocatePage()
-    let separator = Node.splitLeafInserting(
+    let separator = unsafe Node.splitLeafInserting(
       original: currentBuf.readOnly, at: index, key: key, value: leafValue,
       left: currentBuf.raw, right: rightBuf.raw)
     insertSeparator(ctx, tree: &tree, path: path, separator: separator, rightChild: rightNo)
@@ -195,13 +195,13 @@ public enum BTree {
       let parent = path[level]
       let insertAt = parent.slot + 1
       let inserted = separator.withUnsafeBytes { sep in
-        Node.branchInsert(parent.buf.raw, at: insertAt, key: sep, child: rightChild)
+        unsafe Node.branchInsert(parent.buf.raw, at: insertAt, key: sep, child: rightChild)
       }
       if inserted { return }
 
       let (newRightNo, newRightBuf) = ctx.allocatePage()
       let upSeparator = separator.withUnsafeBytes { sep in
-        Node.splitBranchInserting(
+        unsafe Node.splitBranchInserting(
           original: parent.buf.readOnly, at: insertAt, key: sep, child: rightChild,
           left: parent.buf.raw, right: newRightBuf.raw)
       }
@@ -212,10 +212,10 @@ public enum BTree {
 
     // Root split: grow the tree by one level.
     let (newRootNo, rootBuf) = ctx.allocatePage()
-    PageHeader.initialize(rootBuf.raw, type: .branch)
-    PageHeader.setLink(rootBuf.raw, tree.rootPage)
+    unsafe PageHeader.initialize(rootBuf.raw, type: .branch)
+    unsafe PageHeader.setLink(rootBuf.raw, tree.rootPage)
     let ok = separator.withUnsafeBytes { sep in
-      Node.branchInsert(rootBuf.raw, at: 0, key: sep, child: rightChild)
+      unsafe Node.branchInsert(rootBuf.raw, at: 0, key: sep, child: rightChild)
     }
     precondition(ok, "fresh root must fit one separator")
     tree.rootPage = newRootNo
@@ -230,7 +230,7 @@ public enum BTree {
     resolver: some PageResolver, meta: Meta,
     _ body: (UnsafeRawBufferPointer, ValueRef) throws(DBError) -> Void
   ) throws(DBError) {
-    try forEach(resolver: resolver, tree: meta.mainTree, body)
+    unsafe try forEach(resolver: resolver, tree: meta.mainTree, body)
   }
 
   public static func forEach(
@@ -238,33 +238,33 @@ public enum BTree {
     _ body: (UnsafeRawBufferPointer, ValueRef) throws(DBError) -> Void
   ) throws(DBError) {
     guard tree.rootPage != 0 else { return }
-    try walk(resolver: resolver, pageNo: tree.rootPage, level: tree.depth, body)
+    unsafe try walk(resolver: resolver, pageNo: tree.rootPage, level: tree.depth, body)
   }
 
   private static func walk(
     resolver: some PageResolver, pageNo: UInt64, level: UInt16,
     _ body: (UnsafeRawBufferPointer, ValueRef) throws(DBError) -> Void
   ) throws(DBError) {
-    let page = try resolver.resolvePage(pageNo)
+    let page = unsafe try resolver.resolvePage(pageNo)
     if level > 1 {
-      guard PageHeader.pageType(page) == .branch else {
+      guard unsafe PageHeader.pageType(page) == .branch else {
         throw DBError.corruptPage(pageNo: pageNo)
       }
-      try walk(resolver: resolver, pageNo: PageHeader.link(page), level: level - 1, body)
-      for i in 0..<PageHeader.cellCount(page) {
-        try walk(resolver: resolver, pageNo: Node.branchChild(page, i), level: level - 1, body)
+      unsafe try walk(resolver: resolver, pageNo: PageHeader.link(page), level: level - 1, body)
+      for i in unsafe 0..<PageHeader.cellCount(page) {
+        unsafe try walk(resolver: resolver, pageNo: Node.branchChild(page, i), level: level - 1, body)
       }
       return
     }
-    guard PageHeader.pageType(page) == .leaf else {
+    guard unsafe PageHeader.pageType(page) == .leaf else {
       throw DBError.corruptPage(pageNo: pageNo)
     }
-    for i in 0..<PageHeader.cellCount(page) {
-      let cell = Node.leafCell(page, i)
-      if let inline = cell.inlineValue {
-        try body(cell.key, .inline(inline))
+    for i in unsafe 0..<PageHeader.cellCount(page) {
+      let cell = unsafe Node.leafCell(page, i)
+      if let inline = unsafe cell.inlineValue {
+        unsafe try body(cell.key, .inline(inline))
       } else {
-        try body(cell.key, .overflow(head: cell.overflowHead, length: Int(cell.overflowLength)))
+        unsafe try body(cell.key, .overflow(head: cell.overflowHead, length: Int(cell.overflowLength)))
       }
     }
   }
@@ -315,20 +315,20 @@ public enum BTree {
     guard report.reachablePages.insert(pageNo).inserted else {
       throw DBError.integrityFailure("page \(pageNo) reachable twice")
     }
-    let page = try resolver.resolvePage(pageNo)
-    if verifyChecksums, !PageHeader.verifyChecksum(page, pageNo: pageNo) {
+    let page = unsafe try resolver.resolvePage(pageNo)
+    if verifyChecksums, unsafe !PageHeader.verifyChecksum(page, pageNo: pageNo) {
       throw DBError.corruptPage(pageNo: pageNo)
     }
-    let count = PageHeader.cellCount(page)
+    let count = unsafe PageHeader.cellCount(page)
 
     func checkOrderAndBounds() throws(DBError) {
       for i in 0..<count {
-        let key = Node.nodeKey(page, i)
-        if i > 0, Node.compare(Node.nodeKey(page, i - 1), key) >= 0 {
+        let key = unsafe Node.nodeKey(page, i)
+        if i > 0, unsafe Node.compare(Node.nodeKey(page, i - 1), key) >= 0 {
           throw DBError.integrityFailure("page \(pageNo): keys out of order at \(i)")
         }
-        let lowerOK = lower.map { l in l.withUnsafeBytes { Node.compare($0, key) <= 0 } } ?? true
-        let upperOK = upper.map { u in u.withUnsafeBytes { Node.compare(key, $0) < 0 } } ?? true
+        let lowerOK = lower.map { l in l.withUnsafeBytes { unsafe Node.compare($0, key) <= 0 } } ?? true
+        let upperOK = upper.map { u in u.withUnsafeBytes { unsafe Node.compare(key, $0) < 0 } } ?? true
         guard lowerOK, upperOK else {
           throw DBError.integrityFailure("page \(pageNo): key \(i) outside separator bounds")
         }
@@ -336,7 +336,7 @@ public enum BTree {
     }
 
     if level > 1 {
-      guard PageHeader.pageType(page) == .branch else {
+      guard unsafe PageHeader.pageType(page) == .branch else {
         throw DBError.corruptPage(pageNo: pageNo)
       }
       guard count >= 1 else {
@@ -345,14 +345,14 @@ public enum BTree {
       report.branchCount += 1
       try checkOrderAndBounds()
       // leftmost child: (lower, key[0])
-      try validateNode(
+      unsafe try validateNode(
         resolver: resolver, pageNo: PageHeader.link(page), level: level - 1,
         lower: lower, upper: [UInt8](Node.branchKey(page, 0)),
         verifyChecksums: verifyChecksums, report: &report)
       for i in 0..<count {
-        let childLower = [UInt8](Node.branchKey(page, i))
-        let childUpper = i + 1 < count ? [UInt8](Node.branchKey(page, i + 1)) : upper
-        try validateNode(
+        let childLower = unsafe [UInt8](Node.branchKey(page, i))
+        let childUpper = unsafe i + 1 < count ? [UInt8](Node.branchKey(page, i + 1)) : upper
+        unsafe try validateNode(
           resolver: resolver, pageNo: Node.branchChild(page, i), level: level - 1,
           lower: childLower, upper: childUpper,
           verifyChecksums: verifyChecksums, report: &report)
@@ -360,7 +360,7 @@ public enum BTree {
       return
     }
 
-    guard PageHeader.pageType(page) == .leaf else {
+    guard unsafe PageHeader.pageType(page) == .leaf else {
       throw DBError.corruptPage(pageNo: pageNo)
     }
     guard isRoot || count >= 1 else {
@@ -370,8 +370,8 @@ public enum BTree {
     try checkOrderAndBounds()
     report.kvCount += UInt64(count)
     for i in 0..<count {
-      let cell = Node.leafCell(page, i)
-      if cell.inlineValue == nil {
+      let cell = unsafe Node.leafCell(page, i)
+      if unsafe cell.inlineValue == nil {
         var chainPage = cell.overflowHead
         var remaining = Int(cell.overflowLength)
         while chainPage != 0 {
@@ -379,15 +379,15 @@ public enum BTree {
             throw DBError.integrityFailure("overflow page \(chainPage) reachable twice")
           }
           report.overflowPages += 1
-          let overflow = try resolver.resolvePage(chainPage)
-          if verifyChecksums, !PageHeader.verifyChecksum(overflow, pageNo: chainPage) {
+          let overflow = unsafe try resolver.resolvePage(chainPage)
+          if verifyChecksums, unsafe !PageHeader.verifyChecksum(overflow, pageNo: chainPage) {
             throw DBError.corruptPage(pageNo: chainPage)
           }
-          guard PageHeader.pageType(overflow) == .overflow else {
+          guard unsafe PageHeader.pageType(overflow) == .overflow else {
             throw DBError.corruptPage(pageNo: chainPage)
           }
-          remaining -= PageHeader.overflowDataLen(overflow)
-          chainPage = PageHeader.link(overflow)
+          unsafe remaining -= PageHeader.overflowDataLen(overflow)
+          chainPage = unsafe PageHeader.link(overflow)
         }
         guard remaining == 0 else {
           throw DBError.integrityFailure(
@@ -407,7 +407,7 @@ struct ReadOnlyOverflowPager<R: PageResolver>: OverflowPager {
     preconditionFailure("read-only pager cannot allocate")
   }
   func readOverflowPage(_ pageNo: UInt64) throws(DBError) -> UnsafeRawBufferPointer {
-    try resolver.resolvePage(pageNo)
+    unsafe try resolver.resolvePage(pageNo)
   }
   func freeOverflowPage(_ pageNo: UInt64) throws(DBError) {
     preconditionFailure("read-only pager cannot free")

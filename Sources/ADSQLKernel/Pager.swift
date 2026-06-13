@@ -15,6 +15,6 @@ public final class Pager: PageSource, @unchecked Sendable {
   public func page(_ pageNo: UInt64) throws(DBError) -> UnsafeRawBufferPointer {
     let end = (Int(pageNo) + 1) * Format.pageSize
     guard end <= map.capacity else { throw DBError.mapFull }
-    return map.pageBytes(pageNo)
+    return unsafe map.pageBytes(pageNo)
   }
 }

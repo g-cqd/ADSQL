@@ -22,15 +22,15 @@ public enum FreeList {
 
   static func entryKey(gen: UInt64, seq: UInt16) -> [UInt8] {
     var key = [UInt8](repeating: 0, count: keySize)
-    withUnsafeBytes(of: gen.bigEndian) { key.replaceSubrange(0..<8, with: $0) }
-    withUnsafeBytes(of: seq.bigEndian) { key.replaceSubrange(8..<10, with: $0) }
+    withUnsafeBytes(of: gen.bigEndian) { unsafe key.replaceSubrange(0..<8, with: $0) }
+    withUnsafeBytes(of: seq.bigEndian) { unsafe key.replaceSubrange(8..<10, with: $0) }
     return key
   }
 
   static func decodeKey(_ key: UnsafeRawBufferPointer) -> (gen: UInt64, seq: UInt16)? {
     guard key.count == keySize else { return nil }
-    let gen = UInt64(bigEndian: key.loadUnaligned(fromByteOffset: 0, as: UInt64.self))
-    let seq = UInt16(bigEndian: key.loadUnaligned(fromByteOffset: 8, as: UInt16.self))
+    let gen = unsafe UInt64(bigEndian: key.loadUnaligned(fromByteOffset: 0, as: UInt64.self))
+    let seq = unsafe UInt16(bigEndian: key.loadUnaligned(fromByteOffset: 8, as: UInt16.self))
     return (gen, seq)
   }
 
@@ -41,7 +41,7 @@ public enum FreeList {
 
   @inline(__always)
   static func readVarint(_ bytes: UnsafeRawBufferPointer, _ offset: inout Int) -> UInt64? {
-    Varint.read(bytes, &offset)
+    unsafe Varint.read(bytes, &offset)
   }
 
   static let fixedWidthFlag: UInt32 = 0x8000_0000
@@ -56,10 +56,10 @@ public enum FreeList {
   /// Patches a fixed-width buffer with the final page list (count ≤ capacity).
   static func patchFixedWidth(_ buffer: UnsafeMutableRawBufferPointer, pages: ArraySlice<UInt64>) {
     precondition(buffer.count >= 4 + 8 * pages.count)
-    buffer.storeLE32(UInt32(pages.count) | fixedWidthFlag, at: 0)
+    unsafe buffer.storeLE32(UInt32(pages.count) | fixedWidthFlag, at: 0)
     var offset = 4
     for page in pages {
-      buffer.storeLE64(page, at: offset)
+      unsafe buffer.storeLE64(page, at: offset)
       offset += 8
     }
   }
@@ -68,7 +68,7 @@ public enum FreeList {
   static func encodePages(_ pages: ArraySlice<UInt64>) -> [UInt8] {
     var out: [UInt8] = []
     out.reserveCapacity(4 + pages.count * 3)
-    withUnsafeBytes(of: UInt32(pages.count).littleEndian) { out.append(contentsOf: $0) }
+    withUnsafeBytes(of: UInt32(pages.count).littleEndian) { unsafe out.append(contentsOf: $0) }
     var previous: UInt64 = 0
     var first = true
     for page in pages {
@@ -81,7 +81,7 @@ public enum FreeList {
 
   static func decodePages(_ bytes: UnsafeRawBufferPointer) throws(DBError) -> [UInt64] {
     guard bytes.count >= 4 else { throw DBError.integrityFailure("free entry too short") }
-    let rawCount = UInt32(littleEndian: bytes.loadUnaligned(fromByteOffset: 0, as: UInt32.self))
+    let rawCount = unsafe UInt32(littleEndian: bytes.loadUnaligned(fromByteOffset: 0, as: UInt32.self))
     if rawCount & fixedWidthFlag != 0 {
       let count = Int(rawCount & ~fixedWidthFlag)
       guard bytes.count >= 4 + 8 * count else {
@@ -90,7 +90,7 @@ public enum FreeList {
       var pages: [UInt64] = []
       pages.reserveCapacity(count)
       for i in 0..<count {
-        pages.append(UInt64(littleEndian: bytes.loadUnaligned(fromByteOffset: 4 + 8 * i, as: UInt64.self)))
+        unsafe pages.append(UInt64(littleEndian: bytes.loadUnaligned(fromByteOffset: 4 + 8 * i, as: UInt64.self)))
       }
       return pages
     }
@@ -100,7 +100,7 @@ public enum FreeList {
     var offset = 4
     var previous: UInt64 = 0
     for i in 0..<count {
-      guard let delta = readVarint(bytes, &offset) else {
+      guard let delta = unsafe readVarint(bytes, &offset) else {
         throw DBError.integrityFailure("free entry varint truncated")
       }
       previous = i == 0 ? delta : previous + delta
@@ -122,13 +122,13 @@ public enum FreeList {
       // Re-seek the first entry each round: deletes reshape the tree.
       var cursor = Cursor(resolver: ctx, tree: free)
       guard try cursor.move(to: .first) else { break }
-      let result: (key: [UInt8], pages: [UInt64])? = try cursor.withCurrent {
+      let result: (key: [UInt8], pages: [UInt64])? = unsafe try cursor.withCurrent {
         (key, ref) throws(DBError) in
-        guard let decoded = decodeKey(key), decoded.gen <= limit else { return nil }
+        guard let decoded = unsafe decodeKey(key), decoded.gen <= limit else { return nil }
         guard case .inline(let value) = ref else {
           throw DBError.integrityFailure("free entry value must be inline")
         }
-        return (key: [UInt8](key), pages: try decodePages(value))
+        return unsafe (key: [UInt8](key), pages: try decodePages(value))
       } ?? nil
       guard let result else { break }
 
@@ -139,7 +139,7 @@ public enum FreeList {
       var failure: DBError?
       result.key.withUnsafeBytes { keyBytes in
         do throws(DBError) {
-          _ = try BTree.delete(ctx: ctx, tree: &free, key: keyBytes)
+          _ = unsafe try BTree.delete(ctx: ctx, tree: &free, key: keyBytes)
         } catch {
           failure = error
         }
@@ -224,7 +224,7 @@ public enum FreeList {
     key.withUnsafeBytes { keyBytes in
       value.withUnsafeBytes { valueBytes in
         do throws(DBError) {
-          try BTree.put(ctx: ctx, tree: &tree, key: keyBytes, value: valueBytes)
+          unsafe try BTree.put(ctx: ctx, tree: &tree, key: keyBytes, value: valueBytes)
         } catch {
           failure = error
         }
@@ -240,14 +240,14 @@ public enum FreeList {
     resolver: some PageResolver, tree: TreeHandle
   ) throws(DBError) -> [(gen: UInt64, page: UInt64)] {
     var listed: [(gen: UInt64, page: UInt64)] = []
-    try BTree.forEach(resolver: resolver, tree: tree) { (key, ref) throws(DBError) in
-      guard let decoded = decodeKey(key) else {
+    unsafe try BTree.forEach(resolver: resolver, tree: tree) { (key, ref) throws(DBError) in
+      guard let decoded = unsafe decodeKey(key) else {
         throw DBError.integrityFailure("malformed free-list key")
       }
       guard case .inline(let value) = ref else {
         throw DBError.integrityFailure("free entry value must be inline")
       }
-      for page in try decodePages(value) {
+      for page in unsafe try decodePages(value) {
         listed.append((gen: decoded.gen, page: page))
       }
     }

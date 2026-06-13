@@ -19,7 +19,7 @@ extension BTree {
     ctx: TxnContext, key: UnsafeRawBufferPointer
   ) throws(DBError) -> Bool {
     var tree = ctx.meta.mainTree
-    let existed = try delete(ctx: ctx, tree: &tree, key: key)
+    let existed = unsafe try delete(ctx: ctx, tree: &tree, key: key)
     ctx.meta.mainTree = tree
     return existed
   }
@@ -27,12 +27,12 @@ extension BTree {
   public static func delete(
     ctx: TxnContext, tree: inout TreeHandle, key: UnsafeRawBufferPointer
   ) throws(DBError) -> Bool {
-    guard !key.isEmpty else { throw DBError.keyEmpty }
+    guard unsafe !key.isEmpty else { throw DBError.keyEmpty }
     guard key.count <= Format.maxKeySize else { throw DBError.keyTooLarge(key.count) }
     guard tree.rootPage != 0 else { return false }
 
     // Existence probe first: missing keys must not shadow anything.
-    guard try get(resolver: ctx, tree: tree, key: key) != nil else { return false }
+    guard unsafe try get(resolver: ctx, tree: tree, key: key) != nil else { return false }
 
     var (currentNo, currentBuf) = try ctx.shadow(tree.rootPage)
     tree.rootPage = currentNo
@@ -40,15 +40,15 @@ extension BTree {
 
     var level = tree.depth
     while level > 1 {
-      let ro = currentBuf.readOnly
-      let slot = Node.branchChildSlot(ro, key: key)
-      let childNo = slot < 0 ? PageHeader.link(ro) : Node.branchChild(ro, slot)
+      let ro = unsafe currentBuf.readOnly
+      let slot = unsafe Node.branchChildSlot(ro, key: key)
+      let childNo = unsafe slot < 0 ? PageHeader.link(ro) : Node.branchChild(ro, slot)
       let (newChildNo, childBuf) = try ctx.shadow(childNo)
       if newChildNo != childNo {
         if slot < 0 {
-          PageHeader.setLink(currentBuf.raw, newChildNo)
+          unsafe PageHeader.setLink(currentBuf.raw, newChildNo)
         } else {
-          Node.branchSetChild(currentBuf.raw, at: slot, child: newChildNo)
+          unsafe Node.branchSetChild(currentBuf.raw, at: slot, child: newChildNo)
         }
       }
       path.append(PathNode(pageNo: currentNo, buf: currentBuf, slot: slot))
@@ -56,17 +56,17 @@ extension BTree {
       level -= 1
     }
 
-    let ro = currentBuf.readOnly
-    let (index, exact) = Node.search(ro, key: key)
+    let ro = unsafe currentBuf.readOnly
+    let (index, exact) = unsafe Node.search(ro, key: key)
     guard exact else {
       throw DBError.integrityFailure("delete probe found key but descent did not")
     }
-    let cell = Node.leafCell(ro, index)
-    if cell.inlineValue == nil {
+    let cell = unsafe Node.leafCell(ro, index)
+    if unsafe cell.inlineValue == nil {
       var pager = ctx
       try Overflow.free(head: cell.overflowHead, pager: &pager)
     }
-    Node.removeCell(currentBuf.raw, at: index)
+    unsafe Node.removeCell(currentBuf.raw, at: index)
     tree.count -= 1
 
     try rebalance(
@@ -79,7 +79,7 @@ extension BTree {
 
   @inline(__always)
   static func payloadBytes(_ page: UnsafeRawBufferPointer) -> Int {
-    (Format.pageSize - PageHeader.cellAreaStart(page) - PageHeader.fragmentedBytes(page))
+    unsafe (Format.pageSize - PageHeader.cellAreaStart(page) - PageHeader.fragmentedBytes(page))
       + PageHeader.cellCount(page) * Format.slotSize
   }
 
@@ -91,37 +91,37 @@ extension BTree {
     _ ctx: TxnContext, tree: inout TreeHandle, path: [PathNode],
     nodePageNo: UInt64, nodeBuf: PageBuf, level: Int
   ) throws(DBError) {
-    let ro = nodeBuf.readOnly
+    let ro = unsafe nodeBuf.readOnly
     let isLeaf = level == path.count
 
     if level == 0 || (path.isEmpty && isLeaf) {
       // Root rules: empty the tree, or collapse one height level.
       if isLeaf {
-        if PageHeader.cellCount(ro) == 0 {
+        if unsafe PageHeader.cellCount(ro) == 0 {
           ctx.freePage(nodePageNo)
           tree.rootPage = 0
           tree.depth = 0
         }
-      } else if PageHeader.cellCount(ro) == 0 {
-        tree.rootPage = PageHeader.link(ro)
+      } else if unsafe PageHeader.cellCount(ro) == 0 {
+        tree.rootPage = unsafe PageHeader.link(ro)
         tree.depth -= 1
         ctx.freePage(nodePageNo)
       }
       return
     }
 
-    if payloadBytes(ro) >= rebalanceThreshold {
+    if unsafe payloadBytes(ro) >= rebalanceThreshold {
       return
     }
 
     let parent = path[level - 1]
-    let parentRO = parent.buf.readOnly
-    let parentCount = PageHeader.cellCount(parentRO)
+    let parentRO = unsafe parent.buf.readOnly
+    let parentCount = unsafe PageHeader.cellCount(parentRO)
     let slot = parent.slot
 
     if slot + 1 <= parentCount - 1 {
       // Right sibling exists: (left=node, right=sibling), parent cell slot+1.
-      let rightNo = Node.branchChild(parentRO, slot + 1)
+      let rightNo = unsafe Node.branchChild(parentRO, slot + 1)
       try rebalancePair(
         ctx, tree: &tree, path: path, level: level,
         leftNo: nodePageNo, leftBuf: nodeBuf, leftIsTarget: true,
@@ -129,7 +129,7 @@ extension BTree {
         parentCellIndex: slot + 1, isLeaf: isLeaf)
     } else if slot >= 0 {
       // Only a left sibling: (left=sibling, right=node), parent cell `slot`.
-      let leftNo = slot == 0 ? PageHeader.link(parentRO) : Node.branchChild(parentRO, slot - 1)
+      let leftNo = unsafe slot == 0 ? PageHeader.link(parentRO) : Node.branchChild(parentRO, slot - 1)
       try rebalancePair(
         ctx, tree: &tree, path: path, level: level,
         leftNo: leftNo, leftBuf: nil, leftIsTarget: false,
@@ -150,15 +150,15 @@ extension BTree {
     parentCellIndex: Int, isLeaf: Bool
   ) throws(DBError) {
     let parent = path[level - 1]
-    let separator = [UInt8](Node.branchKey(parent.buf.readOnly, parentCellIndex))
+    let separator = unsafe [UInt8](Node.branchKey(parent.buf.readOnly, parentCellIndex))
 
     let leftRO: UnsafeRawBufferPointer =
-      if let leftBuf { leftBuf.readOnly } else { try ctx.resolvePage(leftNo) }
+      if let leftBuf { unsafe leftBuf.readOnly } else { unsafe try ctx.resolvePage(leftNo) }
     let rightRO: UnsafeRawBufferPointer =
-      if let rightBuf { rightBuf.readOnly } else { try ctx.resolvePage(rightNo) }
+      if let rightBuf { unsafe rightBuf.readOnly } else { unsafe try ctx.resolvePage(rightNo) }
 
     let mergedPayload =
-      payloadBytes(leftRO) + payloadBytes(rightRO)
+      unsafe payloadBytes(leftRO) + payloadBytes(rightRO)
       + (isLeaf ? 0 : Node.branchCellSize(keyLen: separator.count) + Format.slotSize)
 
     if mergedPayload <= Format.usablePageSize {
@@ -169,15 +169,15 @@ extension BTree {
       }
       if !isLeaf {
         let ok = separator.withUnsafeBytes { sep in
-          Node.branchInsert(
+          unsafe Node.branchInsert(
             leftOwned.raw, at: PageHeader.cellCount(leftOwned.readOnly),
             key: sep, child: PageHeader.link(rightRO))
         }
         precondition(ok, "merge size was pre-checked")
       }
-      appendAllCells(from: rightRO, to: leftOwned)
+      unsafe appendAllCells(from: rightRO, to: leftOwned)
       ctx.freePage(rightNo)
-      Node.removeCell(parent.buf.raw, at: parentCellIndex)
+      unsafe Node.removeCell(parent.buf.raw, at: parentCellIndex)
       try rebalance(
         ctx, tree: &tree, path: path,
         nodePageNo: parent.pageNo, nodeBuf: parent.buf, level: level - 1)
@@ -197,45 +197,45 @@ extension BTree {
     let newSeparator: [UInt8]
     if leftIsTarget {
       // Move right's first cell into left.
-      let rRO = rightOwned.readOnly
+      let rRO = unsafe rightOwned.readOnly
       if isLeaf {
-        let image = cellImage(rRO, 0)
-        Node.removeCell(rightOwned.raw, at: 0)
+        let image = unsafe cellImage(rRO, 0)
+        unsafe Node.removeCell(rightOwned.raw, at: 0)
         appendCellImage(image, to: leftOwned)
-        newSeparator = [UInt8](Node.nodeKey(rightOwned.readOnly, 0))
+        newSeparator = unsafe [UInt8](Node.nodeKey(rightOwned.readOnly, 0))
       } else {
         let ok = separator.withUnsafeBytes { sep in
-          Node.branchInsert(
+          unsafe Node.branchInsert(
             leftOwned.raw, at: PageHeader.cellCount(leftOwned.readOnly),
             key: sep, child: PageHeader.link(rRO))
         }
         precondition(ok, "borrow target was underfull")
-        newSeparator = [UInt8](Node.branchKey(rRO, 0))
-        PageHeader.setLink(rightOwned.raw, Node.branchChild(rRO, 0))
-        Node.removeCell(rightOwned.raw, at: 0)
+        newSeparator = unsafe [UInt8](Node.branchKey(rRO, 0))
+        unsafe PageHeader.setLink(rightOwned.raw, Node.branchChild(rRO, 0))
+        unsafe Node.removeCell(rightOwned.raw, at: 0)
       }
     } else {
       // Move left's last cell into right.
-      let lRO = leftOwned.readOnly
-      let lastIndex = PageHeader.cellCount(lRO) - 1
+      let lRO = unsafe leftOwned.readOnly
+      let lastIndex = unsafe PageHeader.cellCount(lRO) - 1
       if isLeaf {
-        let image = cellImage(lRO, lastIndex)
+        let image = unsafe cellImage(lRO, lastIndex)
         newSeparator = Node.keyOfCellImage(image, type: .leaf)
-        Node.removeCell(leftOwned.raw, at: lastIndex)
+        unsafe Node.removeCell(leftOwned.raw, at: lastIndex)
         let ok = image.withUnsafeBytes { raw in
-          insertCellImage(raw, into: rightOwned, at: 0)
+          unsafe insertCellImage(raw, into: rightOwned, at: 0)
         }
         precondition(ok, "borrow target was underfull")
       } else {
-        newSeparator = [UInt8](Node.branchKey(lRO, lastIndex))
-        let pushedChild = Node.branchChild(lRO, lastIndex)
-        let oldLeftmost = PageHeader.link(rightOwned.readOnly)
+        newSeparator = unsafe [UInt8](Node.branchKey(lRO, lastIndex))
+        let pushedChild = unsafe Node.branchChild(lRO, lastIndex)
+        let oldLeftmost = unsafe PageHeader.link(rightOwned.readOnly)
         let ok = separator.withUnsafeBytes { sep in
-          Node.branchInsert(rightOwned.raw, at: 0, key: sep, child: oldLeftmost)
+          unsafe Node.branchInsert(rightOwned.raw, at: 0, key: sep, child: oldLeftmost)
         }
         precondition(ok, "borrow target was underfull")
-        PageHeader.setLink(rightOwned.raw, pushedChild)
-        Node.removeCell(leftOwned.raw, at: lastIndex)
+        unsafe PageHeader.setLink(rightOwned.raw, pushedChild)
+        unsafe Node.removeCell(leftOwned.raw, at: lastIndex)
       }
     }
 
@@ -252,15 +252,15 @@ extension BTree {
     cellIndex: Int, newKey: [UInt8]
   ) {
     let parent = path[parentLevel]
-    let child = Node.branchChild(parent.buf.readOnly, cellIndex)
-    Node.removeCell(parent.buf.raw, at: cellIndex)
+    let child = unsafe Node.branchChild(parent.buf.readOnly, cellIndex)
+    unsafe Node.removeCell(parent.buf.raw, at: cellIndex)
     let inserted = newKey.withUnsafeBytes { sep in
-      Node.branchInsert(parent.buf.raw, at: cellIndex, key: sep, child: child)
+      unsafe Node.branchInsert(parent.buf.raw, at: cellIndex, key: sep, child: child)
     }
     if inserted { return }
     let (newRightNo, newRightBuf) = ctx.allocatePage()
     let upSeparator = newKey.withUnsafeBytes { sep in
-      Node.splitBranchInserting(
+      unsafe Node.splitBranchInserting(
         original: parent.buf.readOnly, at: cellIndex, key: sep, child: child,
         left: parent.buf.raw, right: newRightBuf.raw)
     }
@@ -276,20 +276,20 @@ extension BTree {
     _ parentBuf: PageBuf, cellIndex: Int, to newChild: UInt64
   ) {
     if cellIndex < 0 {
-      PageHeader.setLink(parentBuf.raw, newChild)
+      unsafe PageHeader.setLink(parentBuf.raw, newChild)
     } else {
-      Node.branchSetChild(parentBuf.raw, at: cellIndex, child: newChild)
+      unsafe Node.branchSetChild(parentBuf.raw, at: cellIndex, child: newChild)
     }
   }
 
   static func cellImage(_ page: UnsafeRawBufferPointer, _ index: Int) -> [UInt8] {
-    let offset = PageHeader.slotOffset(page, index)
-    return [UInt8](page[offset..<offset + Node.cellLength(page, index)])
+    let offset = unsafe PageHeader.slotOffset(page, index)
+    return unsafe [UInt8](page[offset..<offset + Node.cellLength(page, index)])
   }
 
   private static func appendCellImage(_ image: [UInt8], to buf: PageBuf) {
     let ok = image.withUnsafeBytes { raw in
-      insertCellImage(raw, into: buf, at: PageHeader.cellCount(buf.readOnly))
+      unsafe insertCellImage(raw, into: buf, at: PageHeader.cellCount(buf.readOnly))
     }
     precondition(ok, "append target was pre-checked")
   }
@@ -297,19 +297,19 @@ extension BTree {
   private static func insertCellImage(
     _ image: UnsafeRawBufferPointer, into buf: PageBuf, at index: Int
   ) -> Bool {
-    Node.insertCell(buf.raw, at: index, size: image.count) { page, offset in
-      Node.copyBytes(into: page, at: offset, from: image)
+    unsafe Node.insertCell(buf.raw, at: index, size: image.count) { page, offset in
+      unsafe Node.copyBytes(into: page, at: offset, from: image)
     }
   }
 
   private static func appendAllCells(from source: UnsafeRawBufferPointer, to buf: PageBuf) {
-    for i in 0..<PageHeader.cellCount(source) {
-      let offset = PageHeader.slotOffset(source, i)
-      let length = Node.cellLength(source, i)
-      let ok = Node.insertCell(
+    for i in unsafe 0..<PageHeader.cellCount(source) {
+      let offset = unsafe PageHeader.slotOffset(source, i)
+      let length = unsafe Node.cellLength(source, i)
+      let ok = unsafe Node.insertCell(
         buf.raw, at: PageHeader.cellCount(buf.readOnly), size: length
       ) { page, dst in
-        Node.copyBytes(
+        unsafe Node.copyBytes(
           into: page, at: dst,
           from: UnsafeRawBufferPointer(rebasing: source[offset..<offset + length]))
       }

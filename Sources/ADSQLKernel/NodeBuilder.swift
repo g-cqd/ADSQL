@@ -19,7 +19,7 @@ public enum Node {
   public static func compare(_ a: UnsafeRawBufferPointer, _ b: UnsafeRawBufferPointer) -> Int {
     let n = min(a.count, b.count)
     if n > 0 {
-      let c = memcmp(a.baseAddress!, b.baseAddress!, n)
+      let c = unsafe memcmp(a.baseAddress!, b.baseAddress!, n)
       if c != 0 { return c < 0 ? -1 : 1 }
     }
     if a.count == b.count { return 0 }
@@ -49,72 +49,72 @@ public enum Node {
     public var overflowLength: UInt32
 
     public var valueLength: Int {
-      inlineValue?.count ?? Int(overflowLength)
+      unsafe inlineValue?.count ?? Int(overflowLength)
     }
   }
 
   @inline(__always)
   static func cellStart(_ page: UnsafeRawBufferPointer, _ index: Int) -> Int {
-    PageHeader.slotOffset(page, index)
+    unsafe PageHeader.slotOffset(page, index)
   }
 
   public static func leafCell(_ page: UnsafeRawBufferPointer, _ index: Int) -> LeafCell {
-    let at = cellStart(page, index)
-    let flags = page[at]
-    let keyLen = Int(page.loadLE16(at + 1))
+    let at = unsafe cellStart(page, index)
+    let flags = unsafe page[at]
+    let keyLen = unsafe Int(page.loadLE16(at + 1))
     if flags & leafOverflowFlag == 0 {
-      let valueLen = Int(page.loadLE16(at + 3))
+      let valueLen = unsafe Int(page.loadLE16(at + 3))
       let keyStart = at + 5
-      return LeafCell(
+      return unsafe LeafCell(
         key: UnsafeRawBufferPointer(rebasing: page[keyStart..<keyStart + keyLen]),
         inlineValue: UnsafeRawBufferPointer(
           rebasing: page[keyStart + keyLen..<keyStart + keyLen + valueLen]),
         overflowHead: 0, overflowLength: 0)
     }
-    let valueLen = page.loadLE32(at + 3)
-    let head = page.loadLE64(at + 7)
+    let valueLen = unsafe page.loadLE32(at + 3)
+    let head = unsafe page.loadLE64(at + 7)
     let keyStart = at + 15
-    return LeafCell(
+    return unsafe LeafCell(
       key: UnsafeRawBufferPointer(rebasing: page[keyStart..<keyStart + keyLen]),
       inlineValue: nil, overflowHead: head, overflowLength: valueLen)
   }
 
   @inline(__always)
   public static func branchKey(_ page: UnsafeRawBufferPointer, _ index: Int) -> UnsafeRawBufferPointer {
-    let at = cellStart(page, index)
-    let keyLen = Int(page.loadLE16(at))
-    return UnsafeRawBufferPointer(rebasing: page[at + 10..<at + 10 + keyLen])
+    let at = unsafe cellStart(page, index)
+    let keyLen = unsafe Int(page.loadLE16(at))
+    return unsafe UnsafeRawBufferPointer(rebasing: page[at + 10..<at + 10 + keyLen])
   }
 
   @inline(__always)
   public static func branchChild(_ page: UnsafeRawBufferPointer, _ index: Int) -> UInt64 {
-    page.loadLE64(cellStart(page, index) + 2)
+    unsafe page.loadLE64(cellStart(page, index) + 2)
   }
 
   @inline(__always)
   public static func nodeKey(_ page: UnsafeRawBufferPointer, _ index: Int) -> UnsafeRawBufferPointer {
-    if PageHeader.pageType(page) == .branch {
-      return branchKey(page, index)
+    if unsafe PageHeader.pageType(page) == .branch {
+      return unsafe branchKey(page, index)
     }
-    let at = cellStart(page, index)
-    let flags = page[at]
-    let keyLen = Int(page.loadLE16(at + 1))
+    let at = unsafe cellStart(page, index)
+    let flags = unsafe page[at]
+    let keyLen = unsafe Int(page.loadLE16(at + 1))
     let keyStart = at + (flags & leafOverflowFlag == 0 ? 5 : 15)
-    return UnsafeRawBufferPointer(rebasing: page[keyStart..<keyStart + keyLen])
+    return unsafe UnsafeRawBufferPointer(rebasing: page[keyStart..<keyStart + keyLen])
   }
 
   /// Total encoded size of the cell at `index` (used by removal accounting
   /// and page compaction).
   public static func cellLength(_ page: UnsafeRawBufferPointer, _ index: Int) -> Int {
-    let at = cellStart(page, index)
-    switch PageHeader.pageType(page) {
+    let at = unsafe cellStart(page, index)
+    switch unsafe PageHeader.pageType(page) {
     case .branch:
-      return branchCellSize(keyLen: Int(page.loadLE16(at)))
+      return unsafe branchCellSize(keyLen: Int(page.loadLE16(at)))
     default:
-      let flags = page[at]
-      let keyLen = Int(page.loadLE16(at + 1))
+      let flags = unsafe page[at]
+      let keyLen = unsafe Int(page.loadLE16(at + 1))
       if flags & leafOverflowFlag == 0 {
-        return inlineLeafCellSize(keyLen: keyLen, valueLen: Int(page.loadLE16(at + 3)))
+        return unsafe inlineLeafCellSize(keyLen: keyLen, valueLen: Int(page.loadLE16(at + 3)))
       }
       return overflowLeafCellSize(keyLen: keyLen)
     }
@@ -128,10 +128,10 @@ public enum Node {
     _ page: UnsafeRawBufferPointer, key: UnsafeRawBufferPointer
   ) -> (index: Int, exact: Bool) {
     var lo = 0
-    var hi = PageHeader.cellCount(page)
+    var hi = unsafe PageHeader.cellCount(page)
     while lo < hi {
       let mid = (lo + hi) / 2
-      let c = compare(nodeKey(page, mid), key)
+      let c = unsafe compare(nodeKey(page, mid), key)
       if c == 0 { return (mid, true) }
       if c < 0 { lo = mid + 1 } else { hi = mid }
     }
@@ -141,14 +141,14 @@ public enum Node {
   /// Index of the child to descend into for `key`: -1 = leftmost child.
   @inline(__always)
   public static func branchChildSlot(_ page: UnsafeRawBufferPointer, key: UnsafeRawBufferPointer) -> Int {
-    let (index, exact) = search(page, key: key)
+    let (index, exact) = unsafe search(page, key: key)
     return exact ? index : index - 1
   }
 
   @inline(__always)
   public static func descendTarget(_ page: UnsafeRawBufferPointer, key: UnsafeRawBufferPointer) -> UInt64 {
-    let slot = branchChildSlot(page, key: key)
-    return slot < 0 ? PageHeader.link(page) : branchChild(page, slot)
+    let slot = unsafe branchChildSlot(page, key: key)
+    return unsafe slot < 0 ? PageHeader.link(page) : branchChild(page, slot)
   }
 
   // MARK: - Cell encoding
@@ -178,17 +178,17 @@ public enum Node {
   ) {
     switch value {
     case .inline(let v):
-      page[offset] = 0
-      page.storeLE16(UInt16(key.count), at: offset + 1)
-      page.storeLE16(UInt16(v.count), at: offset + 3)
-      copyBytes(into: page, at: offset + 5, from: key)
-      copyBytes(into: page, at: offset + 5 + key.count, from: v)
+      unsafe page[offset] = 0
+      unsafe page.storeLE16(UInt16(key.count), at: offset + 1)
+      unsafe page.storeLE16(UInt16(v.count), at: offset + 3)
+      unsafe copyBytes(into: page, at: offset + 5, from: key)
+      unsafe copyBytes(into: page, at: offset + 5 + key.count, from: v)
     case .overflow(let head, let length):
-      page[offset] = leafOverflowFlag
-      page.storeLE16(UInt16(key.count), at: offset + 1)
-      page.storeLE32(length, at: offset + 3)
-      page.storeLE64(head, at: offset + 7)
-      copyBytes(into: page, at: offset + 15, from: key)
+      unsafe page[offset] = leafOverflowFlag
+      unsafe page.storeLE16(UInt16(key.count), at: offset + 1)
+      unsafe page.storeLE32(length, at: offset + 3)
+      unsafe page.storeLE64(head, at: offset + 7)
+      unsafe copyBytes(into: page, at: offset + 15, from: key)
     }
   }
 
@@ -196,17 +196,17 @@ public enum Node {
     into page: UnsafeMutableRawBufferPointer, at offset: Int,
     key: UnsafeRawBufferPointer, child: UInt64
   ) {
-    page.storeLE16(UInt16(key.count), at: offset)
-    page.storeLE64(child, at: offset + 2)
-    copyBytes(into: page, at: offset + 10, from: key)
+    unsafe page.storeLE16(UInt16(key.count), at: offset)
+    unsafe page.storeLE64(child, at: offset + 2)
+    unsafe copyBytes(into: page, at: offset + 10, from: key)
   }
 
   @inline(__always)
   static func copyBytes(
     into page: UnsafeMutableRawBufferPointer, at offset: Int, from source: UnsafeRawBufferPointer
   ) {
-    guard !source.isEmpty else { return }
-    UnsafeMutableRawBufferPointer(rebasing: page[offset..<offset + source.count])
+    guard unsafe !source.isEmpty else { return }
+    unsafe UnsafeMutableRawBufferPointer(rebasing: page[offset..<offset + source.count])
       .copyMemory(from: source)
   }
 
@@ -220,27 +220,27 @@ public enum Node {
   ) -> Bool {
     let ro = UnsafeRawBufferPointer(page)
     let need = size + Format.slotSize
-    if PageHeader.freeSpace(ro) < need {
-      if PageHeader.freeSpace(ro) + PageHeader.fragmentedBytes(ro) >= need {
-        compact(page)
+    if unsafe PageHeader.freeSpace(ro) < need {
+      if unsafe PageHeader.freeSpace(ro) + PageHeader.fragmentedBytes(ro) >= need {
+        unsafe compact(page)
       } else {
         return false
       }
     }
-    let count = PageHeader.cellCount(ro)
-    let newOffset = PageHeader.cellAreaStart(ro) - size
-    write(page, newOffset)
+    let count = unsafe PageHeader.cellCount(ro)
+    let newOffset = unsafe PageHeader.cellAreaStart(ro) - size
+    unsafe write(page, newOffset)
 
     // Shift slots [index, count) up one position.
     let slotBase = Format.nodeHeaderSize
     if count > index {
       let src = slotBase + index * Format.slotSize
       let len = (count - index) * Format.slotSize
-      memmove(page.baseAddress! + src + Format.slotSize, page.baseAddress! + src, len)
+      unsafe memmove(page.baseAddress! + src + Format.slotSize, page.baseAddress! + src, len)
     }
-    PageHeader.setSlotOffset(page, index, newOffset)
-    PageHeader.setCellCount(page, count + 1)
-    PageHeader.setCellAreaStart(page, newOffset)
+    unsafe PageHeader.setSlotOffset(page, index, newOffset)
+    unsafe PageHeader.setCellCount(page, count + 1)
+    unsafe PageHeader.setCellAreaStart(page, newOffset)
     return true
   }
 
@@ -248,8 +248,8 @@ public enum Node {
     _ page: UnsafeMutableRawBufferPointer, at index: Int,
     key: UnsafeRawBufferPointer, value: LeafValue
   ) -> Bool {
-    insertCell(page, at: index, size: leafCellSize(keyLen: key.count, value: value)) {
-      encodeLeafCell(into: $0, at: $1, key: key, value: value)
+    unsafe insertCell(page, at: index, size: leafCellSize(keyLen: key.count, value: value)) {
+      unsafe encodeLeafCell(into: $0, at: $1, key: key, value: value)
     }
   }
 
@@ -257,8 +257,8 @@ public enum Node {
     _ page: UnsafeMutableRawBufferPointer, at index: Int,
     key: UnsafeRawBufferPointer, child: UInt64
   ) -> Bool {
-    insertCell(page, at: index, size: branchCellSize(keyLen: key.count)) {
-      encodeBranchCell(into: $0, at: $1, key: key, child: child)
+    unsafe insertCell(page, at: index, size: branchCellSize(keyLen: key.count)) {
+      unsafe encodeBranchCell(into: $0, at: $1, key: key, child: child)
     }
   }
 
@@ -266,21 +266,21 @@ public enum Node {
   /// (or reclaiming directly when it borders the cell area start).
   public static func removeCell(_ page: UnsafeMutableRawBufferPointer, at index: Int) {
     let ro = UnsafeRawBufferPointer(page)
-    let count = PageHeader.cellCount(ro)
-    let offset = PageHeader.slotOffset(ro, index)
-    let length = cellLength(ro, index)
+    let count = unsafe PageHeader.cellCount(ro)
+    let offset = unsafe PageHeader.slotOffset(ro, index)
+    let length = unsafe cellLength(ro, index)
 
     let slotBase = Format.nodeHeaderSize
     if index < count - 1 {
       let dst = slotBase + index * Format.slotSize
       let len = (count - 1 - index) * Format.slotSize
-      memmove(page.baseAddress! + dst, page.baseAddress! + dst + Format.slotSize, len)
+      unsafe memmove(page.baseAddress! + dst, page.baseAddress! + dst + Format.slotSize, len)
     }
-    PageHeader.setCellCount(page, count - 1)
-    if offset == PageHeader.cellAreaStart(ro) {
-      PageHeader.setCellAreaStart(page, offset + length)
+    unsafe PageHeader.setCellCount(page, count - 1)
+    if unsafe offset == PageHeader.cellAreaStart(ro) {
+      unsafe PageHeader.setCellAreaStart(page, offset + length)
     } else {
-      PageHeader.setFragmentedBytes(page, PageHeader.fragmentedBytes(ro) + length)
+      unsafe PageHeader.setFragmentedBytes(page, PageHeader.fragmentedBytes(ro) + length)
     }
   }
 
@@ -288,8 +288,8 @@ public enum Node {
   public static func branchSetChild(
     _ page: UnsafeMutableRawBufferPointer, at index: Int, child: UInt64
   ) {
-    let offset = PageHeader.slotOffset(UnsafeRawBufferPointer(page), index)
-    page.storeLE64(child, at: offset + 2)
+    let offset = unsafe PageHeader.slotOffset(UnsafeRawBufferPointer(page), index)
+    unsafe page.storeLE64(child, at: offset + 2)
   }
 
   // MARK: - Compaction
@@ -297,33 +297,33 @@ public enum Node {
   /// Rewrites the cell area densely (slot order preserved), clearing
   /// fragmentation. Uses a scratch copy of the page.
   public static func compact(_ page: UnsafeMutableRawBufferPointer) {
-    let scratch = PageBuf(copying: UnsafeRawBufferPointer(page))
-    let ro = scratch.readOnly
-    let count = PageHeader.cellCount(ro)
+    let scratch = unsafe PageBuf(copying: UnsafeRawBufferPointer(page))
+    let ro = unsafe scratch.readOnly
+    let count = unsafe PageHeader.cellCount(ro)
     var writeEnd = Format.pageSize
     for i in 0..<count {
-      let length = cellLength(ro, i)
-      let src = PageHeader.slotOffset(ro, i)
+      let length = unsafe cellLength(ro, i)
+      let src = unsafe PageHeader.slotOffset(ro, i)
       writeEnd -= length
-      copyBytes(
+      unsafe copyBytes(
         into: page, at: writeEnd,
         from: UnsafeRawBufferPointer(rebasing: ro[src..<src + length]))
-      PageHeader.setSlotOffset(page, i, writeEnd)
+      unsafe PageHeader.setSlotOffset(page, i, writeEnd)
     }
-    PageHeader.setCellAreaStart(page, writeEnd)
-    PageHeader.setFragmentedBytes(page, 0)
+    unsafe PageHeader.setCellAreaStart(page, writeEnd)
+    unsafe PageHeader.setFragmentedBytes(page, 0)
   }
 
   // MARK: - Splits
 
   /// Copied image of every cell on a page, in slot order.
   static func cellImages(_ page: UnsafeRawBufferPointer) -> [[UInt8]] {
-    let count = PageHeader.cellCount(page)
+    let count = unsafe PageHeader.cellCount(page)
     var cells: [[UInt8]] = []
     cells.reserveCapacity(count + 1)
     for i in 0..<count {
-      let offset = PageHeader.slotOffset(page, i)
-      cells.append([UInt8](page[offset..<offset + cellLength(page, i)]))
+      let offset = unsafe PageHeader.slotOffset(page, i)
+      unsafe cells.append([UInt8](page[offset..<offset + cellLength(page, i)]))
     }
     return cells
   }
@@ -332,11 +332,11 @@ public enum Node {
     cell.withUnsafeBytes { raw in
       switch type {
       case .branch:
-        let keyLen = Int(raw.loadLE16(0))
+        let keyLen = unsafe Int(raw.loadLE16(0))
         return [UInt8](cell[10..<10 + keyLen])
       default:
-        let keyLen = Int(raw.loadLE16(1))
-        let keyStart = raw[0] & leafOverflowFlag == 0 ? 5 : 15
+        let keyLen = unsafe Int(raw.loadLE16(1))
+        let keyStart = unsafe raw[0] & leafOverflowFlag == 0 ? 5 : 15
         return [UInt8](cell[keyStart..<keyStart + keyLen])
       }
     }
@@ -346,18 +346,18 @@ public enum Node {
     _ page: UnsafeMutableRawBufferPointer, type: PageType, cells: ArraySlice<[UInt8]>,
     leftmostChild: UInt64
   ) {
-    PageHeader.initialize(page, type: type)
-    PageHeader.setLink(page, leftmostChild)
+    unsafe PageHeader.initialize(page, type: type)
+    unsafe PageHeader.setLink(page, leftmostChild)
     var writeEnd = Format.pageSize
     var slot = 0
     for cell in cells {
       writeEnd -= cell.count
-      cell.withUnsafeBytes { copyBytes(into: page, at: writeEnd, from: $0) }
-      PageHeader.setSlotOffset(page, slot, writeEnd)
+      cell.withUnsafeBytes { unsafe copyBytes(into: page, at: writeEnd, from: $0) }
+      unsafe PageHeader.setSlotOffset(page, slot, writeEnd)
       slot += 1
     }
-    PageHeader.setCellCount(page, slot)
-    PageHeader.setCellAreaStart(page, writeEnd)
+    unsafe PageHeader.setCellCount(page, slot)
+    unsafe PageHeader.setCellAreaStart(page, writeEnd)
   }
 
   /// Picks the split point: smallest prefix carrying at least half the bytes,
@@ -382,17 +382,17 @@ public enum Node {
     key: UnsafeRawBufferPointer, value: LeafValue,
     left: UnsafeMutableRawBufferPointer, right: UnsafeMutableRawBufferPointer
   ) -> [UInt8] {
-    var cells = cellImages(original)
+    var cells = unsafe cellImages(original)
     var newCell = [UInt8](repeating: 0, count: leafCellSize(keyLen: key.count, value: value))
     newCell.withUnsafeMutableBytes { raw in
-      encodeLeafCell(
+      unsafe encodeLeafCell(
         into: UnsafeMutableRawBufferPointer(mutating: UnsafeRawBufferPointer(raw)), at: 0,
         key: key, value: value)
     }
     cells.insert(newCell, at: index)
     let split = splitPoint(cells)
-    rebuild(left, type: .leaf, cells: cells[..<split], leftmostChild: 0)
-    rebuild(right, type: .leaf, cells: cells[split...], leftmostChild: 0)
+    unsafe rebuild(left, type: .leaf, cells: cells[..<split], leftmostChild: 0)
+    unsafe rebuild(right, type: .leaf, cells: cells[split...], leftmostChild: 0)
     return keyOfCellImage(cells[split], type: .leaf)
   }
 
@@ -404,20 +404,20 @@ public enum Node {
     key: UnsafeRawBufferPointer, child: UInt64,
     left: UnsafeMutableRawBufferPointer, right: UnsafeMutableRawBufferPointer
   ) -> [UInt8] {
-    let leftmost = PageHeader.link(original)
-    var cells = cellImages(original)
+    let leftmost = unsafe PageHeader.link(original)
+    var cells = unsafe cellImages(original)
     var newCell = [UInt8](repeating: 0, count: branchCellSize(keyLen: key.count))
     newCell.withUnsafeMutableBytes { raw in
-      encodeBranchCell(
+      unsafe encodeBranchCell(
         into: UnsafeMutableRawBufferPointer(mutating: UnsafeRawBufferPointer(raw)), at: 0,
         key: key, child: child)
     }
     cells.insert(newCell, at: index)
     let mid = splitPoint(cells)
     let separator = keyOfCellImage(cells[mid], type: .branch)
-    let promotedChild = cells[mid].withUnsafeBytes { $0.loadLE64(2) }
-    rebuild(left, type: .branch, cells: cells[..<mid], leftmostChild: leftmost)
-    rebuild(right, type: .branch, cells: cells[(mid + 1)...], leftmostChild: promotedChild)
+    let promotedChild = cells[mid].withUnsafeBytes { unsafe $0.loadLE64(2) }
+    unsafe rebuild(left, type: .branch, cells: cells[..<mid], leftmostChild: leftmost)
+    unsafe rebuild(right, type: .branch, cells: cells[(mid + 1)...], leftmostChild: promotedChild)
     return separator
   }
 }

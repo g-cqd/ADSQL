@@ -17,25 +17,25 @@ public enum Overflow {
   public static func write<P: OverflowPager>(
     _ value: UnsafeRawBufferPointer, pager: inout P
   ) throws(DBError) -> UInt64 {
-    precondition(!value.isEmpty)
+    unsafe precondition(!value.isEmpty)
     let pages = pageCount(forLength: value.count)
-    var allocated: [(pageNo: UInt64, buffer: UnsafeMutableRawBufferPointer)] = []
-    allocated.reserveCapacity(pages)
+    var allocated: [(pageNo: UInt64, buffer: UnsafeMutableRawBufferPointer)] = unsafe []
+    unsafe allocated.reserveCapacity(pages)
     for _ in 0..<pages {
-      allocated.append(try pager.allocateOverflowPage())
+      unsafe allocated.append(try pager.allocateOverflowPage())
     }
-    var remaining = value
-    for (i, slot) in allocated.enumerated() {
+    var remaining = unsafe value
+    for unsafe (i, slot) in unsafe allocated.enumerated() {
       let take = min(remaining.count, Format.overflowCapacity)
-      PageHeader.initialize(slot.buffer, type: .overflow)
-      PageHeader.setCellCount(slot.buffer, take) // dataLen
-      PageHeader.setLink(slot.buffer, i + 1 < pages ? allocated[i + 1].pageNo : 0)
-      Node.copyBytes(
+      unsafe PageHeader.initialize(slot.buffer, type: .overflow)
+      unsafe PageHeader.setCellCount(slot.buffer, take) // dataLen
+      unsafe PageHeader.setLink(slot.buffer, i + 1 < pages ? allocated[i + 1].pageNo : 0)
+      unsafe Node.copyBytes(
         into: slot.buffer, at: Format.nodeHeaderSize,
         from: UnsafeRawBufferPointer(rebasing: remaining[remaining.startIndex..<remaining.startIndex + take]))
-      remaining = UnsafeRawBufferPointer(rebasing: remaining[(remaining.startIndex + take)...])
+      unsafe remaining = unsafe UnsafeRawBufferPointer(rebasing: remaining[(remaining.startIndex + take)...])
     }
-    return allocated[0].pageNo
+    return unsafe allocated[0].pageNo
   }
 
   /// Reads a whole chain back (copying); `length` comes from the leaf cell.
@@ -47,18 +47,18 @@ public enum Overflow {
     var pageNo = head
     var remaining = length
     while pageNo != 0, remaining > 0 {
-      let page = try pager.readOverflowPage(pageNo)
-      guard PageHeader.pageType(page) == .overflow else {
+      let page = unsafe try pager.readOverflowPage(pageNo)
+      guard unsafe PageHeader.pageType(page) == .overflow else {
         throw DBError.corruptPage(pageNo: pageNo)
       }
-      let dataLen = PageHeader.overflowDataLen(page)
+      let dataLen = unsafe PageHeader.overflowDataLen(page)
       guard dataLen <= Format.overflowCapacity, dataLen <= remaining else {
         throw DBError.corruptPage(pageNo: pageNo)
       }
-      out.append(
+      unsafe out.append(
         contentsOf: page[Format.nodeHeaderSize..<Format.nodeHeaderSize + dataLen])
       remaining -= dataLen
-      pageNo = PageHeader.link(page)
+      pageNo = unsafe PageHeader.link(page)
     }
     guard remaining == 0 else {
       throw DBError.corruptPage(pageNo: head)
@@ -74,19 +74,19 @@ public enum Overflow {
     var pageNo = head
     var remaining = length
     while pageNo != 0, remaining > 0 {
-      let page = try pager.readOverflowPage(pageNo)
-      guard PageHeader.pageType(page) == .overflow else {
+      let page = unsafe try pager.readOverflowPage(pageNo)
+      guard unsafe PageHeader.pageType(page) == .overflow else {
         throw DBError.corruptPage(pageNo: pageNo)
       }
-      let dataLen = PageHeader.overflowDataLen(page)
+      let dataLen = unsafe PageHeader.overflowDataLen(page)
       guard dataLen <= Format.overflowCapacity, dataLen <= remaining else {
         throw DBError.corruptPage(pageNo: pageNo)
       }
-      body(
+      unsafe body(
         UnsafeRawBufferPointer(
           rebasing: page[Format.nodeHeaderSize..<Format.nodeHeaderSize + dataLen]))
       remaining -= dataLen
-      pageNo = PageHeader.link(page)
+      pageNo = unsafe PageHeader.link(page)
     }
     guard remaining == 0 else {
       throw DBError.corruptPage(pageNo: head)
@@ -99,7 +99,7 @@ public enum Overflow {
   ) throws(DBError) {
     var pageNo = head
     while pageNo != 0 {
-      let next = PageHeader.link(try pager.readOverflowPage(pageNo))
+      let next = unsafe PageHeader.link(try pager.readOverflowPage(pageNo))
       try pager.freeOverflowPage(pageNo)
       pageNo = next
     }

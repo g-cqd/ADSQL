@@ -44,23 +44,23 @@ public struct Cursor<R: PageResolver>: ~Copyable {
     var pageNo = tree.rootPage
     var level = tree.depth
     while level > 1 {
-      let page = try resolver.resolvePage(pageNo)
-      guard PageHeader.pageType(page) == .branch else {
+      let page = unsafe try resolver.resolvePage(pageNo)
+      guard unsafe PageHeader.pageType(page) == .branch else {
         throw DBError.corruptPage(pageNo: pageNo)
       }
-      let slot = Node.branchChildSlot(page, key: key)
+      let slot = unsafe Node.branchChildSlot(page, key: key)
       stack.append((pageNo, slot))
-      pageNo = slot < 0 ? PageHeader.link(page) : Node.branchChild(page, slot)
+      pageNo = unsafe slot < 0 ? PageHeader.link(page) : Node.branchChild(page, slot)
       level -= 1
     }
-    let leaf = try resolver.resolvePage(pageNo)
-    guard PageHeader.pageType(leaf) == .leaf else {
+    let leaf = unsafe try resolver.resolvePage(pageNo)
+    guard unsafe PageHeader.pageType(leaf) == .leaf else {
       throw DBError.corruptPage(pageNo: pageNo)
     }
-    let (index, exact) = Node.search(leaf, key: key)
+    let (index, exact) = unsafe Node.search(leaf, key: key)
     stack.append((pageNo, index))
     isValid = true
-    if index == PageHeader.cellCount(leaf) {
+    if unsafe index == PageHeader.cellCount(leaf) {
       // Lower bound lies in a later leaf (or past the end).
       isValid = try stepLeaf(direction: +1)
     }
@@ -75,20 +75,20 @@ public struct Cursor<R: PageResolver>: ~Copyable {
   /// where `Node.search` (the same primitive `seek` ends with) is authoritative.
   public mutating func seekForward(_ key: UnsafeRawBufferPointer) throws(DBError) -> Bool {
     if isValid, let top = stack.last {
-      let leaf = try resolver.resolvePage(top.pageNo)
-      let count = PageHeader.cellCount(leaf)
-      if PageHeader.pageType(leaf) == .leaf, count > 0 {
-        let firstKey = Node.leafCell(leaf, 0).key
-        let lastKey = Node.leafCell(leaf, count - 1).key
-        if Node.compare(key, firstKey) >= 0, Node.compare(key, lastKey) <= 0 {
-          let (index, exact) = Node.search(leaf, key: key)
+      let leaf = unsafe try resolver.resolvePage(top.pageNo)
+      let count = unsafe PageHeader.cellCount(leaf)
+      if unsafe PageHeader.pageType(leaf) == .leaf, count > 0 {
+        let firstKey = unsafe Node.leafCell(leaf, 0).key
+        let lastKey = unsafe Node.leafCell(leaf, count - 1).key
+        if unsafe Node.compare(key, firstKey) >= 0, unsafe Node.compare(key, lastKey) <= 0 {
+          let (index, exact) = unsafe Node.search(leaf, key: key)
           stack[stack.count - 1].index = index
           isValid = true
           return exact
         }
       }
     }
-    return try seek(key)
+    return unsafe try seek(key)
   }
 
   @discardableResult
@@ -98,8 +98,8 @@ public struct Cursor<R: PageResolver>: ~Copyable {
     guard tree.rootPage != 0 else { return false }
     try descend(from: tree.rootPage, level: tree.depth, edge: edge)
     let (leafNo, index) = stack[stack.count - 1]
-    let leaf = try resolver.resolvePage(leafNo)
-    isValid = index >= 0 && index < PageHeader.cellCount(leaf)
+    let leaf = unsafe try resolver.resolvePage(leafNo)
+    isValid = unsafe index >= 0 && index < PageHeader.cellCount(leaf)
     return isValid
   }
 
@@ -107,8 +107,8 @@ public struct Cursor<R: PageResolver>: ~Copyable {
   public mutating func next() throws(DBError) -> Bool {
     guard isValid else { return false }
     let top = stack.count - 1
-    let leaf = try resolver.resolvePage(stack[top].pageNo)
-    if stack[top].index + 1 < PageHeader.cellCount(leaf) {
+    let leaf = unsafe try resolver.resolvePage(stack[top].pageNo)
+    if unsafe stack[top].index + 1 < PageHeader.cellCount(leaf) {
       stack[top].index += 1
       return true
     }
@@ -136,22 +136,22 @@ public struct Cursor<R: PageResolver>: ~Copyable {
   ) throws(DBError) -> T? {
     guard isValid else { return nil }
     let (leafNo, index) = stack[stack.count - 1]
-    let leaf = try resolver.resolvePage(leafNo)
-    let cell = Node.leafCell(leaf, index)
-    if let inline = cell.inlineValue {
-      return try body(cell.key, .inline(inline))
+    let leaf = unsafe try resolver.resolvePage(leafNo)
+    let cell = unsafe Node.leafCell(leaf, index)
+    if let inline = unsafe cell.inlineValue {
+      return unsafe try body(cell.key, .inline(inline))
     }
-    return try body(
+    return unsafe try body(
       cell.key, .overflow(head: cell.overflowHead, length: Int(cell.overflowLength)))
   }
 
   public mutating func currentKey() throws(DBError) -> [UInt8]? {
-    try withCurrent { key, _ in [UInt8](key) }
+    unsafe try withCurrent { key, _ in unsafe [UInt8](key) }
   }
 
   /// Materializes the current value (streams overflow chains).
   public mutating func currentValue() throws(DBError) -> [UInt8]? {
-    let ref: BTree.ValueRef? = try withCurrent { _, ref in ref }
+    let ref: BTree.ValueRef? = unsafe try withCurrent { _, ref in ref }
     guard let ref else { return nil }
     return try BTree.copyValue(ref, resolver: resolver)
   }
@@ -166,21 +166,21 @@ public struct Cursor<R: PageResolver>: ~Copyable {
     var pageNo = pageNo
     var level = level
     while level > 1 {
-      let page = try resolver.resolvePage(pageNo)
-      guard PageHeader.pageType(page) == .branch else {
+      let page = unsafe try resolver.resolvePage(pageNo)
+      guard unsafe PageHeader.pageType(page) == .branch else {
         throw DBError.corruptPage(pageNo: pageNo)
       }
-      let count = PageHeader.cellCount(page)
+      let count = unsafe PageHeader.cellCount(page)
       let slot = edge == .first ? -1 : count - 1
       stack.append((pageNo, slot))
-      pageNo = slot < 0 ? PageHeader.link(page) : Node.branchChild(page, slot)
+      pageNo = unsafe slot < 0 ? PageHeader.link(page) : Node.branchChild(page, slot)
       level -= 1
     }
-    let leaf = try resolver.resolvePage(pageNo)
-    guard PageHeader.pageType(leaf) == .leaf else {
+    let leaf = unsafe try resolver.resolvePage(pageNo)
+    guard unsafe PageHeader.pageType(leaf) == .leaf else {
       throw DBError.corruptPage(pageNo: pageNo)
     }
-    stack.append((pageNo, edge == .first ? 0 : PageHeader.cellCount(leaf) - 1))
+    unsafe stack.append((pageNo, edge == .first ? 0 : PageHeader.cellCount(leaf) - 1))
   }
 
   /// Pops to the nearest branch with an unvisited sibling in `direction`,
@@ -190,12 +190,12 @@ public struct Cursor<R: PageResolver>: ~Copyable {
     stack.removeLast() // leaf frame
     while !stack.isEmpty {
       let frame = stack[stack.count - 1]
-      let page = try resolver.resolvePage(frame.pageNo)
+      let page = unsafe try resolver.resolvePage(frame.pageNo)
       let nextIndex = frame.index + direction
-      let limit = PageHeader.cellCount(page) - 1
+      let limit = unsafe PageHeader.cellCount(page) - 1
       if nextIndex >= -1 && nextIndex <= limit {
         stack[stack.count - 1].index = nextIndex
-        let child = nextIndex < 0 ? PageHeader.link(page) : Node.branchChild(page, nextIndex)
+        let child = unsafe nextIndex < 0 ? PageHeader.link(page) : Node.branchChild(page, nextIndex)
         let childLevel = UInt16(depth - stack.count)
         try descend(from: child, level: childLevel, edge: direction > 0 ? .first : .last)
         return true
