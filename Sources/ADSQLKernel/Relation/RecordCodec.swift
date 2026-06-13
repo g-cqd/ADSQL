@@ -85,6 +85,28 @@ public enum RecordCodec {
     return unsafe try decodeOne(bytes, &offset)
   }
 
+  /// Decodes the column at `index` directly from a `RawSpan` record (the
+  /// lifetime-checked scan path). `index` must be in range and must not be the
+  /// rowid-alias column (the caller substitutes the rowid). Columns the row did
+  /// not store read as their schema DEFAULT/NULL. The single point that bridges
+  /// the safe `RawSpan` to the existing pointer-based decoder.
+  public static func value(
+    at index: Int, in span: RawSpan, defaults columns: [ColumnDefinition]
+  ) throws(DBError) -> Value {
+    try span.withUnsafeBytes { (bytes: UnsafeRawBufferPointer) throws(DBError) -> Value in
+      var offset = 0
+      let stored = unsafe try readHeader(bytes, &offset)
+      if index >= stored {
+        switch columns[index].defaultValue {
+        case .value(let v): return v
+        case .datetimeNow, nil: return .null
+        }
+      }
+      for _ in 0..<index { unsafe try skipCell(bytes, &offset) }
+      return unsafe try decodeCell(bytes, at: offset)
+    }
+  }
+
   /// Reads the leading varint column count and advances `offset` to the first
   /// cell — the entry point for incremental, allocation-free column location.
   public static func readHeader(

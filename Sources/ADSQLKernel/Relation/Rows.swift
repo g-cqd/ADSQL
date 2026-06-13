@@ -32,17 +32,21 @@ public struct Row: Equatable, Sendable {
 /// header just far enough to reach it, with no allocation and no work for
 /// columns the caller never touches.
 ///
-/// Noncopyable and delivered `borrowing`: its bytes are a view into a mapped
-/// page valid only for the callback that receives it, so it cannot escape.
-@safe public struct RowView: ~Copyable {
+/// Noncopyable **and `~Escapable`**: it borrows a `RawSpan` view of a mapped
+/// page valid only for the callback that receives it, and the compiler now
+/// *enforces* that it cannot outlive that borrow (Review 0001 F1 — `@safe`
+/// previously only asserted this). A scan reads columns through it on demand;
+/// trying to store or return one fails to compile.
+public struct RowView: ~Copyable, ~Escapable {
   public let rowid: Int64
   let definition: TableDefinition
-  let span: UnsafeRawBufferPointer
+  let span: RawSpan
 
-  init(rowid: Int64, definition: TableDefinition, span: UnsafeRawBufferPointer) {
+  @_lifetime(copy span)
+  init(rowid: Int64, definition: TableDefinition, span: RawSpan) {
     self.rowid = rowid
     self.definition = definition
-    unsafe self.span = unsafe span
+    self.span = span
   }
 
   /// The value of the column at `index` (schema order). Columns a short row did
@@ -51,16 +55,7 @@ public struct Row: Equatable, Sendable {
   public func value(at index: Int) throws(DBError) -> Value {
     precondition(index >= 0 && index < definition.columns.count, "column index out of range")
     if let alias = definition.rowidAliasIndex, index == alias { return .integer(rowid) }
-    var offset = 0
-    let stored = unsafe try RecordCodec.readHeader(span, &offset)
-    if index >= stored {
-      switch definition.columns[index].defaultValue {
-      case .value(let v): return v
-      case .datetimeNow, nil: return .null
-      }
-    }
-    for _ in 0..<index { unsafe try RecordCodec.skipCell(span, &offset) }
-    return unsafe try RecordCodec.decodeCell(span, at: offset)
+    return try RecordCodec.value(at: index, in: span, defaults: definition.columns)
   }
 
   /// The value of the named column, or nil when no such column exists.
@@ -262,9 +257,26 @@ public struct RowCursor<R: PageResolver>: ~Copyable {
     _ body: (borrowing RowView) throws(DBError) -> Bool
   ) throws(DBError) {
     let definition = table.definition
+    // Bind each record span to the resolver (the snapshot owner). A `RowView`
+    // borrowing it therefore cannot outlive the snapshot: escaping the scan —
+    // exactly the use-after-free the page recycler would make silent — fails
+    // to compile (Review 0001 F1). `resolver` is captured locally so the bound
+    // views also cannot escape this call.
+    let resolver = self.resolver
     unsafe try forEachRecordSpan { (rowid, span) throws(DBError) -> Bool in
-      unsafe try body(RowView(rowid: rowid, definition: definition, span: span))
+      let record = unsafe Self.bindSpan(span, to: resolver)
+      return try body(RowView(rowid: rowid, definition: definition, span: record))
     }
+  }
+
+  /// Re-expresses a record pointer (valid for the current snapshot) as a
+  /// `RawSpan` whose lifetime is tied to the resolver that owns the mapping.
+  /// The page memory stays valid as long as the snapshot does; binding the
+  /// span there is what lets the compiler reject a view that escapes it.
+  @_lifetime(borrow resolver)
+  static func bindSpan(_ bytes: UnsafeRawBufferPointer, to resolver: borrowing R) -> RawSpan {
+    let span = unsafe RawSpan(_unsafeBytes: bytes)
+    return unsafe _overrideLifetime(span, borrowing: resolver)
   }
 
   /// The next fully materialized row, or nil at the end of the bounds.
