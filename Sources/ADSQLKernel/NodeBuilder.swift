@@ -405,7 +405,19 @@ public enum Node {
         key: key, value: value)
     }
     cells.insert(newCell, at: index)
-    let split = splitPoint(cells)
+    // Append/prepend bias: a key inserted at a leaf edge is the signature of a
+    // sequential (often bulk) load. A 50/50 split there strands the just-filled
+    // side at ~50% forever; keeping it packed and starting the new side with the
+    // single edge cell yields ~100% fill on monotonic loads (random inserts land
+    // interior and fall back to the balanced split).
+    let split: Int
+    if index == cells.count - 1 {
+      split = cells.count - 1
+    } else if index == 0 {
+      split = 1
+    } else {
+      split = splitPoint(cells)
+    }
     unsafe rebuild(left, type: .leaf, cells: cells[..<split], leftmostChild: 0)
     unsafe rebuild(right, type: .leaf, cells: cells[split...], leftmostChild: 0)
     return keyOfCellImage(cells[split], type: .leaf)
