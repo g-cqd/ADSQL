@@ -282,6 +282,79 @@ struct RelationDMLSemanticsTests {
     _ = try db.verifyIntegrity()
   }
 
+  /// The lazy `forEachRow`/`RowView` path decodes exactly the same values as
+  /// the eager `next()`/`Row` path, for both table (rowid-order) and index
+  /// (key-order, warm table-cursor fetch) scans, across every column kind: the
+  /// rowid alias, a static default, a blob, text, and NULLs.
+  @Test func lazyRowViewMatchesEagerRow() throws {
+    let dir = TempDir()
+    defer { dir.cleanup() }
+    let db = try makeDB(dir, "lazyview.adsql")
+    defer { db.close() }
+
+    try db.writeSync { (txn) throws(DBError) in
+      _ = try txn.insert(into: "docs", [
+        "key": .text("a"), "title": .text("Alpha"),
+        "score": .integer(5), "payload": .blob([1, 2, 3])])
+      _ = try txn.insert(into: "docs", ["key": .text("b")])  // title/payload NULL, score default
+      _ = try txn.insert(into: "docs", [
+        "key": .text("c"), "title": .text("Gamma"), "score": .integer(2)])
+    }
+    let columnCount = docsDef.columns.count
+
+    func eager<R: PageResolver>(_ cursor: inout RowCursor<R>) throws(DBError) -> [[Value]] {
+      var out: [[Value]] = []
+      while let row = try cursor.next() { out.append(row.values) }
+      return out
+    }
+    func lazy<R: PageResolver>(_ cursor: inout RowCursor<R>) throws(DBError) -> [[Value]] {
+      var out: [[Value]] = []
+      try cursor.forEachRow { (view) throws(DBError) in
+        var values: [Value] = []
+        for index in 0..<columnCount { values.append(try view.value(at: index)) }
+        out.append(values)
+        return true
+      }
+      return out
+    }
+
+    let tableEager = try db.read { (txn) throws(DBError) in
+      try txn.withRowCursor(table: "docs") { (c) throws(DBError) in try eager(&c) }
+    }
+    let tableLazy = try db.read { (txn) throws(DBError) in
+      try txn.withRowCursor(table: "docs") { (c) throws(DBError) in try lazy(&c) }
+    }
+    let indexEager = try db.read { (txn) throws(DBError) in
+      try txn.withIndexCursor(index: "i_docs_title") { (c) throws(DBError) in try eager(&c) }
+    }
+    let indexLazy = try db.read { (txn) throws(DBError) in
+      try txn.withIndexCursor(index: "i_docs_title") { (c) throws(DBError) in try lazy(&c) }
+    }
+
+    #expect(tableEager == tableLazy)
+    #expect(indexEager == indexLazy)
+    #expect(tableEager.count == 3)
+    #expect(tableLazy[0] == [.integer(1), .text("a"), .text("Alpha"), .integer(5), .blob([1, 2, 3])])
+    #expect(tableLazy[1] == [.integer(2), .text("b"), .null, .integer(0), .null])
+
+    // Name-based access, the rowid alias by name, and a missing column.
+    var probes: [(rowid: Int64, keyByName: Value?, idByName: Int64?, missing: Value?)] = []
+    try db.read { (txn) throws(DBError) in
+      try txn.withRowCursor(table: "docs") { (cursor) throws(DBError) in
+        try cursor.forEachRow { (view) throws(DBError) in
+          probes.append(
+            (view.rowid, try view.value("key"), try view.integer("id"), try view.value("nope")))
+          return true
+        }
+      }
+    }
+    for probe in probes {
+      #expect(probe.keyByName != nil)
+      #expect(probe.idByName == probe.rowid)
+      #expect(probe.missing == nil)
+    }
+  }
+
   @Test func nocaseUniqueAndScans() throws {
     let dir = TempDir()
     defer { dir.cleanup() }

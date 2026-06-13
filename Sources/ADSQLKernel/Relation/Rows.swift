@@ -26,6 +26,67 @@ public struct Row: Equatable, Sendable {
   }
 }
 
+/// A lazy, read-only view of one row during a scan callback. Where the eager
+/// `Row` decodes every column into a `[Value]` and builds a name array up
+/// front, `RowView` decodes a single column on demand — walking the record
+/// header just far enough to reach it, with no allocation and no work for
+/// columns the caller never touches.
+///
+/// Noncopyable and delivered `borrowing`: its bytes are a view into a mapped
+/// page valid only for the callback that receives it, so it cannot escape.
+public struct RowView: ~Copyable {
+  public let rowid: Int64
+  let definition: TableDefinition
+  let span: UnsafeRawBufferPointer
+
+  init(rowid: Int64, definition: TableDefinition, span: UnsafeRawBufferPointer) {
+    self.rowid = rowid
+    self.definition = definition
+    self.span = span
+  }
+
+  /// The value of the column at `index` (schema order). Columns a short row did
+  /// not store (e.g. after a future ADD COLUMN) read as their DEFAULT/NULL; the
+  /// rowid-alias column reads as the rowid.
+  public func value(at index: Int) throws(DBError) -> Value {
+    precondition(index >= 0 && index < definition.columns.count, "column index out of range")
+    if let alias = definition.rowidAliasIndex, index == alias { return .integer(rowid) }
+    var offset = 0
+    let stored = try RecordCodec.readHeader(span, &offset)
+    if index >= stored {
+      switch definition.columns[index].defaultValue {
+      case .value(let v): return v
+      case .datetimeNow, nil: return .null
+      }
+    }
+    for _ in 0..<index { try RecordCodec.skipCell(span, &offset) }
+    return try RecordCodec.decodeCell(span, at: offset)
+  }
+
+  /// The value of the named column, or nil when no such column exists.
+  public func value(_ name: String) throws(DBError) -> Value? {
+    guard let index = definition.columnIndex(of: name) else { return nil }
+    return try value(at: index)
+  }
+
+  public func integer(_ name: String) throws(DBError) -> Int64? {
+    if case .integer(let v)? = try value(name) { return v }
+    return nil
+  }
+  public func real(_ name: String) throws(DBError) -> Double? {
+    if case .real(let v)? = try value(name) { return v }
+    return nil
+  }
+  public func text(_ name: String) throws(DBError) -> String? {
+    if case .text(let v)? = try value(name) { return v }
+    return nil
+  }
+  public func blob(_ name: String) throws(DBError) -> [UInt8]? {
+    if case .blob(let v)? = try value(name) { return v }
+    return nil
+  }
+}
+
 /// Forward iteration over a table (rowid order) or an index (key order),
 /// materializing rows. Index cursors resolve each entry's rowid back into
 /// the table tree; a dangling entry is corruption and throws.
@@ -191,6 +252,18 @@ public struct RowCursor<R: PageResolver>: ~Copyable {
   ) -> Bool {
     upperKey.withUnsafeBytes { upper in
       Node.compare(key, UnsafeRawBufferPointer(rebasing: upper[...])) < 0
+    }
+  }
+
+  /// Lazy push scan: invokes `body` with a `RowView` per row in bounds, where
+  /// each column decodes on demand (no per-row `Row` materialization). `body`
+  /// returns false to stop early; the view is valid only for that call.
+  public mutating func forEachRow(
+    _ body: (borrowing RowView) throws(DBError) -> Bool
+  ) throws(DBError) {
+    let definition = table.definition
+    try forEachRecordSpan { (rowid, span) throws(DBError) -> Bool in
+      try body(RowView(rowid: rowid, definition: definition, span: span))
     }
   }
 

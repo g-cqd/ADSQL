@@ -109,8 +109,9 @@ enum TableScenario {
         index: "i_documents_framework", bounds: .prefix([.text("swiftui")])
       ) { (cursor) throws(DBError) in
         var n = 0
-        while let row = try cursor.next() {
-          n += row.text("kind") == nil ? 0 : 1
+        try cursor.forEachRow { (row) throws(DBError) in
+          n += (try row.text("kind")) == nil ? 0 : 1
+          return true
         }
         return n
       }
