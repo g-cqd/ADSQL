@@ -1,8 +1,9 @@
-/// Single-table SELECT execution over a `PageResolver` (committed reader or
-/// write-transaction overlay). The pipeline is full scan → WHERE filter →
-/// projection → DISTINCT → ORDER BY → OFFSET/LIMIT, fully materialized before
-/// the transaction closure returns. Access-path selection (rowid/index
-/// probes, ordered early-exit) arrives in M4/PR4; here every query is a scan.
+/// SELECT execution over a `PageResolver` (committed reader or write-txn
+/// overlay). The single-table pipeline is access-path source → WHERE filter →
+/// projection → DISTINCT → ORDER BY → OFFSET/LIMIT (with a LIMIT early-exit
+/// when the source order is final); joins add a nested-loop driver that
+/// null-extends LEFT non-matches and applies ON during matching, WHERE after.
+/// Results are fully materialized before the transaction closure returns.
 
 /// On-demand row view over copied record bytes. Decodes a column only when
 /// the evaluator asks for it and caches the result, so a scan that filters on
@@ -87,11 +88,15 @@ final class RowSlot {
 
 enum SelectExecutor {
   static func run<R: PageResolver>(
-    _ plan: BoundSelect, table: Catalog.TableRecord, index: Catalog.IndexRecord?,
+    _ plan: BoundSelect, tables: [Catalog.TableRecord], index: Catalog.IndexRecord?,
     resolver: R, params: SQLParameters
   ) throws(DBError) -> [SQLRow] {
-    let slot = RowSlot(table: table.definition)
-    let env = rowEnv(plan, slot: slot, params: params)
+    if plan.isJoin {
+      return try runJoin(plan, tables: tables, index: index, resolver: resolver, params: params)
+    }
+    let table = tables[0]
+    let context = RowContext(definitions: tables.map(\.definition))
+    let env = rowEnv(plan, context: context, params: params)
     let paramsEnv = SQLEvalEnv.parametersOnly { p throws(DBError) in try params.lookup(p) }
     let bounds = try sliceBounds(plan, params: params)
 
@@ -99,29 +104,15 @@ enum SelectExecutor {
     // its order satisfies ORDER BY (so the sort and a LIMIT early-exit are
     // safe). An index probe whose values do not convert to the column class
     // falls back to a table scan — still correct via the residual WHERE.
-    let source: RowSource
+    let source = try resolveSource(plan, table: table, index: index, env: paramsEnv)
     let ordered: Bool
-    switch plan.access {
-    case .tableScan:
-      source = .table
+    switch source {
+    case .table:
       ordered = plan.orderBy.isEmpty || plan.rowidOrderSatisfiesOrderBy
-    case .rowid(let exprs):
-      source = .rowids(try evaluateRowids(exprs, paramsEnv))
+    case .rowids:
       ordered = plan.accessYieldsOrder
-    case .index(_, let probes, _):
-      guard let index else {
-        source = .table
-        ordered = plan.orderBy.isEmpty || plan.rowidOrderSatisfiesOrderBy
-        break
-      }
-      switch try buildIndexBounds(probes, index: index, table: table, env: paramsEnv) {
-      case .scan:
-        source = .table
-        ordered = plan.orderBy.isEmpty || plan.rowidOrderSatisfiesOrderBy
-      case .bounds(let list):
-        source = .index(index, list)
-        ordered = plan.orderBy.isEmpty || (plan.accessYieldsOrder && list.count <= 1)
-      }
+    case .index(_, let list):
+      ordered = plan.orderBy.isEmpty || (plan.accessYieldsOrder && list.count <= 1)
     }
 
     // Early-exit under LIMIT is sound only when the source order is final and
@@ -136,10 +127,12 @@ enum SelectExecutor {
     }()
 
     let accumulator = Accumulator(
-      slot: slot, env: env, residual: plan.whereExpr, outputs: plan.outputs,
+      context: context, env: env, residual: plan.whereExpr, outputs: plan.outputs,
       orderBy: plan.orderBy, collectKeys: collectKeys, sliceEnd: sliceEnd,
       dedupRowids: dedupRowids)
-    try scan(source, table: table, resolver: resolver, into: accumulator)
+    try forEachRow(source, table: table, resolver: resolver) { rowid, record throws(DBError) in
+      try accumulator.consume(rowid: rowid, record: record)
+    }
 
     var rows = accumulator.rows
     var sortKeys = accumulator.sortKeys
@@ -170,7 +163,7 @@ enum SelectExecutor {
   /// Accumulates surviving rows; `consume` returns false to request early
   /// termination (LIMIT reached on an already-ordered source).
   private final class Accumulator {
-    let slot: RowSlot
+    let context: RowContext
     let env: SQLEvalEnv
     let residual: SQLExpr?
     let outputs: [BoundOutput]
@@ -182,10 +175,10 @@ enum SelectExecutor {
     var sortKeys: [[Value]] = []
 
     init(
-      slot: RowSlot, env: SQLEvalEnv, residual: SQLExpr?, outputs: [BoundOutput],
+      context: RowContext, env: SQLEvalEnv, residual: SQLExpr?, outputs: [BoundOutput],
       orderBy: [SQLOrderingTerm], collectKeys: Bool, sliceEnd: Int?, dedupRowids: Bool
     ) {
-      self.slot = slot
+      self.context = context
       self.env = env
       self.residual = residual
       self.outputs = outputs
@@ -200,7 +193,7 @@ enum SelectExecutor {
         if seenRowids!.contains(rowid) { return true }
         seenRowids!.insert(rowid)
       }
-      slot.load(rowid: rowid, record: record)
+      context.load(0, rowid: rowid, record: record)
       if let residual {
         if SQLEval.truth(try SQLEval.evaluate(residual, env)) != .yes { return true }
       }
@@ -219,22 +212,25 @@ enum SelectExecutor {
     }
   }
 
-  private static func scan<R: PageResolver>(
-    _ source: RowSource, table: Catalog.TableRecord, resolver: R, into acc: Accumulator
+  /// Drives a row source, invoking `body` per `(rowid, record)`. `body`
+  /// returns false to stop early.
+  private static func forEachRow<R: PageResolver>(
+    _ source: RowSource, table: Catalog.TableRecord, resolver: R,
+    _ body: (Int64, [UInt8]) throws(DBError) -> Bool
   ) throws(DBError) {
     switch source {
     case .table:
       var cursor = try RowCursor(
         resolver: resolver, table: table, mode: .table, lowerKey: nil, upperKey: nil)
       while let (rowid, record) = try cursor.nextRecord() {
-        if !(try acc.consume(rowid: rowid, record: record)) { return }
+        if !(try body(rowid, record)) { return }
       }
     case .rowids(let rowids):
       for rowid in rowids {
         guard
           let record = try Relation.getBytes(resolver, table.handle, key: KeyCodec.rowKey(rowid))
         else { continue }
-        if !(try acc.consume(rowid: rowid, record: record)) { return }
+        if !(try body(rowid, record)) { return }
       }
     case .index(let index, let boundsList):
       for bounds in boundsList {
@@ -242,10 +238,105 @@ enum SelectExecutor {
         var cursor = try RowCursor(
           resolver: resolver, table: table, mode: .index(index), lowerKey: lower, upperKey: upper)
         while let (rowid, record) = try cursor.nextRecord() {
-          if !(try acc.consume(rowid: rowid, record: record)) { return }
+          if !(try body(rowid, record)) { return }
         }
       }
     }
+  }
+
+  /// Resolves the leading table's access plan into a concrete row source for
+  /// this execution (probe values may be parameters; an unconvertible probe
+  /// falls back to a table scan).
+  private static func resolveSource(
+    _ plan: BoundSelect, table: Catalog.TableRecord, index: Catalog.IndexRecord?,
+    env paramsEnv: SQLEvalEnv
+  ) throws(DBError) -> RowSource {
+    switch plan.access {
+    case .tableScan:
+      return .table
+    case .rowid(let exprs):
+      return .rowids(try evaluateRowids(exprs, paramsEnv))
+    case .index(_, let probes, _):
+      guard let index else { return .table }
+      switch try buildIndexBounds(probes, index: index, table: table, env: paramsEnv) {
+      case .scan: return .table
+      case .bounds(let list): return .index(index, list)
+      }
+    }
+  }
+
+  // MARK: - Joins (nested loop, null-extension)
+
+  private static func runJoin<R: PageResolver>(
+    _ plan: BoundSelect, tables: [Catalog.TableRecord], index: Catalog.IndexRecord?,
+    resolver: R, params: SQLParameters
+  ) throws(DBError) -> [SQLRow] {
+    let context = RowContext(definitions: tables.map(\.definition))
+    let env = rowEnv(plan, context: context, params: params)
+    let paramsEnv = SQLEvalEnv.parametersOnly { p throws(DBError) in try params.lookup(p) }
+    let collectKeys = !plan.orderBy.isEmpty
+
+    var rows: [[Value]] = []
+    var sortKeys: [[Value]] = []
+
+    // Recurse to the right through the join tables; the leaf applies the full
+    // WHERE (after any LEFT null-extension) and projects. ON predicates filter
+    // during matching only.
+    func descend(_ depth: Int) throws(DBError) {
+      if depth == tables.count {
+        if let predicate = plan.whereExpr {
+          if SQLEval.truth(try SQLEval.evaluate(predicate, env)) != .yes { return }
+        }
+        var projected: [Value] = []
+        projected.reserveCapacity(plan.outputs.count)
+        for output in plan.outputs { projected.append(try SQLEval.evaluate(output.expr, env)) }
+        rows.append(projected)
+        if collectKeys {
+          var keys: [Value] = []
+          for term in plan.orderBy { keys.append(try SQLEval.evaluate(term.expr, env)) }
+          sortKeys.append(keys)
+        }
+        return
+      }
+      let join = plan.joins[depth - 1]
+      var matched = false
+      try forEachRow(.table, table: tables[depth], resolver: resolver) {
+        rowid, record throws(DBError) in
+        context.load(depth, rowid: rowid, record: record)
+        if SQLEval.truth(try SQLEval.evaluate(join.on, env)) == .yes {
+          matched = true
+          try descend(depth + 1)
+        }
+        return true
+      }
+      if join.kind == .left && !matched {
+        context.setNull(depth)
+        try descend(depth + 1)
+      }
+    }
+
+    let outerSource = try resolveSource(plan, table: tables[0], index: index, env: paramsEnv)
+    try forEachRow(outerSource, table: tables[0], resolver: resolver) {
+      rowid, record throws(DBError) in
+      context.load(0, rowid: rowid, record: record)
+      try descend(1)
+      return true
+    }
+
+    if plan.distinct {
+      (rows, sortKeys) = deduplicate(
+        rows, sortKeys: sortKeys, ordered: collectKeys, collations: plan.outputCollations)
+    }
+    if collectKeys {
+      let order = sortedOrder(sortKeys, terms: plan.orderBy, collations: plan.orderCollations)
+      rows = order.map { rows[$0] }
+    }
+    if let bounds = try sliceBounds(plan, params: params) {
+      let lower = min(bounds.offset, rows.count)
+      let upper = bounds.limit.map { min(lower + $0, rows.count) } ?? rows.count
+      rows = Array(rows[lower..<upper])
+    }
+    return rows.map { SQLRow(header: plan.header, values: $0) }
   }
 
   // MARK: - Probe evaluation & type-boundary coercion
@@ -360,23 +451,47 @@ enum SelectExecutor {
 
   // MARK: - Evaluation environment
 
+  /// The live row for each table in a query, with per-table null-extension for
+  /// LEFT joins. Column reads route here through the binding's resolver.
+  final class RowContext {
+    let slots: [RowSlot]
+    var nullExtended: [Bool]
+
+    init(definitions: [TableDefinition]) {
+      self.slots = definitions.map { RowSlot(table: $0) }
+      self.nullExtended = Array(repeating: false, count: definitions.count)
+    }
+
+    func load(_ table: Int, rowid: Int64, record: [UInt8]) {
+      nullExtended[table] = false
+      slots[table].load(rowid: rowid, record: record)
+    }
+    func setNull(_ table: Int) { nullExtended[table] = true }
+
+    func value(table: Int, column: Int) throws(DBError) -> Value {
+      nullExtended[table] ? .null : try slots[table].value(at: column)
+    }
+  }
+
   private static func rowEnv(
-    _ plan: BoundSelect, slot: RowSlot, params: SQLParameters
+    _ plan: BoundSelect, context: RowContext, params: SQLParameters
   ) -> SQLEvalEnv {
-    let source = plan.source
+    let binding = plan.binding
     return SQLEvalEnv(
       parameter: { parameter throws(DBError) in try params.lookup(parameter) },
       column: { (qualifier, name, _) throws(DBError) in
-        guard let index = source.columnIndex(qualifier: qualifier, name: name) else {
-          throw DBError.noSuchColumn(table: qualifier ?? source.table, column: name)
+        guard let (table, column) = binding.resolve(qualifier: qualifier, name: name) else {
+          throw DBError.noSuchColumn(table: qualifier ?? binding.tables[0].table, column: name)
         }
-        return try slot.value(at: index)
+        return try context.value(table: table, column: column)
       },
       collationOf: { (qualifier, name) in
-        source.columnIndex(qualifier: qualifier, name: name).map { source.columnCollations[$0] }
+        binding.resolve(qualifier: qualifier, name: name)
+          .map { binding.tables[$0.table].columnCollations[$0.column] }
       },
       columnTypeOf: { (qualifier, name) in
-        source.columnIndex(qualifier: qualifier, name: name).map { source.columnTypes[$0] }
+        binding.resolve(qualifier: qualifier, name: name)
+          .map { binding.tables[$0.table].columnTypes[$0.column] }
       },
       scalarSubquery: { _ throws(DBError) in
         throw DBError.sqlUnsupported("subquery (arrives in a later slice)")

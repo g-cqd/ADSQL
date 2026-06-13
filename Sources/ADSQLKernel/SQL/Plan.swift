@@ -46,9 +46,48 @@ struct BoundOutput: Sendable {
   let expr: SQLExpr
 }
 
-/// A single-table SELECT resolved against one schema version.
+/// One join in a nested-loop plan: the right-hand table (by index into the
+/// query's tables) and its ON predicate. INNER filters matches; LEFT emits one
+/// null-extended row when the right side has no match.
+struct BoundJoin: Sendable {
+  let kind: SQLJoinKind
+  let table: Int
+  let on: SQLExpr
+}
+
+/// All tables in a query's FROM/JOIN list, with column resolution across them.
+struct QueryBinding: Sendable {
+  let tables: [TableBinding]
+
+  /// Resolves (qualifier, name) to (table index, column index). Unqualified
+  /// names that match more than one table are ambiguous (nil → the evaluator
+  /// reports no-such-column).
+  func resolve(qualifier: String?, name: String) -> (table: Int, column: Int)? {
+    let key = name.lowercased()
+    if let qualifier {
+      let q = qualifier.lowercased()
+      for (index, table) in tables.enumerated() where table.binding == q {
+        return table.indexByName[key].map { (index, $0) }
+      }
+      return nil
+    }
+    var found: (Int, Int)?
+    for (index, table) in tables.enumerated() {
+      if let column = table.indexByName[key] {
+        if found != nil { return nil }  // ambiguous
+        found = (index, column)
+      }
+    }
+    return found
+  }
+}
+
+/// A SELECT resolved against one schema version: one or more tables (the first
+/// is the leading/outer table), joins, projection, filters, and ordering. The
+/// access plan optimizes the leading table; joined tables nested-loop scan.
 struct BoundSelect: Sendable {
-  let source: TableBinding
+  let binding: QueryBinding
+  let joins: [BoundJoin]
   let outputs: [BoundOutput]
   let outputCollations: [Collation]
   let whereExpr: SQLExpr?
@@ -63,13 +102,14 @@ struct BoundSelect: Sendable {
   let accessYieldsOrder: Bool
   /// Table (rowid) order satisfies ORDER BY — used on index→scan fallback.
   let rowidOrderSatisfiesOrderBy: Bool
+
+  /// The leading (outer) table — the one the access plan optimizes.
+  var source: TableBinding { binding.tables[0] }
+  var isJoin: Bool { !joins.isEmpty }
 }
 
 enum Binder {
   static func bindSelect(_ select: SQLSelect, schema: Schema) throws(DBError) -> BoundSelect {
-    guard select.joins.isEmpty else {
-      throw DBError.sqlUnsupported("JOIN (arrives in a later slice)")
-    }
     guard select.compounds.isEmpty else {
       throw DBError.sqlUnsupported("UNION/compound SELECT (arrives in a later slice)")
     }
@@ -79,35 +119,52 @@ enum Binder {
     guard let from = select.from else {
       throw DBError.sqlUnsupported("SELECT without FROM (arrives in a later slice)")
     }
-    guard let definition = schema.tables[from.name] else {
-      throw DBError.noSuchTable(from.name)
+
+    // Resolve every table in FROM/JOIN order; the first is the outer table.
+    func bind(_ reference: SQLTableRef) throws(DBError) -> TableBinding {
+      guard let definition = schema.tables[reference.name] else {
+        throw DBError.noSuchTable(reference.name)
+      }
+      return TableBinding(reference: reference, definition: definition)
     }
-    let source = TableBinding(reference: from, definition: definition)
+    var tables: [TableBinding] = [try bind(from)]
+    var joins: [BoundJoin] = []
+    for join in select.joins {
+      tables.append(try bind(join.table))
+      joins.append(BoundJoin(kind: join.kind, table: tables.count - 1, on: join.on))
+    }
+    let binding = QueryBinding(tables: tables)
 
     var outputs: [BoundOutput] = []
     for column in select.columns {
       switch column {
       case .star:
-        appendAllColumns(source, to: &outputs)
+        for table in tables { appendAllColumns(table, to: &outputs) }
       case .tableStar(let qualifier):
-        guard qualifier.lowercased() == source.binding else {
+        guard let table = tables.first(where: { $0.binding == qualifier.lowercased() }) else {
           throw DBError.sqlBind("no such table alias: \(qualifier)")
         }
-        appendAllColumns(source, to: &outputs)
+        appendAllColumns(table, to: &outputs)
       case .expr(let expr, let alias, let sourceText):
         outputs.append(
           BoundOutput(name: outputName(expr, alias: alias, sourceText: sourceText), expr: expr))
       }
     }
 
-    let orderCollations = select.orderBy.map { collation(of: $0.expr, source: source) }
-    let outputCollations = outputs.map { collation(of: $0.expr, source: source) }
+    let orderCollations = select.orderBy.map { collation(of: $0.expr, binding: binding) }
+    let outputCollations = outputs.map { collation(of: $0.expr, binding: binding) }
     let header = SQLColumnHeader(outputs.map(\.name))
+    // The planner optimizes the outer table only: column-vs-constant conjuncts
+    // on it (join predicates are column-vs-column, hence ignored here and left
+    // to the residual). For a LEFT join the outer side is never null-extended,
+    // so pushing its WHERE conjuncts down stays a valid superset.
+    let source = tables[0]
     let planning = Planner.plan(
       where: select.whereExpr, orderBy: select.orderBy, source: source,
-      indexes: schema.indexes(on: definition.name), definition: definition)
+      indexes: schema.indexes(on: source.table), definition: schema.tables[source.table]!)
     return BoundSelect(
-      source: source,
+      binding: binding,
+      joins: joins,
       outputs: outputs,
       outputCollations: outputCollations,
       whereExpr: select.whereExpr,
@@ -118,14 +175,14 @@ enum Binder {
       offset: select.offset,
       header: header,
       access: planning.plan,
-      accessYieldsOrder: planning.yieldsOrder,
-      rowidOrderSatisfiesOrderBy: planning.rowidOrderSatisfiesOrderBy)
+      accessYieldsOrder: joins.isEmpty && planning.yieldsOrder,
+      rowidOrderSatisfiesOrderBy: joins.isEmpty && planning.rowidOrderSatisfiesOrderBy)
   }
 
-  private static func appendAllColumns(_ source: TableBinding, to outputs: inout [BoundOutput]) {
-    for name in source.columnNames {
+  private static func appendAllColumns(_ table: TableBinding, to outputs: inout [BoundOutput]) {
+    for name in table.columnNames {
       outputs.append(
-        BoundOutput(name: name, expr: .column(table: nil, name: name, offset: 0)))
+        BoundOutput(name: name, expr: .column(table: table.binding, name: name, offset: 0)))
     }
   }
 
@@ -139,13 +196,13 @@ enum Binder {
 
   /// Collation of an expression for ORDER BY / DISTINCT: explicit COLLATE
   /// wins, else the referenced column's declared collation, else BINARY.
-  private static func collation(of expr: SQLExpr, source: TableBinding) -> Collation {
+  private static func collation(of expr: SQLExpr, binding: QueryBinding) -> Collation {
     switch expr {
     case .collate(_, let collation):
       return collation
     case .column(let qualifier, let name, _):
-      if let index = source.columnIndex(qualifier: qualifier, name: name) {
-        return source.columnCollations[index]
+      if let (table, column) = binding.resolve(qualifier: qualifier, name: name) {
+        return binding.tables[table].columnCollations[column]
       }
       return .binary
     default:

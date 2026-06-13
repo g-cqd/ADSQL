@@ -147,11 +147,12 @@ public final class Statement: Sendable {
     return try database.read { txn throws(DBError) in
       let schema = try txn.schema()
       let plan = try self.boundSelect(select, schema: schema)
-      let table = try txn.tableRecord(plan.source.table)
+      var tables: [Catalog.TableRecord] = []
+      for binding in plan.binding.tables { tables.append(try txn.tableRecord(binding.table)) }
       var index: Catalog.IndexRecord?
       if let name = plan.access.indexName { index = try txn.indexRecord(name) }
       return try SelectExecutor.run(
-        plan, table: table, index: index, resolver: txn.resolver, params: parameters)
+        plan, tables: tables, index: index, resolver: txn.resolver, params: parameters)
     }
   }
 
