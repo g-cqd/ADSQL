@@ -686,7 +686,6 @@ struct SQLParser {
   mutating func equality() throws(DBError) -> SQLExpr {
     var lhs = try comparison()
     while true {
-      if checkKeyword("BETWEEN") { throw DBError.sqlUnsupported("BETWEEN") }
       if checkKeyword("MATCH") { throw DBError.sqlUnsupported("MATCH (FTS arrives with M5)") }
       if checkKeyword("GLOB") || checkKeyword("REGEXP") {
         throw DBError.sqlUnsupported("GLOB/REGEXP")
@@ -702,16 +701,21 @@ struct SQLParser {
         } else {
           throw DBError.sqlUnsupported("IS comparisons other than IS [NOT] NULL")
         }
-      } else if checkKeyword("NOT") && (checkKeyword("IN", 1) || checkKeyword("LIKE", 1)) {
+      } else if checkKeyword("NOT")
+        && (checkKeyword("IN", 1) || checkKeyword("LIKE", 1) || checkKeyword("BETWEEN", 1)) {
         pos += 1
         if matchKeyword("IN") {
           lhs = try inSuffix(lhs, negated: true)
+        } else if matchKeyword("BETWEEN") {
+          lhs = try betweenSuffix(lhs, negated: true)
         } else {
           try expectKeyword("LIKE")
           lhs = .like(lhs, pattern: try comparison(), negated: true)
         }
       } else if matchKeyword("IN") {
         lhs = try inSuffix(lhs, negated: false)
+      } else if matchKeyword("BETWEEN") {
+        lhs = try betweenSuffix(lhs, negated: false)
       } else if matchKeyword("LIKE") {
         lhs = .like(lhs, pattern: try comparison(), negated: false)
         if checkKeyword("ESCAPE") { throw DBError.sqlUnsupported("LIKE ... ESCAPE") }
@@ -719,6 +723,20 @@ struct SQLParser {
         return lhs
       }
     }
+  }
+
+  /// `x BETWEEN a AND b` desugars to `x>=a AND x<=b` (and NOT BETWEEN to
+  /// `x<a OR x>b`), so the planner's range extraction treats it as a sargable
+  /// range and 3VL on NULL matches SQLite. `a`/`b` parse at comparison
+  /// precedence; the BETWEEN `AND` is consumed here, not by the boolean AND.
+  mutating func betweenSuffix(_ subject: SQLExpr, negated: Bool) throws(DBError) -> SQLExpr {
+    let lower = try comparison()
+    try expectKeyword("AND")
+    let upper = try comparison()
+    if negated {
+      return .binary(.or, .binary(.lt, subject, lower), .binary(.gt, subject, upper))
+    }
+    return .binary(.and, .binary(.ge, subject, lower), .binary(.le, subject, upper))
   }
 
   mutating func inSuffix(_ lhs: SQLExpr, negated: Bool) throws(DBError) -> SQLExpr {

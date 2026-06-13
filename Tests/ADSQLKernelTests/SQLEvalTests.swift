@@ -91,6 +91,10 @@ struct SQLEvalDifferentialTests {
     // blobs
     "x'00ff' = x'00FF'", "x'00' < x'01'", "x'' = x''", "x'61' = 'a'",
     "LENGTH(x'001122')", "CAST(x'414243' AS TEXT)",
+    // BETWEEN (desugared) incl. 3VL and types
+    "5 BETWEEN 1 AND 10", "5 BETWEEN 6 AND 10", "5 NOT BETWEEN 6 AND 10",
+    "5 BETWEEN 5 AND 5", "NULL BETWEEN 1 AND 10", "5 BETWEEN NULL AND 10",
+    "5 NOT BETWEEN NULL AND 10", "'b' BETWEEN 'a' AND 'c'", "2.5 BETWEEN 2 AND 3",
     // comparison affinity
     "CAST(-837 AS TEXT) >= CAST(9223372036854775807 AS INTEGER)",
     "COALESCE('5', 5) < CAST(107 AS REAL)", "CAST(5 AS TEXT) = '5'",

@@ -90,6 +90,7 @@ struct SQLPlannerPathTests {
     ("SELECT id FROM docs WHERE score = 3", "USING INDEX i_score_weight"),
     ("SELECT id FROM docs WHERE score = 3 AND weight > 1.0", "score=? AND weight range"),
     ("SELECT id FROM docs WHERE score > 2", "USING INDEX i_score_weight (score range)"),
+    ("SELECT id FROM docs WHERE score BETWEEN 2 AND 4", "USING INDEX i_score_weight (score range)"),
     ("SELECT id FROM docs WHERE title LIKE 'a%'", "SCAN docs"),  // LIKE-prefix deferred
     ("SELECT id FROM docs ORDER BY id LIMIT 5", "SCAN docs"),
   ]
@@ -166,6 +167,9 @@ struct SQLPlannerResidualTests {
       "weight > \(Double(rng.next() % 1000) / 100.0)",
       "weight IS NOT NULL",
       "title = 'alpha'",
+      "score BETWEEN \(rng.next() % 4) AND \(2 + rng.next() % 4)",
+      "score NOT BETWEEN \(rng.next() % 4) AND \(2 + rng.next() % 4)",
+      "id BETWEEN \(1 + rng.next() % 20) AND \(20 + rng.next() % 20)",
     ]
 
     var clauses: [String] = [pick(predicates)]

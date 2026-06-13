@@ -276,7 +276,6 @@ struct SQLParserStatementTests {
 struct SQLParserErrorTests {
   static let unsupported: [(String, String)] = [
     ("WITH x AS (SELECT 1) SELECT * FROM x", "WITH"),
-    ("SELECT * FROM t WHERE a BETWEEN 1 AND 2", "BETWEEN"),
     ("SELECT * FROM docs WHERE docs MATCH 'q'", "MATCH"),
     ("SELECT COUNT(DISTINCT a) FROM t", "DISTINCT"),
     ("SELECT AVG(a) FROM t", "AVG"),
