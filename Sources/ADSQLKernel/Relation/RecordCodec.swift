@@ -34,9 +34,8 @@ public enum RecordCodec {
         withUnsafeBytes(of: d.bitPattern.littleEndian) { unsafe out.append(contentsOf: $0) }
       case .text(let s):
         out.append(CellTag.text)
-        let utf8 = Array(s.utf8)
-        Varint.append(UInt64(utf8.count), to: &out)
-        out.append(contentsOf: utf8)
+        Varint.append(UInt64(s.utf8.count), to: &out)
+        out.append(contentsOf: s.utf8)
       case .blob(let b):
         out.append(CellTag.blob)
         Varint.append(UInt64(b.count), to: &out)

@@ -49,10 +49,10 @@ public enum KeyCodec {
     case .text(let s):
       if collation == .nocase {
         key.append(Tag.textNocase)
-        appendEscaped(asciiFolded(Array(s.utf8)), to: &key)
+        appendEscaped(s.utf8.lazy.map(asciiFoldByte), to: &key)
       } else {
         key.append(Tag.text)
-        appendEscaped(Array(s.utf8), to: &key)
+        appendEscaped(s.utf8, to: &key)
       }
     case .blob(let b):
       key.append(Tag.blob)
@@ -124,7 +124,9 @@ public enum KeyCodec {
     withUnsafeBytes(of: value.bigEndian) { unsafe key.append(contentsOf: $0) }
   }
 
-  static func appendEscaped(_ bytes: [UInt8], to key: inout [UInt8]) {
+  static func appendEscaped<S: Sequence>(
+    _ bytes: S, to key: inout [UInt8]
+  ) where S.Element == UInt8 {
     for byte in bytes {
       if byte == 0x00 {
         key.append(0x00)
@@ -135,6 +137,10 @@ public enum KeyCodec {
     }
     key.append(0x00)
   }
+
+  /// SQLite NOCASE fold of one byte (ASCII A–Z only).
+  @inline(__always)
+  static func asciiFoldByte(_ b: UInt8) -> UInt8 { b >= 0x41 && b <= 0x5A ? b | 0x20 : b }
 
   /// Monotone IEEE754 transform: positives get the sign bit set, negatives
   /// are bit-complemented; -0.0 normalizes to +0.0 first.
