@@ -45,7 +45,7 @@ enum TableScenario {
         ],
         primaryKey: .rowidAlias(column: "id", autoincrement: true)))
       try txn.createIndex(IndexDefinition("u_documents_key", on: "documents", columns: ["key"], unique: true))
-      try txn.createIndex(IndexDefinition("i_documents_framework", on: "documents", columns: ["framework"]))
+      try txn.createIndex(IndexDefinition("i_documents_framework", on: "documents", columns: ["framework"], includes: ["kind"]))
       try txn.createIndex(IndexDefinition("i_documents_kind", on: "documents", columns: ["kind"]))
       try txn.createIndex(IndexDefinition("i_documents_title", on: "documents", columns: ["title"]))
       try txn.createIndex(IndexDefinition("i_documents_fw_kind", on: "documents", columns: ["framework", "kind"]))
@@ -106,11 +106,13 @@ enum TableScenario {
     let scanStart = nowNanos()
     let scanned = try db.read { (txn) throws(DBError) in
       try txn.withIndexCursor(
-        index: "i_documents_framework", bounds: .prefix([.text("swiftui")])
+        index: "i_documents_framework", bounds: .prefix([.text("swiftui")]),
+        covering: ["kind"]
       ) { (cursor) throws(DBError) in
         var n = 0
         // columns: id,key,title,framework,kind,is_deprecated → kind = index 4.
-        // Zero-copy presence check, matching SQLite's sqlite3_column_bytes path.
+        // Index-only scan (kind is an INCLUDE column): zero-copy presence check,
+        // no table descent — matching SQLite's covering-index path.
         let kindColumn = 4
         try cursor.forEachRow { (row) throws(DBError) in
           n += try row.withText(at: kindColumn) { $0 == nil ? 0 : 1 }

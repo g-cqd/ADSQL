@@ -163,15 +163,22 @@ extension ReadTxn {
 
   /// Forward scan over an index within typed bounds.
   public func withIndexCursor<R>(
-    index name: String, bounds: IndexBounds = .all,
+    index name: String, bounds: IndexBounds = .all, covering: [String]? = nil,
     _ body: (inout RowCursor<CommittedResolver>) throws(DBError) -> R
   ) throws(DBError) -> R {
     let index = try indexRecord(name)
     let table = try tableRecord(index.definition.table)
+    if let covering {
+      for column in covering where !index.definition.includes.contains(column) {
+        throw DBError.invalidDefinition(
+          "index-only scan of \(name) needs column \(column) in INCLUDE")
+      }
+    }
     let (lower, upper) = try Relation.scanBounds(bounds, index: index, table: table)
     var cursor = try RowCursor(
       resolver: resolver, table: table, mode: .index(index),
-      lowerKey: lower, upperKey: upper)
+      lowerKey: lower, upperKey: upper,
+      coveringIncludes: covering == nil ? nil : index.definition.includes)
     return try body(&cursor)
   }
 

@@ -175,6 +175,76 @@ struct RelationDMLSemanticsTests {
     return db
   }
 
+  @Test func coveringIndexScan() throws {
+    let dir = TempDir()
+    defer { dir.cleanup() }
+    var db = try makeDB(dir, "covering.adsql")
+    try db.writeSync { (txn) throws(DBError) in
+      try txn.createIndex(
+        IndexDefinition("c_docs_title", on: "docs", columns: ["title"], includes: ["key", "score"]))
+      for i in 0..<120 {
+        _ = try txn.insert(into: "docs", [
+          "key": .text("k-\(i)"),
+          "title": .text(i % 3 == 0 ? "alpha" : "beta"),
+          "score": .integer(Int64(i)),
+        ])
+      }
+    }
+
+    // Index-only scan: each covered value (key=col 1, score=col 3) must equal an
+    // authoritative table read for that rowid.
+    func verifyCovering(_ database: Database) throws {
+      try database.read { (txn) throws(DBError) in
+        var seen = 0
+        try txn.withIndexCursor(
+          index: "c_docs_title", bounds: .prefix([.text("alpha")]), covering: ["key", "score"]
+        ) { (cursor) throws(DBError) in
+          try cursor.forEachRow { (row) throws(DBError) in
+            seen += 1
+            let table = try txn.row(in: "docs", rowid: row.rowid)!
+            #expect(try row.value(at: 1) == table["key"])
+            #expect(try row.value(at: 3) == table["score"])
+            return true
+          }
+        }
+        #expect(seen == 40)  // i % 3 == 0 over 0..<120
+      }
+    }
+    try verifyCovering(db)
+
+    // A value-only update (score covered, title key unchanged) must refresh the
+    // index entry's stored value, so the index-only scan sees the new score.
+    let target: Int64 = try db.read { (txn) throws(DBError) in
+      try txn.withIndexCursor(
+        index: "c_docs_title", bounds: .prefix([.text("alpha")]), covering: ["score"]
+      ) { (cursor) throws(DBError) in
+        var rid: Int64 = -1
+        try cursor.forEachRow { (row) throws(DBError) in rid = row.rowid; return false }
+        return rid
+      }
+    }
+    try db.writeSync { (txn) throws(DBError) in
+      _ = try txn.update("docs", rowid: target, set: ["score": .integer(9999)])
+    }
+    try db.read { (txn) throws(DBError) in
+      try txn.withIndexCursor(
+        index: "c_docs_title", bounds: .prefix([.text("alpha")]), covering: ["score"]
+      ) { (cursor) throws(DBError) in
+        try cursor.forEachRow { (row) throws(DBError) in
+          if row.rowid == target { #expect(try row.value(at: 3) == .integer(9999)) }
+          return true
+        }
+      }
+    }
+
+    // Reopen: INCLUDE columns survive the catalog round-trip (otherwise the
+    // covering: validation would throw "needs column … in INCLUDE").
+    db.close()
+    db = try Database.open(at: dir.file("covering.adsql"))
+    defer { db.close() }
+    try verifyCovering(db)
+  }
+
   @Test func defaultsAndValidation() throws {
     let dir = TempDir()
     defer { dir.cleanup() }

@@ -157,6 +157,18 @@ extension Relation {
     index.columns.map { row[table.columnIndex(of: $0)!] }
   }
 
+  /// Value stored alongside an index entry: the covering (`INCLUDE`) columns in
+  /// declaration order, losslessly `RecordCodec`-encoded so an index-only scan
+  /// can read them without a table descent. Empty (`[]`) for a plain index.
+  static func indexEntryValue(
+    index: Catalog.IndexRecord, table: Catalog.TableRecord, row: [Value]
+  ) -> [UInt8] {
+    let includes = index.definition.includes
+    guard !includes.isEmpty else { return [] }
+    let values = includes.map { row[table.definition.columnIndex(of: $0)!] }
+    return RecordCodec.encode(values)
+  }
+
   /// Full index entry key: encoded column values + rowid suffix.
   static func indexEntryKey(
     index: Catalog.IndexRecord, table: Catalog.TableRecord, row: [Value], rowid: Int64
@@ -378,7 +390,7 @@ extension Relation {
       var index = state.indexRecords[indexName]!
       let key = try indexEntryKey(index: index, table: table, row: row, rowid: rowid)
       var indexHandle = index.handle
-      try putBytes(ctx, &indexHandle, key: key, value: [])
+      try putBytes(ctx, &indexHandle, key: key, value: indexEntryValue(index: index, table: table, row: row))
       index.handle = indexHandle
       state.indexRecords[indexName] = index
     }
@@ -477,31 +489,40 @@ extension Relation {
     let ownIndexNames = state.indexRecords.keys.sorted().filter {
       state.indexRecords[$0]!.tableId == table.tableId
     }
-    var changedIndexes: [(name: String, oldKey: [UInt8], newKey: [UInt8])] = []
+    // An entry is rewritten when its key changes, or — for a covering index —
+    // when only its stored INCLUDE value changes (key-stable, value-only update).
+    var changedIndexes: [(name: String, oldKey: [UInt8], newKey: [UInt8], keyChanged: Bool)] = []
     for indexName in ownIndexNames {
       let index = state.indexRecords[indexName]!
       let oldKey = try indexEntryKey(index: index, table: table, row: oldRow, rowid: rowid)
       let newKey = try indexEntryKey(index: index, table: table, row: newRow, rowid: rowid)
-      if oldKey != newKey {
-        if index.definition.unique,
-          let conflicting = try uniqueConflict(
-            ctx, index: index, table: table, row: newRow, excluding: rowid) {
-          _ = conflicting
-          throw DBError.uniqueViolation(table: tableName, index: indexName)
-        }
-        changedIndexes.append((name: indexName, oldKey: oldKey, newKey: newKey))
+      let keyChanged = oldKey != newKey
+      let valueChanged = !index.definition.includes.isEmpty
+        && indexEntryValue(index: index, table: table, row: oldRow)
+          != indexEntryValue(index: index, table: table, row: newRow)
+      guard keyChanged || valueChanged else { continue }
+      if keyChanged, index.definition.unique,
+        try uniqueConflict(ctx, index: index, table: table, row: newRow, excluding: rowid) != nil {
+        throw DBError.uniqueViolation(table: tableName, index: indexName)
       }
+      changedIndexes.append((name: indexName, oldKey: oldKey, newKey: newKey, keyChanged: keyChanged))
     }
 
     for change in changedIndexes {
       var index = state.indexRecords[change.name]!
       var indexHandle = index.handle
-      let removed = try deleteBytes(ctx, &indexHandle, key: change.oldKey)
-      guard removed else {
-        throw DBError.integrityFailure(
-          "index \(change.name) missing entry for \(tableName) rowid \(rowid)")
+      if change.keyChanged {
+        let removed = try deleteBytes(ctx, &indexHandle, key: change.oldKey)
+        guard removed else {
+          throw DBError.integrityFailure(
+            "index \(change.name) missing entry for \(tableName) rowid \(rowid)")
+        }
       }
-      try putBytes(ctx, &indexHandle, key: change.newKey, value: [])
+      // Key-stable value updates overwrite in place (BTree.put replaces on an
+      // exact key match), so no delete is needed in that case.
+      try putBytes(
+        ctx, &indexHandle, key: change.newKey,
+        value: indexEntryValue(index: index, table: table, row: newRow))
       index.handle = indexHandle
       state.indexRecords[change.name] = index
     }
@@ -545,7 +566,7 @@ extension Relation {
       var withHandle = probe
       withHandle.handle = handle
       let key = try indexEntryKey(index: withHandle, table: table, row: row, rowid: entry.rowid)
-      try putBytes(ctx, &handle, key: key, value: [])
+      try putBytes(ctx, &handle, key: key, value: indexEntryValue(index: withHandle, table: table, row: row))
       positioned = try cursor.next()
     }
     return handle

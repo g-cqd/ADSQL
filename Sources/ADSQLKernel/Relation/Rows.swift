@@ -41,12 +41,28 @@ public struct RowView: ~Copyable, ~Escapable {
   public let rowid: Int64
   let definition: TableDefinition
   let span: RawSpan
+  /// Index-only scans: when non-nil, `span` is the index entry's covering value
+  /// (a `RecordCodec` record of these columns, in order) rather than the full
+  /// table record. Reading the rowid-alias yields the rowid; reading a covered
+  /// column decodes it from the value; reading any other column traps (the scan
+  /// guaranteed it touches only covered columns).
+  let coveringIncludes: [String]?
 
   @_lifetime(copy span)
-  init(rowid: Int64, definition: TableDefinition, span: RawSpan) {
+  init(
+    rowid: Int64, definition: TableDefinition, span: RawSpan,
+    coveringIncludes: [String]? = nil
+  ) {
     self.rowid = rowid
     self.definition = definition
     self.span = span
+    self.coveringIncludes = coveringIncludes
+  }
+
+  /// Decode position of schema column `index` within a covering entry's value,
+  /// or nil when the column isn't part of the covering set.
+  private func coveringSlot(_ index: Int) -> Int? {
+    coveringIncludes?.firstIndex(of: definition.columns[index].name)
   }
 
   /// The value of the column at `index` (schema order). Columns a short row did
@@ -55,6 +71,12 @@ public struct RowView: ~Copyable, ~Escapable {
   public func value(at index: Int) throws(DBError) -> Value {
     precondition(index >= 0 && index < definition.columns.count, "column index out of range")
     if let alias = definition.rowidAliasIndex, index == alias { return .integer(rowid) }
+    if coveringIncludes != nil {
+      guard let slot = coveringSlot(index) else {
+        preconditionFailure("column \(definition.columns[index].name) not covered by this index-only scan")
+      }
+      return try RecordCodec.value(at: slot, in: span, defaults: definition.columns)
+    }
     return try RecordCodec.value(at: index, in: span, defaults: definition.columns)
   }
 
@@ -73,6 +95,12 @@ public struct RowView: ~Copyable, ~Escapable {
   ) throws(DBError) -> R {
     precondition(index >= 0 && index < definition.columns.count, "column index out of range")
     if let alias = definition.rowidAliasIndex, index == alias { return try body(nil) }
+    if coveringIncludes != nil {
+      guard let slot = coveringSlot(index) else {
+        preconditionFailure("column \(definition.columns[index].name) not covered by this index-only scan")
+      }
+      return unsafe try RecordCodec.withText(at: slot, in: span, body)
+    }
     return unsafe try RecordCodec.withText(at: index, in: span, body)
   }
 
@@ -83,6 +111,12 @@ public struct RowView: ~Copyable, ~Escapable {
   ) throws(DBError) -> R {
     precondition(index >= 0 && index < definition.columns.count, "column index out of range")
     if let alias = definition.rowidAliasIndex, index == alias { return try body(nil) }
+    if coveringIncludes != nil {
+      guard let slot = coveringSlot(index) else {
+        preconditionFailure("column \(definition.columns[index].name) not covered by this index-only scan")
+      }
+      return unsafe try RecordCodec.withBlob(at: slot, in: span, body)
+    }
     return unsafe try RecordCodec.withBlob(at: index, in: span, body)
   }
 
@@ -118,17 +152,22 @@ public struct RowCursor<R: PageResolver>: ~Copyable {
   let mode: Mode
   /// Exclusive upper bound on the iterated tree's keys.
   let upperKey: [UInt8]?
+  /// Index-only scan: the index's covering columns (entry-value layout). When
+  /// set (index mode only), rows are served from the entry value with no table
+  /// descent. Nil = ordinary scan.
+  let coveringIncludes: [String]?
   var cursor: Cursor<R>
   var exhausted = false
 
   init(
     resolver: R, table: Catalog.TableRecord, mode: Mode,
-    lowerKey: [UInt8]?, upperKey: [UInt8]?
+    lowerKey: [UInt8]?, upperKey: [UInt8]?, coveringIncludes: [String]? = nil
   ) throws(DBError) {
     self.resolver = resolver
     self.table = table
     self.mode = mode
     self.upperKey = upperKey
+    self.coveringIncludes = coveringIncludes
     let tree: TreeHandle =
       switch mode {
       case .table: table.handle
@@ -223,6 +262,23 @@ public struct RowCursor<R: PageResolver>: ~Copyable {
         if !proceed { return }
         exhausted = !(try cursor.next())
       }
+    case .index where coveringIncludes != nil:
+      // Index-only scan: every needed column lives in the entry's covering
+      // value, so serve it straight from the index leaf — no table descent.
+      while !exhausted {
+        let step: Bool? = unsafe try cursor.withCurrent { (key, ref) throws(DBError) -> Bool? in
+          if let upperKey, unsafe !Self.inBounds(key, below: upperKey) { return nil }
+          guard let rowid = unsafe KeyCodec.rowid(fromSuffixOf: key) else {
+            throw DBError.integrityFailure("malformed key in \(table.definition.name)")
+          }
+          return unsafe try BTree.withValueBytes(ref, resolver: resolver) { span throws(DBError) in
+            unsafe try body(rowid, span)
+          }
+        } ?? nil
+        guard let proceed = step else { exhausted = true; return }
+        if !proceed { return }
+        exhausted = !(try cursor.next())
+      }
     case .index:
       // Index entries within a probe arrive in (columns…, rowid) order, so the
       // rowids are ascending; a warm table cursor (`seekForward`) skips the
@@ -285,9 +341,13 @@ public struct RowCursor<R: PageResolver>: ~Copyable {
     // to compile (Review 0001 F1). `resolver` is captured locally so the bound
     // views also cannot escape this call.
     let resolver = self.resolver
+    // For an index-only scan, `span` is the covering entry value, decoded
+    // through `coveringIncludes`; otherwise it's the full table record.
+    let covering = coveringIncludes
     unsafe try forEachRecordSpan { (rowid, span) throws(DBError) -> Bool in
       let record = unsafe Self.bindSpan(span, to: resolver)
-      return try body(RowView(rowid: rowid, definition: definition, span: record))
+      return try body(
+        RowView(rowid: rowid, definition: definition, span: record, coveringIncludes: covering))
     }
   }
 

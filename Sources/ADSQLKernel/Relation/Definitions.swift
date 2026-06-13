@@ -138,12 +138,21 @@ public struct IndexDefinition: Equatable, Sendable {
   public var table: String
   public var columns: [String]
   public var unique: Bool
+  /// Non-key "covering" columns stored losslessly in each index entry's value
+  /// (Postgres `INCLUDE` semantics). They don't affect key order or uniqueness;
+  /// a scan that reads only `includes` columns (plus the rowid) is served
+  /// index-only, with no descent into the table tree.
+  public var includes: [String]
 
-  public init(_ name: String, on table: String, columns: [String], unique: Bool = false) {
+  public init(
+    _ name: String, on table: String, columns: [String], unique: Bool = false,
+    includes: [String] = []
+  ) {
     self.name = name
     self.table = table
     self.columns = columns
     self.unique = unique
+    self.includes = includes
   }
 
   func validate(against table: TableDefinition) throws(DBError) {
@@ -160,6 +169,18 @@ public struct IndexDefinition: Equatable, Sendable {
       }
       guard seen.insert(column).inserted else {
         throw DBError.invalidDefinition("index \(name): duplicate column \(column)")
+      }
+    }
+    for column in includes {
+      guard table.columnIndex(of: column) != nil else {
+        throw DBError.noSuchColumn(table: table.name, column: column)
+      }
+      guard !columns.contains(column) else {
+        throw DBError.invalidDefinition(
+          "index \(name): included column \(column) is already a key column")
+      }
+      guard seen.insert(column).inserted else {
+        throw DBError.invalidDefinition("index \(name): duplicate included column \(column)")
       }
     }
   }
