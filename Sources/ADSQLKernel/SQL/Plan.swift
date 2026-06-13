@@ -311,27 +311,109 @@ enum Binder {
       yieldsOrder
       ? removeCovered(select.whereExpr, planning.coveredConjuncts)
       : select.whereExpr
+
+    // Final step: resolve every runtime column reference to (table, column)
+    // slots so the evaluator never re-resolves names per row. Runs after all
+    // bind-time analysis (planning, collation, INLJ extraction, removeCovered),
+    // which consumed the `.column` form. Correlated outer refs that don't
+    // resolve here stay `.column` (runtime outer fallback).
+    func bind(_ expr: SQLExpr) -> SQLExpr { bindColumns(expr, binding) }
     return BoundSelect(
       binding: binding,
-      joins: joins,
-      outputs: outputs,
+      joins: joins.map {
+        BoundJoin(kind: $0.kind, table: $0.table, on: bind($0.on), access: bindAccess($0.access, binding))
+      },
+      outputs: outputs.map { BoundOutput(name: $0.name, expr: bind($0.expr)) },
       outputCollations: outputCollations,
-      whereExpr: select.whereExpr,
-      residualWithoutCovered: residualWithoutCovered,
-      orderBy: orderBy,
+      whereExpr: select.whereExpr.map(bind),
+      residualWithoutCovered: residualWithoutCovered.map(bind),
+      orderBy: orderBy.map { SQLOrderingTerm(expr: bind($0.expr), descending: $0.descending) },
       orderCollations: orderCollations,
-      groupBy: select.groupBy,
+      groupBy: select.groupBy.map(bind),
       groupCollations: groupCollations,
-      having: having,
-      aggregates: aggregates,
+      having: having.map(bind),
+      aggregates: aggregates.map { bindAggregate($0, binding) },
       isAggregated: isAggregated,
       distinct: select.distinct,
       limit: select.limit,
       offset: select.offset,
       header: header,
-      access: planning.plan,
+      access: bindAccess(planning.plan, binding),
       accessYieldsOrder: yieldsOrder && planning.yieldsOrder,
       rowidOrderSatisfiesOrderBy: yieldsOrder && planning.rowidOrderSatisfiesOrderBy)
+  }
+
+  /// Resolves resolvable `.column` refs to `.boundColumn(table, column)` slots
+  /// (leaving correlated outer refs as `.column`); does not descend into
+  /// `.scalarSubquery` (bound independently when executed).
+  private static func bindColumns(_ expr: SQLExpr, _ binding: QueryBinding) -> SQLExpr {
+    func recur(_ e: SQLExpr) -> SQLExpr { bindColumns(e, binding) }
+    switch expr {
+    case .column(let qualifier, let name, _):
+      if let (table, column) = binding.resolve(qualifier: qualifier, name: name) {
+        return .boundColumn(table: table, column: column)
+      }
+      return expr
+    case .literal, .parameter, .aggregateResult, .boundColumn, .scalarSubquery:
+      return expr
+    case .binary(let op, let lhs, let rhs):
+      return .binary(op, recur(lhs), recur(rhs))
+    case .unary(let op, let inner):
+      return .unary(op, recur(inner))
+    case .like(let subject, let pattern, let negated):
+      return .like(recur(subject), pattern: recur(pattern), negated: negated)
+    case .isNull(let inner, let negated):
+      return .isNull(recur(inner), negated: negated)
+    case .inList(let subject, let items, let negated):
+      return .inList(recur(subject), items.map(recur), negated: negated)
+    case .inJSONEach(let subject, let source, let negated):
+      return .inJSONEach(recur(subject), source: recur(source), negated: negated)
+    case .caseWhen(let operand, let whens, let elseExpr):
+      return .caseWhen(
+        operand: operand.map(recur),
+        whens: whens.map { SQLWhen(condition: recur($0.condition), result: recur($0.result)) },
+        elseExpr: elseExpr.map(recur))
+    case .function(let name, let args, let star, let offset):
+      return .function(name: name, args: args.map(recur), star: star, offset: offset)
+    case .cast(let inner, let type):
+      return .cast(recur(inner), type)
+    case .collate(let inner, let collation):
+      return .collate(recur(inner), collation)
+    }
+  }
+
+  private static func bindAccess(_ access: AccessPlan, _ binding: QueryBinding) -> AccessPlan {
+    switch access {
+    case .tableScan:
+      return .tableScan
+    case .rowid(let exprs):
+      return .rowid(exprs.map { bindColumns($0, binding) })
+    case .index(let name, let probes, let constraint):
+      let bound = probes.map { probe in
+        IndexProbe(
+          equality: probe.equality.map { bindColumns($0, binding) },
+          trailing: probe.trailing.map { bindTrailing($0, binding) })
+      }
+      return .index(name: name, probes: bound, constraint: constraint)
+    }
+  }
+
+  private static func bindTrailing(_ trailing: Trailing, _ binding: QueryBinding) -> Trailing {
+    switch trailing {
+    case .range(let lower, let upper):
+      func bound(_ b: BoundExpr) -> BoundExpr {
+        BoundExpr(expr: bindColumns(b.expr, binding), inclusive: b.inclusive)
+      }
+      return .range(lower: lower.map(bound), upper: upper.map(bound))
+    }
+  }
+
+  private static func bindAggregate(_ spec: AggregateSpec, _ binding: QueryBinding) -> AggregateSpec {
+    switch spec.kind {
+    case .countStar: return spec
+    case .count(let expr): return AggregateSpec(kind: .count(bindColumns(expr, binding)))
+    case .sum(let expr): return AggregateSpec(kind: .sum(bindColumns(expr, binding)))
+    }
   }
 
   /// WHERE with `covered` top-level conjuncts removed (nil if none remain).
@@ -396,6 +478,8 @@ enum Binder {
     case .column(let qualifier, let name, _):
       guard let (table, _) = binding.resolve(qualifier: qualifier, name: name) else { return false }
       return table < depth
+    case .boundColumn(let table, _):
+      return table < depth
     case .scalarSubquery, .inJSONEach, .aggregateResult:
       return false
     case .collate(let inner, _), .cast(let inner, _), .unary(_, let inner):
@@ -441,7 +525,7 @@ enum Binder {
       return .aggregateResult(aggregates.count - 1)
     }
     switch expr {
-    case .literal, .column, .parameter, .scalarSubquery, .aggregateResult:
+    case .literal, .column, .boundColumn, .parameter, .scalarSubquery, .aggregateResult:
       return expr
     case .function(let name, let args, let star, let offset):
       let upper = name.uppercased()

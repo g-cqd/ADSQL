@@ -3,6 +3,11 @@
 public indirect enum SQLExpr: Equatable, Sendable {
   case literal(Value)
   case column(table: String?, name: String, offset: Int)
+  /// A `column` resolved to `(table, column)` slot indices at bind time — the
+  /// evaluator reads the row directly without re-resolving names per row. The
+  /// binder produces these as its last step; a correlated reference that only
+  /// resolves in an outer scope stays a `.column`.
+  case boundColumn(table: Int, column: Int)
   case parameter(SQLParam, offset: Int)
   case binary(SQLBinaryOp, SQLExpr, SQLExpr)
   case unary(SQLUnaryOp, SQLExpr)

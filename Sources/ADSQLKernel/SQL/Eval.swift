@@ -138,6 +138,14 @@ struct SQLEvalEnv {
   var column: (_ table: String?, _ name: String, _ offset: Int) throws(DBError) -> Value
   var collationOf: (_ table: String?, _ name: String) -> Collation?
   var columnTypeOf: (_ table: String?, _ name: String) -> ColumnType? = { _, _ in nil }
+  /// Slot-resolved column access (the bind-time `.boundColumn` fast path): no
+  /// per-row name resolution. Defaults throw so only a row context need install
+  /// them.
+  var boundColumn: (_ table: Int, _ column: Int) throws(DBError) -> Value = { _, _ throws(DBError) in
+    throw DBError.sqlRuntime("bound column used outside a row context")
+  }
+  var boundCollation: (_ table: Int, _ column: Int) -> Collation? = { _, _ in nil }
+  var boundColumnType: (_ table: Int, _ column: Int) -> ColumnType? = { _, _ in nil }
   /// Correlated scalar subquery executor (installed by the query executor).
   var scalarSubquery: (SQLSelect) throws(DBError) -> Value
   /// The current group's value for an aggregate slot (installed during
@@ -186,6 +194,8 @@ enum SQLEval {
       return try env.parameter(param)
     case .column(let table, let name, let offset):
       return try env.column(table, name, offset)
+    case .boundColumn(let table, let column):
+      return try env.boundColumn(table, column)
     case .aggregateResult(let slot):
       return try env.aggregateValue(slot)
     case .collate(let inner, _):
@@ -336,6 +346,12 @@ enum SQLEval {
       case .text: return .text
       case .blob, nil: return .none
       }
+    case .boundColumn(let table, let column):
+      switch env.boundColumnType(table, column) {
+      case .integer, .real: return .numeric
+      case .text: return .text
+      case .blob, nil: return .none
+      }
     case .binary(.concat, _, _):
       return .text
     case .binary(let op, _, _) where !op.isComparison && op != .and && op != .or:
@@ -392,6 +408,7 @@ enum SQLEval {
   private static func impliedCollation(_ expr: SQLExpr, _ env: SQLEvalEnv) -> Collation? {
     switch expr {
     case .column(let table, let name, _): return env.collationOf(table, name)
+    case .boundColumn(let table, let column): return env.boundCollation(table, column)
     case .collate(let inner, _), .unary(_, let inner), .cast(let inner, _):
       return impliedCollation(inner, env)
     default: return nil

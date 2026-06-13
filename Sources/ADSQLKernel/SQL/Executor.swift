@@ -602,6 +602,9 @@ enum SelectExecutor {
         binding.resolve(qualifier: qualifier, name: name)
           .map { binding.tables[$0.table].columnTypes[$0.column] }
       },
+      boundColumn: { (table, column) throws(DBError) in representative[table][column] },
+      boundCollation: { (table, column) in binding.tables[table].columnCollations[column] },
+      boundColumnType: { (table, column) in binding.tables[table].columnTypes[column] },
       scalarSubquery: { _ throws(DBError) in
         throw DBError.sqlUnsupported("subquery (arrives in a later slice)")
       },
@@ -827,6 +830,13 @@ enum SelectExecutor {
         binding.resolve(qualifier: qualifier, name: name)
           .map { binding.tables[$0.table].columnTypes[$0.column] }
       },
+      // Bind-time-resolved slots: read the row directly, no name resolution.
+      // Always an inner reference (correlated outer refs stay `.column`).
+      boundColumn: { (table, column) throws(DBError) in
+        try context.value(table: table, column: column)
+      },
+      boundCollation: { (table, column) in binding.tables[table].columnCollations[column] },
+      boundColumnType: { (table, column) in binding.tables[table].columnTypes[column] },
       scalarSubquery: { sub throws(DBError) in try subquery(sub, context, binding) })
   }
 

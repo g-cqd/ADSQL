@@ -323,7 +323,7 @@ enum Planner {
   /// from parameters alone at execution time.
   private static func isConstant(_ expr: SQLExpr) -> Bool {
     switch expr {
-    case .column, .scalarSubquery, .inJSONEach, .aggregateResult:
+    case .column, .boundColumn, .scalarSubquery, .inJSONEach, .aggregateResult:
       return false
     case .literal, .parameter:
       return true
