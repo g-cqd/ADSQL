@@ -36,8 +36,11 @@ enum AccessPlan: Sendable {
   case index(name: String, probes: [IndexProbe], constraint: String)
   /// Full-text MATCH on an FTS5 table: the row source is the docid set
   /// `FTSMatch.evaluate` returns for `query` (a literal/parameter expression),
-  /// not a B+tree scan. `query` is the MATCH right-hand operand.
-  case fts(table: String, query: SQLExpr)
+  /// not a B+tree scan. `query` is the MATCH right-hand operand. `weights` are
+  /// the bm25() per-column weights the binder captured (empty → all-ones, i.e.
+  /// plain `rank`); the executor pads/truncates them to the FTS column count and
+  /// scores each matching doc with them (F4).
+  case fts(table: String, query: SQLExpr, weights: [Double])
 }
 
 /// The result of planning: the access path plus order analysis.
@@ -78,7 +81,8 @@ enum Planner {
     if source.isFTS, let whereExpr,
       let (query, conjunct) = ftsMatchConjunct(whereExpr, source: source) {
       return AccessPlanning(
-        plan: .fts(table: source.table, query: query),
+        // Default all-ones weights (`rank`); the binder overlays bm25() weights.
+        plan: .fts(table: source.table, query: query, weights: []),
         yieldsOrder: orderBy.isEmpty,
         rowidOrderSatisfiesOrderBy: false,
         coveredConjuncts: [conjunct])
@@ -129,7 +133,7 @@ enum Planner {
     // An FTS inner table is driven by a MATCH conjunct in its ON clause. MATCH
     // re-evaluates per outer row here (acceptable for F3c; FTS-first avoids it).
     if inner.isFTS, let (query, _) = ftsMatchConjunct(on, source: inner) {
-      return .fts(table: inner.table, query: query)
+      return .fts(table: inner.table, query: query, weights: [])
     }
     guard !equalities.isEmpty else { return .tableScan }
     let constraints = equalities.map { Constraint.eq(column: $0.column, value: $0.value, source: $0.value) }
@@ -439,7 +443,7 @@ extension AccessPlan {
       return probes.count > 1 ? "SEARCH \(table) USING ROWID (IN)" : "SEARCH \(table) USING ROWID"
     case .index(let name, _, let constraint):
       return "SEARCH \(table) USING INDEX \(name) (\(constraint))"
-    case .fts(let ftsTable, _):
+    case .fts(let ftsTable, _, _):
       return "SCAN \(ftsTable) VIRTUAL TABLE INDEX (MATCH)"
     }
   }

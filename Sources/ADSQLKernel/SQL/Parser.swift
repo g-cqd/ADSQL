@@ -1046,7 +1046,8 @@ struct SQLParser {
     if unsupportedAggregates.contains(upper) {
       throw DBError.sqlUnsupported("\(upper)() aggregate")
     }
-    if upper == "BM25" { throw DBError.sqlUnsupported("bm25() (FTS arrives with M5)") }
+    // `bm25(tbl, w0, …)` parses as an ordinary function call; the binder (F4b)
+    // rewrites it to a read of the FTS table's `rank` score slot.
     var star = false
     var args: [SQLExpr] = []
     if matchSymbol("*") {

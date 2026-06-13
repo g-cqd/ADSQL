@@ -293,7 +293,8 @@ struct SQLParserErrorTests {
     ("SELECT COUNT(DISTINCT a) FROM t", "DISTINCT"),
     ("SELECT AVG(a) FROM t", "AVG"),
     ("SELECT MAX(a) FROM t", "MAX"),
-    ("SELECT bm25(fts) FROM fts", "bm25"),
+    // bm25() now parses as a function call (F4b); the binder rewrites it to the
+    // FTS `rank` score slot. (Was rejected at parse time before ranking landed.)
     ("SELECT a, ROW_NUMBER() OVER (ORDER BY a) FROM t", "window"),
     ("SELECT * FROM (SELECT 1)", "FROM"),
     ("SELECT * FROM a, b", "comma join"),
@@ -362,7 +363,10 @@ struct SQLParserErrorTests {
         _ = try? SQLParser.parseScript(text)
       }
     }
-    #expect(attempts > 1000)
+    // Sanity: the loop ran 40 mutations per corpus entry (tied to the corpus so
+    // it stays correct as entries are added/removed — e.g. bm25 leaving the
+    // unsupported set in F4 — rather than to a magic constant).
+    #expect(attempts == corpus.count * 40)
   }
 }
 

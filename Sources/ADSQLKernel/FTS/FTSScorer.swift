@@ -10,8 +10,10 @@ import Darwin
 /// is a pure exclusion (already removed from the match set by F3b) and never
 /// scores. For each positive leaf phrase `p`:
 ///
-///   - `IDF(p) = log((N − df_p + 0.5) / (df_p + 0.5))` — SQLite's form (it may
-///     go negative for a term in more than half the corpus, matching FTS5).
+///   - `IDF(p) = log((N − df_p + 0.5) / (df_p + 0.5))`, clamped to a tiny
+///     positive `1e-6` when ≤ 0 (FTS5's behavior: a term in more than half the
+///     corpus would otherwise get a negative IDF and *invert* the ranking; the
+///     clamp keeps it weakly positive so denser docs still rank first).
 ///   - `wf(p, row) = Σ_c weight_c · freq(p, c, row)` — weighted occurrences of
 ///     `p` in each column `c` (a term: per-column tf; a phrase: per-column
 ///     adjacency count). A `col:` restriction zeroes the weight of every other
@@ -27,6 +29,10 @@ enum FTSScorer {
   static let k1 = 1.2
   /// BM25 length-normalization parameter (SQLite FTS5 default).
   static let b = 0.75
+  /// Floor for a non-positive IDF (FTS5 clamps `IDF ≤ 0` to this so a term in
+  /// more than half the corpus stays weakly discriminating instead of inverting
+  /// the ranking).
+  static let minIDF = 1e-6
 
   /// The (negated) bm25f score of `docid` for `query`. `weights` is per-column
   /// (length == the FTS table's column count; the caller pads with 1.0). `global`
@@ -54,7 +60,8 @@ enum FTSScorer {
     try scorer.collectLeaves(query, columns: nil) { leaf, allowed throws(DBError) in
       let df = try scorer.documentFrequency(leaf)
       let n = Double(global.docCount)
-      let idf = log((n - Double(df) + 0.5) / (Double(df) + 0.5))
+      let rawIDF = log((n - Double(df) + 0.5) / (Double(df) + 0.5))
+      let idf = rawIDF <= 0 ? minIDF : rawIDF
       var weightedFreq = 0.0
       let perColumn = try scorer.frequencies(leaf, docid: docid)
       for column in 0..<columns where allowed?.contains(column) ?? true {

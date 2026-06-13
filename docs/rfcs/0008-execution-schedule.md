@@ -113,8 +113,8 @@ format) feed M6 but are scheduled within F0/F6, not here.
 | F1 · tokenizers | M5 | ✅ done | `feat(fts): F1` |
 | F2 · index build + maintenance | M5 | ✅ done | `feat(fts): F2a/F2b/F2c` — postings codec, self-contained build/maintenance, content modes + 'delete' idiom (segments deferred to F6) |
 | F3 · boolean MATCH | M5 | ✅ done | F3a grammar `feat(fts): F3a` + F3b eval `feat(fts): F3b` + F3c SQL `MATCH` surface `feat(fts): F3c` (`SQLBinaryOp.match`, `AccessPlan.fts`/`RowSource.fts`, FTS-driven join). Differential-vs-CSQLite-FTS5 membership gate **passed** (AND/OR/NOT/prefix/phrase/column over a shared corpus). |
-| F4 · ranking (bm25/bm25f) | M5 | ⏭ next | — |
-| F5 · triggers | M5 | ⏳ planned | — |
+| F4 · ranking (bm25/bm25f) | M5 | ✅ done | F4a scorer `feat(fts): F4a` (`FTS/FTSScorer.swift` — bm25f over the F2 stats, SQLite's IDF clamped to 1e-6, per-field weights) + F4b surface `feat(fts): F4b` (`rank`/`bm25()` → FTS `rank` score slot, `ORDER BY rank LIMIT k` via the existing bounded top-N). Differential-vs-CSQLite-FTS5 **ordering** gate **passed** (plain `rank`, weighted `bm25()`, OR/AND queries — equal top-k rowid order). Block-max WAND top-k deferred to F6 (ships score-all-matches + bounded top-N). |
+| F5 · triggers | M5 | ⏭ next | — |
 | F6 · apple-docs tables + bench | M5 | ⏳ planned | — |
 | P0 · DSL dep-free core | M7 | 🔒 blocked (F5) | — |
 | P1 · macro tier (swift-syntax) | M7 | 🔒 blocked (P0) | — |

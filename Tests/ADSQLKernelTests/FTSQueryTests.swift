@@ -147,19 +147,17 @@ struct FTSQueryTests {
     }
   }
 
-  @Test func bm25StillRejected() {
-    // bm25() is F4; the parser still rejects it as unsupported. (Plain do/catch
-    // with a `switch` in the body — `catch let … as DBError` miscompiles in the
-    // Swift 6.4 SIL ownership verifier, see SQLParserTests.)
-    do {
-      _ = try SQLParser.parseOne("SELECT bm25(documents_fts) FROM documents_fts")
-      Issue.record("bm25() must be rejected")
-    } catch {
-      guard case .sqlUnsupported = error else {
-        Issue.record("bm25 should be sqlUnsupported, got \(error)")
-        return
-      }
+  @Test func bm25ParsesAsFunctionCall() throws {
+    // bm25() is no longer rejected at parse time (F4b): it parses as an ordinary
+    // function call and the binder rewrites it to the FTS `rank` score slot.
+    let parsed = try SQLParser.parseOne("SELECT bm25(documents_fts) FROM documents_fts")
+    guard case .select(let select) = parsed, case .expr(let expr, _, _) = select.columns[0],
+      case .function(let name, _, _, _) = expr
+    else {
+      Issue.record("bm25() should parse as a function call, got \(parsed)")
+      return
     }
+    #expect(name == "BM25")
   }
 
   // MARK: - Differential gate vs SQLite FTS5

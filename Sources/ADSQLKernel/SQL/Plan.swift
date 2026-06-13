@@ -47,13 +47,31 @@ struct TableBinding: Sendable {
 }
 
 /// The executor and planner model an FTS5 table as an ordinary rowid-keyed
-/// table with a single `rowid` alias column. `RowSlot.compute` returns the
-/// docid for that column without touching any record span, so the empty span
-/// the `.fts` source supplies is never read; `f.rowid` joins the base table.
+/// table with two synthetic columns: slot 0 is the `rowid` alias (`RowSlot`
+/// returns the docid without touching any record span, so the empty span the
+/// `.fts` source supplies is never read; `f.rowid` joins the base table), and
+/// slot 1 is `rank` — the bm25 relevance score the `.fts` source computes per
+/// matching doc (F4). `f.rank` / bare `rank` resolves to slot 1 and reads the
+/// score via `RowSlot.compute`'s `scoreIndex` path, parallel to the rowid path.
+/// The `bm25()` index of the rank slot.
+let ftsRankSlot = 1
+
 func syntheticFTSDefinition(_ name: String) -> TableDefinition {
   TableDefinition(
-    name, columns: [ColumnDefinition("rowid", .integer)],
+    name, columns: [ColumnDefinition("rowid", .integer), ColumnDefinition("rank", .real)],
     primaryKey: .rowidAlias(column: "rowid", autoincrement: false))
+}
+
+extension TableDefinition {
+  /// The `rank` score-column index for a synthetic FTS definition (the
+  /// `[rowid, rank]` shape `syntheticFTSDefinition` builds), else nil. Lets the
+  /// executor's `RowSlot` recognize the score slot without a separate flag.
+  var ftsScoreIndex: Int? {
+    guard columns.count == 2, rowidAliasIndex == 0,
+      columns[ftsRankSlot].name == "rank", columns[ftsRankSlot].type == .real
+    else { return nil }
+    return ftsRankSlot
+  }
 }
 
 /// A projected output column: its result-set name and the expression that
@@ -368,37 +386,73 @@ enum Binder {
     // bind-time analysis (planning, collation, INLJ extraction, removeCovered),
     // which consumed the `.column` form. Correlated outer refs that don't
     // resolve here stay `.column` (runtime outer fallback).
-    func bind(_ expr: SQLExpr) -> SQLExpr { bindColumns(expr, binding) }
+    //
+    // The same pass intercepts `bm25(tbl, w0, w1, …)` (and bare `rank`), which
+    // reads the FTS `rank` score slot: it rewrites the call to a bound read of
+    // that slot and records the per-column weights for the table, so they can be
+    // threaded into the `.fts` access plan below (one ranking per FTS table).
+    var ftsWeights: [Int: [Double]] = [:]
+    func bind(_ expr: SQLExpr) -> SQLExpr { bindColumns(expr, binding, &ftsWeights) }
+    let boundJoins = joins.map {
+      BoundJoin(kind: $0.kind, table: $0.table, on: bind($0.on), access: $0.access)
+    }
+    let boundOutputs = outputs.map { BoundOutput(name: $0.name, expr: bind($0.expr)) }
+    let boundWhere = whereExpr.map(bind)
+    let boundResidual = residualWithoutCovered.map(bind)
+    let boundOrderBy = orderBy.map { SQLOrderingTerm(expr: bind($0.expr), descending: $0.descending) }
+    let boundGroupBy = select.groupBy.map(bind)
+    let boundHaving = having.map(bind)
+    // Apply the captured weights now that every expression has been bound (so a
+    // bm25() anywhere in the projection/ORDER BY is seen). Default to all-ones
+    // for a plain `rank` reference (the table index is the leading table or the
+    // join depth).
     return BoundSelect(
       binding: binding,
-      joins: joins.map {
-        BoundJoin(kind: $0.kind, table: $0.table, on: bind($0.on), access: bindAccess($0.access, binding))
+      joins: boundJoins.map {
+        BoundJoin(
+          kind: $0.kind, table: $0.table, on: $0.on,
+          access: bindAccess(applyWeights($0.access, ftsWeights, depth: $0.table), binding))
       },
-      outputs: outputs.map { BoundOutput(name: $0.name, expr: bind($0.expr)) },
+      outputs: boundOutputs,
       outputCollations: outputCollations,
-      whereExpr: whereExpr.map(bind),
-      residualWithoutCovered: residualWithoutCovered.map(bind),
-      orderBy: orderBy.map { SQLOrderingTerm(expr: bind($0.expr), descending: $0.descending) },
+      whereExpr: boundWhere,
+      residualWithoutCovered: boundResidual,
+      orderBy: boundOrderBy,
       orderCollations: orderCollations,
-      groupBy: select.groupBy.map(bind),
+      groupBy: boundGroupBy,
       groupCollations: groupCollations,
-      having: having.map(bind),
+      having: boundHaving,
       aggregates: aggregates.map { bindAggregate($0, binding) },
       isAggregated: isAggregated,
       distinct: select.distinct,
       limit: select.limit,
       offset: select.offset,
       header: header,
-      access: bindAccess(planning.plan, binding),
+      access: bindAccess(applyWeights(planning.plan, ftsWeights, depth: 0), binding),
       accessYieldsOrder: yieldsOrder && planning.yieldsOrder,
       rowidOrderSatisfiesOrderBy: yieldsOrder && planning.rowidOrderSatisfiesOrderBy)
   }
 
+  /// Overlays captured bm25() weights onto an `.fts` access plan for the table at
+  /// `depth`; other plans pass through. With no bm25() call the plan keeps the
+  /// Planner's default (empty → all-ones at execution), i.e. plain `rank`.
+  private static func applyWeights(
+    _ access: AccessPlan, _ weights: [Int: [Double]], depth: Int
+  ) -> AccessPlan {
+    guard case .fts(let table, let query, _) = access, let captured = weights[depth] else {
+      return access
+    }
+    return .fts(table: table, query: query, weights: captured)
+  }
+
   /// Resolves resolvable `.column` refs to `.boundColumn(table, column)` slots
   /// (leaving correlated outer refs as `.column`); does not descend into
-  /// `.scalarSubquery` (bound independently when executed).
-  private static func bindColumns(_ expr: SQLExpr, _ binding: QueryBinding) -> SQLExpr {
-    func recur(_ e: SQLExpr) -> SQLExpr { bindColumns(e, binding) }
+  /// `.scalarSubquery` (bound independently when executed). A `bm25(tbl, …)`
+  /// call is rewritten to a bound read of the table's `rank` score slot, with its
+  /// weight literals captured into `weights` (keyed by the table's depth).
+  private static func bindColumns(
+    _ expr: SQLExpr, _ binding: QueryBinding, _ weights: inout [Int: [Double]]
+  ) -> SQLExpr {
     switch expr {
     case .column(let qualifier, let name, _):
       if let (table, column) = binding.resolve(qualifier: qualifier, name: name) {
@@ -408,28 +462,74 @@ enum Binder {
     case .literal, .parameter, .aggregateResult, .boundColumn, .scalarSubquery:
       return expr
     case .binary(let op, let lhs, let rhs):
-      return .binary(op, recur(lhs), recur(rhs))
+      return .binary(op, bindColumns(lhs, binding, &weights), bindColumns(rhs, binding, &weights))
     case .unary(let op, let inner):
-      return .unary(op, recur(inner))
+      return .unary(op, bindColumns(inner, binding, &weights))
     case .like(let subject, let pattern, let negated):
-      return .like(recur(subject), pattern: recur(pattern), negated: negated)
+      return .like(
+        bindColumns(subject, binding, &weights),
+        pattern: bindColumns(pattern, binding, &weights), negated: negated)
     case .isNull(let inner, let negated):
-      return .isNull(recur(inner), negated: negated)
+      return .isNull(bindColumns(inner, binding, &weights), negated: negated)
     case .inList(let subject, let items, let negated):
-      return .inList(recur(subject), items.map(recur), negated: negated)
+      return .inList(
+        bindColumns(subject, binding, &weights),
+        items.map { bindColumns($0, binding, &weights) }, negated: negated)
     case .inJSONEach(let subject, let source, let negated):
-      return .inJSONEach(recur(subject), source: recur(source), negated: negated)
+      return .inJSONEach(
+        bindColumns(subject, binding, &weights),
+        source: bindColumns(source, binding, &weights), negated: negated)
     case .caseWhen(let operand, let whens, let elseExpr):
       return .caseWhen(
-        operand: operand.map(recur),
-        whens: whens.map { SQLWhen(condition: recur($0.condition), result: recur($0.result)) },
-        elseExpr: elseExpr.map(recur))
+        operand: operand.map { bindColumns($0, binding, &weights) },
+        whens: whens.map {
+          SQLWhen(
+            condition: bindColumns($0.condition, binding, &weights),
+            result: bindColumns($0.result, binding, &weights))
+        },
+        elseExpr: elseExpr.map { bindColumns($0, binding, &weights) })
     case .function(let name, let args, let star, let offset):
-      return .function(name: name, args: args.map(recur), star: star, offset: offset)
+      if name.uppercased() == "BM25", let bound = bindBM25(args, binding, &weights) {
+        return bound
+      }
+      return .function(
+        name: name, args: args.map { bindColumns($0, binding, &weights) }, star: star,
+        offset: offset)
     case .cast(let inner, let type):
-      return .cast(recur(inner), type)
+      return .cast(bindColumns(inner, binding, &weights), type)
     case .collate(let inner, let collation):
-      return .collate(recur(inner), collation)
+      return .collate(bindColumns(inner, binding, &weights), collation)
+    }
+  }
+
+  /// Binds `bm25(tbl, w0, w1, …)`: the first argument names the FTS table (its
+  /// alias-or-name, parsed as a bare column ref), the rest are numeric weight
+  /// literals. Returns a bound read of the table's `rank` slot and records the
+  /// authored weights under the table's depth (the executor pads/truncates them
+  /// to the real column count); nil if the first argument doesn't name an FTS
+  /// table in this query (so the generic `.function` path reports the error).
+  private static func bindBM25(
+    _ args: [SQLExpr], _ binding: QueryBinding, _ weights: inout [Int: [Double]]
+  ) -> SQLExpr? {
+    guard let first = args.first, case .column(let qualifier, let name, _) = first else { return nil }
+    let target = qualifier ?? name
+    guard let depth = binding.tables.firstIndex(where: { $0.binding == target.lowercased() }),
+      binding.tables[depth].isFTS
+    else { return nil }
+    // Capture the authored weights as written; missing args default to 1.0 and
+    // the real per-column length is resolved at execution (the synthetic binding
+    // only carries [rowid, rank], not the FTS table's real text columns).
+    weights[depth] = args.dropFirst().map { numericLiteral($0) ?? 1.0 }
+    return .boundColumn(table: depth, column: ftsRankSlot)
+  }
+
+  /// A numeric weight literal (integer or real); nil otherwise.
+  private static func numericLiteral(_ expr: SQLExpr) -> Double? {
+    switch expr {
+    case .literal(.integer(let value)): return Double(value)
+    case .literal(.real(let value)): return value
+    case .unary(.negate, let inner): return numericLiteral(inner).map { -$0 }
+    default: return nil
     }
   }
 
@@ -438,26 +538,34 @@ enum Binder {
     case .tableScan:
       return .tableScan
     case .rowid(let exprs):
-      return .rowid(exprs.map { bindColumns($0, binding) })
+      return .rowid(exprs.map { bindColumnsNoWeights($0, binding) })
     case .index(let name, let probes, let constraint):
       let bound = probes.map { probe in
         IndexProbe(
-          equality: probe.equality.map { bindColumns($0, binding) },
+          equality: probe.equality.map { bindColumnsNoWeights($0, binding) },
           trailing: probe.trailing.map { bindTrailing($0, binding) })
       }
       return .index(name: name, probes: bound, constraint: constraint)
-    case .fts(let table, let query):
+    case .fts(let table, let query, let weights):
       // The query string is a literal/parameter; bind it like any expression
       // (a stray column ref would just stay `.column` and fail at evaluation).
-      return .fts(table: table, query: bindColumns(query, binding))
+      // The weights were already captured/applied from any bm25() call.
+      return .fts(table: table, query: bindColumnsNoWeights(query, binding), weights: weights)
     }
+  }
+
+  /// `bindColumns` for the access-path expressions (probe values, MATCH query):
+  /// these never contain a bm25() call, so the weight collector is discarded.
+  private static func bindColumnsNoWeights(_ expr: SQLExpr, _ binding: QueryBinding) -> SQLExpr {
+    var weights: [Int: [Double]] = [:]
+    return bindColumns(expr, binding, &weights)
   }
 
   private static func bindTrailing(_ trailing: Trailing, _ binding: QueryBinding) -> Trailing {
     switch trailing {
     case .range(let lower, let upper):
       func bound(_ b: BoundExpr) -> BoundExpr {
-        BoundExpr(expr: bindColumns(b.expr, binding), inclusive: b.inclusive)
+        BoundExpr(expr: bindColumnsNoWeights(b.expr, binding), inclusive: b.inclusive)
       }
       return .range(lower: lower.map(bound), upper: upper.map(bound))
     }
@@ -466,8 +574,8 @@ enum Binder {
   private static func bindAggregate(_ spec: AggregateSpec, _ binding: QueryBinding) -> AggregateSpec {
     switch spec.kind {
     case .countStar: return spec
-    case .count(let expr): return AggregateSpec(kind: .count(bindColumns(expr, binding)))
-    case .sum(let expr): return AggregateSpec(kind: .sum(bindColumns(expr, binding)))
+    case .count(let expr): return AggregateSpec(kind: .count(bindColumnsNoWeights(expr, binding)))
+    case .sum(let expr): return AggregateSpec(kind: .sum(bindColumnsNoWeights(expr, binding)))
     }
   }
 

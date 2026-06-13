@@ -39,9 +39,12 @@ struct FTSScorerTests {
     let commonScore = try score(db, "fts", "common", docid: 1)
     // df(rare)=1 < df(common)=4 → rare is strictly more informative (better).
     #expect(rareScore < commonScore)
-    // "common" is in all 4 of 4 docs → IDF = log((4-4+0.5)/(4+0.5)) < 0, so the
-    // negated contribution is positive: a non-discriminating term ranks worst.
-    #expect(commonScore > 0)
+    // "common" is in all 4 of 4 docs → raw IDF = log((4-4+0.5)/(4+0.5)) < 0,
+    // clamped to 1e-6 (FTS5 behavior), so its score is a tiny negative near zero
+    // — far weaker than the rare term, never inverting the ranking.
+    #expect(commonScore < 0)
+    #expect(commonScore > -0.001, "clamped-IDF score is near zero, got \(commonScore)")
+    #expect(rareScore < -0.1, "rare term keeps a strong negative score, got \(rareScore)")
   }
 
   // MARK: - Score improves with term frequency

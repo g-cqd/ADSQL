@@ -28,7 +28,14 @@
 @safe final class RowSlot {
   private let columns: [ColumnDefinition]
   private let aliasIndex: Int?
+  /// The FTS `rank` score column index (slot 1 of the synthetic FTS definition),
+  /// if this slot models an FTS table. `compute` returns the per-row `score` for
+  /// it without touching the span, parallel to the `aliasIndex → rowid` path.
+  private let scoreIndex: Int?
   private(set) var rowid: Int64 = 0
+  /// The bm25 relevance score of the current FTS row (`.real(score)` for the
+  /// `rank` column). Zero for non-FTS rows, where `scoreIndex` is nil.
+  private var score: Double = 0
   private var span = unsafe UnsafeRawBufferPointer(start: nil, count: 0)
   private var cache: [Value?]
   // Incremental cell location: `offsets[i]` is the byte start of stored cell i,
@@ -44,16 +51,19 @@
   init(table: TableDefinition) {
     self.columns = table.columns
     self.aliasIndex = table.rowidAliasIndex
+    self.scoreIndex = table.ftsScoreIndex
     self.cache = Array(repeating: nil, count: table.columns.count)
     self.offsets = []
     self.offsets.reserveCapacity(table.columns.count)
   }
 
   /// Re-points the slot at a new row's record span; resets the decode state.
-  /// The span must stay valid for as long as the slot is read (the scan driver
+  /// `score` is the FTS row's bm25 score (ignored when not an FTS slot). The
+  /// span must stay valid for as long as the slot is read (the scan driver
   /// guarantees this within the per-row body).
-  func load(rowid: Int64, span: UnsafeRawBufferPointer) {
+  func load(rowid: Int64, span: UnsafeRawBufferPointer, score: Double = 0) {
     self.rowid = rowid
+    self.score = score
     unsafe self.span = unsafe span
     self.headerParsed = false
     self.locatedCount = 0
@@ -79,6 +89,8 @@
 
   private func compute(at index: Int) throws(DBError) -> Value {
     if index == aliasIndex { return .integer(rowid) }
+    // The FTS `rank` slot reads the precomputed score, never the (empty) span.
+    if index == scoreIndex { return .real(score) }
     guard let start = try locate(index) else {
       switch columns[index].defaultValue {
       case .value(let value): return value
@@ -184,8 +196,9 @@ enum SelectExecutor {
       context: context, env: env, residual: residual, outputs: plan.outputs,
       orderBy: plan.orderBy, orderCollations: plan.orderCollations, collectKeys: collectKeys,
       sliceEnd: sliceEnd, topN: topN, dedupRowids: dedupRowids)
-    unsafe try forEachRow(source, table: table, resolver: resolver) { rowid, span throws(DBError) in
-      unsafe try accumulator.consume(rowid: rowid, span: span)
+    unsafe try forEachRow(source, table: table, resolver: resolver) {
+      rowid, span, score throws(DBError) in
+      unsafe try accumulator.consume(rowid: rowid, span: span, score: score)
     }
 
     var rows = accumulator.rows
@@ -213,9 +226,11 @@ enum SelectExecutor {
     case table
     case rowids([Int64])
     case index(Catalog.IndexRecord, [IndexBounds])
-    /// An FTS5 MATCH source: the docids `FTSMatch.evaluate` returns (ascending).
-    /// `query` is the UTF-8 of the resolved MATCH query string.
-    case fts(Catalog.FTSRecord, query: [UInt8])
+    /// An FTS5 MATCH source: the docids `FTSMatch.evaluate` returns (ascending),
+    /// each scored by bm25f. `query` is the UTF-8 of the resolved MATCH query
+    /// string; `weights` are the per-column bm25() weights (already padded to the
+    /// FTS column count, all-ones for plain `rank`).
+    case fts(Catalog.FTSRecord, query: [UInt8], weights: [Double])
   }
 
   /// Accumulates surviving rows; `consume` returns false to request early
@@ -257,12 +272,12 @@ enum SelectExecutor {
       self.seenRowids = dedupRowids ? [] : nil
     }
 
-    func consume(rowid: Int64, span: UnsafeRawBufferPointer) throws(DBError) -> Bool {
+    func consume(rowid: Int64, span: UnsafeRawBufferPointer, score: Double) throws(DBError) -> Bool {
       if seenRowids != nil {
         if seenRowids!.contains(rowid) { return true }
         seenRowids!.insert(rowid)
       }
-      unsafe context.load(0, rowid: rowid, span: span)
+      unsafe context.load(0, rowid: rowid, span: span, score: score)
       if let residual {
         if SQLEval.truth(try SQLEval.evaluate(residual, env)) != .yes { return true }
       }
@@ -322,25 +337,28 @@ enum SelectExecutor {
     }
   }
 
-  /// Drives a row source, invoking `body` per `(rowid, recordSpan)`. The span
-  /// is a zero-copy view into the mapped page, valid only for the duration of
-  /// the `body` call; `body` returns false to stop early.
+  /// Drives a row source, invoking `body` per `(rowid, recordSpan, score)`. The
+  /// span is a zero-copy view into the mapped page, valid only for the duration
+  /// of the `body` call; `score` is the bm25 relevance (0 for non-FTS sources).
+  /// `body` returns false to stop early.
   private static func forEachRow<R: PageResolver>(
     _ source: RowSource, table: Catalog.TableRecord, resolver: R,
-    _ body: (Int64, UnsafeRawBufferPointer) throws(DBError) -> Bool
+    _ body: (Int64, UnsafeRawBufferPointer, Double) throws(DBError) -> Bool
   ) throws(DBError) {
     switch source {
     case .table:
       var cursor = try RowCursor(
         resolver: resolver, table: table, mode: .table, lowerKey: nil, upperKey: nil)
-      unsafe try cursor.forEachRecordSpan(body)
+      unsafe try cursor.forEachRecordSpan { rowid, span throws(DBError) in
+        unsafe try body(rowid, span, 0)
+      }
     case .rowids(let rowids):
       for rowid in rowids {
         let outcome: Bool? = try Relation.withRowValue(
           resolver, table.handle, key: KeyCodec.rowKey(rowid)
         ) { ref throws(DBError) in
           unsafe try BTree.withValueBytes(ref, resolver: resolver) { span throws(DBError) in
-            unsafe try body(rowid, span)
+            unsafe try body(rowid, span, 0)
           }
         }
         if outcome == false { return }  // nil = no such row → skip
@@ -350,19 +368,32 @@ enum SelectExecutor {
         let (lower, upper) = try Relation.scanBounds(bounds, index: index, table: table)
         var cursor = try RowCursor(
           resolver: resolver, table: table, mode: .index(index), lowerKey: lower, upperKey: upper)
-        unsafe try cursor.forEachRecordSpan(body)
+        unsafe try cursor.forEachRecordSpan { rowid, span throws(DBError) in
+          unsafe try body(rowid, span, 0)
+        }
       }
-    case .fts(let record, let queryBytes):
-      // Evaluate the MATCH query to its docid set (F3b), then hand each docid to
-      // `body` with an EMPTY span: the FTS table's `RowSlot` is built from the
-      // synthetic rowid-alias definition, so `compute` returns `.integer(docid)`
-      // for `rowid` and never reads the span. The join then descends on
+    case .fts(let record, let queryBytes, let weights):
+      // Evaluate the MATCH query to its docid set (F3b), score each by bm25f
+      // (F4a), then hand each docid to `body` with an EMPTY span and the score:
+      // the FTS table's `RowSlot` is built from the synthetic rowid-alias
+      // definition, so `compute` returns `.integer(docid)` for `rowid`, `.real`
+      // for `rank`, and never reads the span. The join then descends on
       // `base.id = fts.rowid` exactly as for an ordinary rowid source.
       let query = try FTSQuery.parse(String(decoding: queryBytes, as: UTF8.self))
       let docids = try FTSMatch.evaluate(query, record: record, resolver: resolver)
+      // Fetch the corpus aggregate once; pad weights to the FTS column count.
+      let global = try FTSIndex.globalStats(resolver, record)
+      let columns = record.definition.columns.count
+      var resolvedWeights = weights
+      if resolvedWeights.count < columns {
+        resolvedWeights += Array(repeating: 1.0, count: columns - resolvedWeights.count)
+      }
       let empty = unsafe UnsafeRawBufferPointer(start: nil, count: 0)
       for docid in docids {
-        if try unsafe !body(docid, empty) { return }
+        let score = try FTSScorer.score(
+          query, record: record, resolver: resolver, docid: docid,
+          weights: resolvedWeights, global: global)
+        if try unsafe !body(docid, empty, score) { return }
       }
     }
   }
@@ -398,7 +429,7 @@ enum SelectExecutor {
       case .scan: return .table
       case .bounds(let list): return .index(index, list)
       }
-    case .fts(let name, let queryExpr):
+    case .fts(let name, let queryExpr, let weights):
       guard let record = ftsRecords[name] else {
         throw DBError.noSuchTable(name)
       }
@@ -408,7 +439,7 @@ enum SelectExecutor {
       guard case .text(let text) = value else {
         throw DBError.sqlRuntime("MATCH query must be a text value")
       }
-      return .fts(record, query: Array(text.utf8))
+      return .fts(record, query: Array(text.utf8), weights: weights)
     }
   }
 
@@ -434,8 +465,8 @@ enum SelectExecutor {
       let source = try resolveSource(
         plan, table: tables[0], index: index, ftsRecords: ftsRecords, env: paramsEnv)
       unsafe try forEachRow(source, table: tables[0], resolver: resolver) {
-        rowid, span throws(DBError) in
-        unsafe context.load(0, rowid: rowid, span: span)
+        rowid, span, score throws(DBError) in
+        unsafe context.load(0, rowid: rowid, span: span, score: score)
         if try passesWhere() { try body() }
         return true
       }
@@ -458,8 +489,8 @@ enum SelectExecutor {
       let innerSource = try resolveAccess(
         join.access, index: joinIndex, table: tables[depth], ftsRecords: ftsRecords, env: env)
       unsafe try forEachRow(innerSource, table: tables[depth], resolver: resolver) {
-        rowid, span throws(DBError) in
-        unsafe context.load(depth, rowid: rowid, span: span)
+        rowid, span, score throws(DBError) in
+        unsafe context.load(depth, rowid: rowid, span: span, score: score)
         if SQLEval.truth(try SQLEval.evaluate(join.on, env)) == .yes {
           matched = true
           try descend(depth + 1)
@@ -475,8 +506,8 @@ enum SelectExecutor {
     let outerSource = try resolveSource(
       plan, table: tables[0], index: index, ftsRecords: ftsRecords, env: paramsEnv)
     unsafe try forEachRow(outerSource, table: tables[0], resolver: resolver) {
-      rowid, span throws(DBError) in
-      unsafe context.load(0, rowid: rowid, span: span)
+      rowid, span, score throws(DBError) in
+      unsafe context.load(0, rowid: rowid, span: span, score: score)
       try descend(1)
       return true
     }
@@ -820,9 +851,9 @@ enum SelectExecutor {
       self.nullExtended = Array(repeating: false, count: definitions.count)
     }
 
-    func load(_ table: Int, rowid: Int64, span: UnsafeRawBufferPointer) {
+    func load(_ table: Int, rowid: Int64, span: UnsafeRawBufferPointer, score: Double = 0) {
       nullExtended[table] = false
-      unsafe slots[table].load(rowid: rowid, span: span)
+      unsafe slots[table].load(rowid: rowid, span: span, score: score)
     }
     func setNull(_ table: Int) { nullExtended[table] = true }
 
