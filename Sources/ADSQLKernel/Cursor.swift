@@ -67,6 +67,30 @@ public struct Cursor<R: PageResolver>: ~Copyable {
     return exact && isValid
   }
 
+  /// Like `seek`, but for *ascending* access: when the cursor is already
+  /// positioned and the target lies within the current leaf's key range, it
+  /// searches that leaf directly and skips the root→leaf descent. Otherwise it
+  /// falls back to a full `seek`. Provably equivalent to `seek` — the fast path
+  /// runs only when the key is bounded by the current leaf's first/last key,
+  /// where `Node.search` (the same primitive `seek` ends with) is authoritative.
+  public mutating func seekForward(_ key: UnsafeRawBufferPointer) throws(DBError) -> Bool {
+    if isValid, let top = stack.last {
+      let leaf = try resolver.resolvePage(top.pageNo)
+      let count = PageHeader.cellCount(leaf)
+      if PageHeader.pageType(leaf) == .leaf, count > 0 {
+        let firstKey = Node.leafCell(leaf, 0).key
+        let lastKey = Node.leafCell(leaf, count - 1).key
+        if Node.compare(key, firstKey) >= 0, Node.compare(key, lastKey) <= 0 {
+          let (index, exact) = Node.search(leaf, key: key)
+          stack[stack.count - 1].index = index
+          isValid = true
+          return exact
+        }
+      }
+    }
+    return try seek(key)
+  }
+
   @discardableResult
   public mutating func move(to edge: Edge) throws(DBError) -> Bool {
     stack.removeAll(keepingCapacity: true)

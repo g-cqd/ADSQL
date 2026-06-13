@@ -129,44 +129,68 @@ public struct RowCursor<R: PageResolver>: ~Copyable {
   public mutating func forEachRecordSpan(
     _ body: (Int64, UnsafeRawBufferPointer) throws(DBError) -> Bool
   ) throws(DBError) {
-    while !exhausted {
-      let step: Bool? = try cursor.withCurrent { (key, ref) throws(DBError) -> Bool? in
-        if let upperKey {
-          let inBounds = upperKey.withUnsafeBytes { upper in
-            Node.compare(key, UnsafeRawBufferPointer(rebasing: upper[...])) < 0
+    switch mode {
+    case .table:
+      while !exhausted {
+        let step: Bool? = try cursor.withCurrent { (key, ref) throws(DBError) -> Bool? in
+          if let upperKey, !Self.inBounds(key, below: upperKey) { return nil }
+          guard let rowid = KeyCodec.rowid(fromSuffixOf: key) else {
+            throw DBError.integrityFailure("malformed key in \(table.definition.name)")
           }
-          guard inBounds else { return nil }  // past the upper bound: stop
-        }
-        guard let rowid = KeyCodec.rowid(fromSuffixOf: key) else {
-          throw DBError.integrityFailure("malformed key in \(table.definition.name)")
-        }
-        switch mode {
-        case .table:
           return try BTree.withValueBytes(ref, resolver: resolver) { span throws(DBError) in
             try body(rowid, span)
           }
-        case .index:
-          let proceed: Bool? = try Relation.withRowValue(
-            resolver, table.handle, key: KeyCodec.rowKey(rowid)
-          ) { rowRef throws(DBError) in
-            try BTree.withValueBytes(rowRef, resolver: resolver) { span throws(DBError) in
-              try body(rowid, span)
-            }
-          }
-          guard let proceed else {
-            throw DBError.integrityFailure(
-              "dangling index entry: \(table.definition.name) rowid \(rowid)")
-          }
-          return proceed
-        }
-      } ?? nil
-
-      guard let proceed = step else {
-        exhausted = true  // cursor invalid or past the bound
-        return
+        } ?? nil
+        guard let proceed = step else { exhausted = true; return }
+        if !proceed { return }
+        exhausted = !(try cursor.next())
       }
-      if !proceed { return }  // body requested early-exit
-      exhausted = !(try cursor.next())
+    case .index:
+      // Index entries within a probe arrive in (columns…, rowid) order, so the
+      // rowids are ascending; a warm table cursor (`seekForward`) skips the
+      // root→leaf descent whenever the next rowid is in the leaf it already
+      // holds. The row fetch happens outside the index cursor's scope so the
+      // two cursors never alias.
+      var tableCursor = Cursor(resolver: resolver, tree: table.handle)
+      while !exhausted {
+        let rowid: Int64? = try cursor.withCurrent { (key, _) throws(DBError) -> Int64? in
+          if let upperKey, !Self.inBounds(key, below: upperKey) { return nil }
+          guard let rowid = KeyCodec.rowid(fromSuffixOf: key) else {
+            throw DBError.integrityFailure("malformed key in \(table.definition.name)")
+          }
+          return rowid
+        } ?? nil
+        guard let rowid else { exhausted = true; return }
+
+        let rowKey = KeyCodec.rowKey(rowid)
+        var found: Result<Bool, DBError> = .success(false)
+        rowKey.withUnsafeBytes { raw in
+          do throws(DBError) {
+            found = .success(try tableCursor.seekForward(raw))
+          } catch {
+            found = .failure(error)
+          }
+        }
+        guard try found.get() else {
+          throw DBError.integrityFailure(
+            "dangling index entry: \(table.definition.name) rowid \(rowid)")
+        }
+        let proceed: Bool = try tableCursor.withCurrent { (_, rowRef) throws(DBError) in
+          try BTree.withValueBytes(rowRef, resolver: resolver) { span throws(DBError) in
+            try body(rowid, span)
+          }
+        } ?? false
+        if !proceed { return }
+        exhausted = !(try cursor.next())
+      }
+    }
+  }
+
+  private static func inBounds(
+    _ key: UnsafeRawBufferPointer, below upperKey: [UInt8]
+  ) -> Bool {
+    upperKey.withUnsafeBytes { upper in
+      Node.compare(key, UnsafeRawBufferPointer(rebasing: upper[...])) < 0
     }
   }
 

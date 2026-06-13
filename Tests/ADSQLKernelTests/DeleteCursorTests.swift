@@ -210,6 +210,43 @@ struct CursorTests {
     #expect(scanned == Array(expected))
   }
 
+  /// The warm `seekForward` (leaf-local fast path) must be indistinguishable
+  /// from a fresh `seek` for both present and absent keys, in ascending order
+  /// (its design case) and in random order (the fallback must still be exact).
+  @Test func seekForwardMatchesSeek() throws {
+    let (kernel, model) = try buildTree(seed: 33, count: 3000)
+    let present = model.sortedPairs().map(\.key)
+    // A mix of present keys and absent probes, both ascending and shuffled.
+    var absent: [[UInt8]] = (0..<800).map { Array("c\($0 * 61)x".utf8) }
+    var rng = SplitMix64(seed: 99)
+    var shuffled = present + absent
+    for i in shuffled.indices.reversed() where i > 0 {
+      shuffled.swapAt(i, Int(rng.next() % UInt64(i + 1)))
+    }
+    absent.sort(by: lessBytes)
+
+    func check(_ probes: [[UInt8]]) throws {
+      var warm = Cursor(resolver: CommittedResolver(source: kernel), meta: kernel.meta)
+      for key in probes {
+        var fresh = Cursor(resolver: CommittedResolver(source: kernel), meta: kernel.meta)
+        var freshFound = false
+        var warmFound = false
+        key.withUnsafeBytes { freshFound = (try? fresh.seek($0)) ?? false }
+        key.withUnsafeBytes { warmFound = (try? warm.seekForward($0)) ?? false }
+        #expect(freshFound == warmFound, "found mismatch for \(key)")
+        #expect(try fresh.currentKey() == warm.currentKey(), "position mismatch for \(key)")
+      }
+    }
+    try check(present)                          // ascending present
+    try check((present + absent).sorted(by: lessBytes))  // ascending mixed
+    try check(shuffled)                         // random order → fallback path
+  }
+
+  private func lessBytes(_ a: [UInt8], _ b: [UInt8]) -> Bool {
+    for (x, y) in zip(a, b) where x != y { return x < y }
+    return a.count < b.count
+  }
+
   @Test func seekSemantics() throws {
     let kernel = MemKernel()
     let ctx = kernel.begin()
