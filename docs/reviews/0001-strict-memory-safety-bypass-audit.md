@@ -107,3 +107,30 @@ types; it is currently standing in for `~Escapable` on borrowed views.**
 
 See RFC 0003 (A1/A2/A3, D1/D2/D4) for the API references and the deferred-work
 rationale this review audits.
+
+## Resolution (2026-06)
+
+All six findings addressed. The `Lifetimes` experimental feature (SE-0446/0456;
+the flag is named `Lifetimes`, not `LifetimeDependence`, on Swift 6.4) is now on
+for `ADSQLKernel`, and the two highest-exposure borrowed views — the ones that
+cross into consumer/closure scopes — are genuinely compiler-enforced.
+
+| ID | Disposition | How |
+|---|---|---|
+| **F3** | Fixed | `MMap.base` is `private`; only `pageBytes`/`bytes` escape the type. |
+| **F5** | Fixed | Both `RawSpan(_unsafeBytes:)` sites confined to one `ReadTxn.withRawSpan` helper. |
+| **F6** | Fixed | Test shared-mutable vars → `Mutex`; bench reader → `KVReader: Sendable` (not `nonisolated(unsafe)`). |
+| **F1 · RowView** | **Fixed (enforced)** | `~Copyable, ~Escapable` over a `RawSpan` bound to the resolver (`bindSpan` = `_unsafeBytes` + `_overrideLifetime(borrowing: resolver)`). A view escaping the snapshot now fails to compile. |
+| **F2 · ValueRef** | **Fixed (enforced)** | `~Escapable`, `.inline(RawSpan)` bound to the resolver via `BTree.boundInline`; `get` carries `@_lifetime(borrow resolver)`; `withCurrent` yields `borrowing ValueRef`. |
+| **F1 · RowSlot** | Interim | `@safe` + precise `// SAFETY:` note. Column reads are decoupled from the scan body via the `@escaping` `SQLEvalEnv.column` closure (no `RawSpan` capture), so the span must be stored; enforcement would need a `RawSpan` threaded through the whole evaluator — a disproportionate refactor for a query-internal, scope-confined value. |
+| **F2 · LeafCell / LeafValue** | Interim | `@safe` + `// SAFETY:` notes. Transient node-builder projections, consumed synchronously, never stored; `leafCell(page:)` has no lifetime-bearing owner to bind to. |
+| **F4 · PageBuf** | Encapsulation fixed | `raw` is `internal` (was `public`) — the naked mutable pointer no longer leaves the package. The `MutableRawSpan`/`withMutableBytes` migration is deferred (≈60 in-module mutator sites), documented at the type. |
+
+Findings the audit got exactly right and that paid off in practice: the
+`~Copyable ≠ ~Escapable` point (a plain `~Escapable`-by-`_unsafeBytes` view is
+*immortal* and does **not** enforce escape — the lifetime must be tied to the
+snapshot owner via `_overrideLifetime`), and that `@safe` was standing in for
+`~Escapable`. Where the IRON LAW's enforcement is now real (RowView/ValueRef) it
+is the compiler's; where it remains an assertion (RowSlot/LeafCell/LeafValue) the
+owner/lifetime/bounds are now stated at the type. All changes perf-neutral
+(`sql search` ~5.0 ms, index scan ~2.1 M rows/s), 208 tests + TSan green.

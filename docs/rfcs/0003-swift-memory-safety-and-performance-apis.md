@@ -33,16 +33,25 @@ markers are annotations — `sql search` p50 4.97 ms, insert 143k rows/s, scan
   refactor on a working kernel. Recorded as future work (would shrink the
   marked surface to a small audited core).
 
-**RawSpan signature migration (A1/A2/A3) — evaluated, deferred.** The marked
-reads (`UnsafeRawBufferPointer` subscript / `loadUnaligned`) already **trap on
-out-of-bounds** in non-`-Ounchecked` builds, so memory safety (no UB) is
-already achieved. Migrating decode signatures to `RawSpan`/`Span<UInt8>` would
-only remove some `unsafe` markers, at the cost of signature churn (and possible
-per-byte bounds-check cost on the hot loop) on a now-clean, verified kernel.
-Spike confirmed the closure-yield-`RawSpan` pattern and safe `Span<UInt8>`
-parsing compile at the 6.4 floor without experimental features (returning a
-`~Escapable` still needs `@_lifetime` + `LifetimeDependence`). Deferred as an
-ergonomic refinement, not a safety gap.
+**RawSpan signature migration (A1/A2/A3) — partially implemented (Review 0001).**
+M4.7 deferred this as an "ergonomic refinement, not a safety gap." Review 0001
+sharpened that: the gap is **temporal** (`@safe` on a *borrowed* view asserts a
+lifetime invariant it can't enforce; bounds-trapping covers only spatial OOB,
+not a read after the snapshot is recycled). The follow-up undefers A1 where it
+matters: the two borrowed views that cross into consumer/closure scopes —
+`RowView` and `BTree.ValueRef` — are now `~Escapable` over a `RawSpan` *bound to
+the resolver* (the snapshot owner), via `_overrideLifetime`, so a view escaping
+its snapshot fails to compile. The `Lifetimes` feature (its real name on 6.4;
+not `LifetimeDependence`) is enabled for the kernel. The internal transient views
+(`RowSlot` — decoupled from the scan body by the `@escaping` eval env;
+`NodeBuilder.LeafCell`/`LeafValue` — no lifetime-owner at construction) keep
+`@safe` with precise `// SAFETY:` notes, since enforcing them needs an evaluator/
+node-primitive refactor disproportionate to their internal, scope-confined use.
+A2/A3 (RawSpan in the codec / `MutableRawSpan` writers) remain deferred:
+`RecordCodec.value(at:in:)` is the one RawSpan bridge; `PageBuf.raw` is now
+`internal` but still pointer-based. Key lesson: a `RawSpan(_unsafeBytes:)` view
+is *immortal* and does **not** enforce escape on its own — the lifetime must be
+tied to the owner. All perf-neutral. See Review 0001 → Resolution.
 
 **Perf items (four):**
 
@@ -132,7 +141,7 @@ number. KPIs: `ADSQLBench` `sql search` p50 and the relational index-scan rows/s
 
 ## Catalog A — Memory safety
 
-### A1. `RawSpan` / `Span<UInt8>` on the scan path — deferred (M4.7; see outcomes)
+### A1. `RawSpan` / `Span<UInt8>` on the scan path — partially implemented (Review 0001: RowView + ValueRef enforced)
 **safety · ROI: high (safety) / neutral (perf) · effort: med-high**
 
 `forEachRecordSpan` (`Rows.swift:129`) hands an `UnsafeRawBufferPointer` to a
