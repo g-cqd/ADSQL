@@ -10,8 +10,12 @@ enum Writer {
     switch ast {
     case .insert(let insert):
       return try self.insert(insert, txn: txn, params: params)
-    case .update, .delete, .createTable, .createIndex, .dropTable, .dropIndex:
-      throw DBError.sqlUnsupported("this write statement arrives in a later slice")
+    case .update(let update):
+      return try self.update(update, txn: txn, params: params)
+    case .delete(let delete):
+      return try self.delete(delete, txn: txn, params: params)
+    case .createTable, .createIndex, .dropTable, .dropIndex:
+      throw DBError.sqlUnsupported("DDL arrives in a later slice")
     case .select, .begin, .commit, .rollback:
       throw DBError.sqlUnsupported("not a write statement")
     }
@@ -62,11 +66,97 @@ enum Writer {
       changes += 1
       lastRowid = rowid
       if let returning, let header {
+        guard let row = try txn.row(in: insert.table, rowid: rowid) else {
+          throw DBError.integrityFailure("RETURNING row \(rowid) vanished")
+        }
         returningRows.append(
-          try project(returning, table: definition, rowid: rowid, txn: txn, header: header, params: params))
+          try projectRow(returning, table: definition, values: row.values, header: header, params: params))
       }
     }
     return (returningRows, RunResult(changes: changes, lastInsertRowid: lastRowid))
+  }
+
+  // MARK: - UPDATE (two-phase)
+
+  static func update(
+    _ update: SQLUpdate, txn: borrowing WriteTxn, params: SQLParameters
+  ) throws(DBError) -> (rows: [SQLRow], result: RunResult) {
+    let schema = try txn.schema()
+    guard let definition = schema.tables[update.table] else {
+      throw DBError.noSuchTable(update.table)
+    }
+    for assignment in update.sets where definition.columnIndex(of: assignment.column) == nil {
+      throw DBError.noSuchColumn(table: update.table, column: assignment.column)
+    }
+    let returning = try bindReturning(update.returning, definition: definition)
+    let header = returning.map { SQLColumnHeader($0.map(\.name)) }
+
+    // Phase 1: collect matching rows (the predicate sees pre-update values).
+    let matches = try collectMatches(update.whereExpr, table: definition, txn: txn, params: params)
+
+    // Phase 2: apply SET (evaluated against each row's pre-update values).
+    var returningRows: [SQLRow] = []
+    var changes = 0
+    for match in matches {
+      let env = rowEnv(table: definition, values: match.values, params: params)
+      var assignments: [String: Value] = [:]
+      for set in update.sets { assignments[set.column] = try SQLEval.evaluate(set.value, env) }
+      guard try txn.update(update.table, rowid: match.rowid, set: assignments) else { continue }
+      changes += 1
+      if let returning, let header {
+        guard let row = try txn.row(in: update.table, rowid: match.rowid) else { continue }
+        returningRows.append(
+          try projectRow(returning, table: definition, values: row.values, header: header, params: params))
+      }
+    }
+    return (returningRows, RunResult(changes: changes, lastInsertRowid: 0))
+  }
+
+  // MARK: - DELETE (two-phase)
+
+  static func delete(
+    _ delete: SQLDelete, txn: borrowing WriteTxn, params: SQLParameters
+  ) throws(DBError) -> (rows: [SQLRow], result: RunResult) {
+    let schema = try txn.schema()
+    guard let definition = schema.tables[delete.table] else {
+      throw DBError.noSuchTable(delete.table)
+    }
+    let returning = try bindReturning(delete.returning, definition: definition)
+    let header = returning.map { SQLColumnHeader($0.map(\.name)) }
+
+    let matches = try collectMatches(delete.whereExpr, table: definition, txn: txn, params: params)
+
+    // RETURNING reports the pre-delete row, so project before deleting.
+    var returningRows: [SQLRow] = []
+    if let returning, let header {
+      for match in matches {
+        returningRows.append(
+          try projectRow(returning, table: definition, values: match.values, header: header, params: params))
+      }
+    }
+    var changes = 0
+    for match in matches where try txn.delete(from: delete.table, rowid: match.rowid) {
+      changes += 1
+    }
+    return (returningRows, RunResult(changes: changes, lastInsertRowid: 0))
+  }
+
+  /// Phase 1 of UPDATE/DELETE: every rowid (with its current values) whose row
+  /// satisfies the predicate, collected before any mutation (Halloween-safe).
+  static func collectMatches(
+    _ predicate: SQLExpr?, table: TableDefinition, txn: borrowing WriteTxn, params: SQLParameters
+  ) throws(DBError) -> [(rowid: Int64, values: [Value])] {
+    try txn.withRowCursor(table: table.name) { (cursor) throws(DBError) in
+      var matches: [(rowid: Int64, values: [Value])] = []
+      while let row = try cursor.next() {
+        if let predicate {
+          let env = rowEnv(table: table, values: row.values, params: params)
+          if SQLEval.truth(try SQLEval.evaluate(predicate, env)) != .yes { continue }
+        }
+        matches.append((row.rowid, row.values))
+      }
+      return matches
+    }
   }
 
   // MARK: - RETURNING
@@ -98,15 +188,12 @@ enum Writer {
     return outputs
   }
 
-  /// Reads a row back and evaluates the RETURNING expressions against it.
-  static func project(
-    _ returning: [(name: String, expr: SQLExpr)], table: TableDefinition, rowid: Int64,
-    txn: borrowing WriteTxn, header: SQLColumnHeader, params: SQLParameters
+  /// Evaluates the RETURNING expressions against a row's values.
+  static func projectRow(
+    _ returning: [(name: String, expr: SQLExpr)], table: TableDefinition, values rowValues: [Value],
+    header: SQLColumnHeader, params: SQLParameters
   ) throws(DBError) -> SQLRow {
-    guard let row = try txn.row(in: table.name, rowid: rowid) else {
-      throw DBError.integrityFailure("RETURNING row \(rowid) vanished")
-    }
-    let env = rowEnv(table: table, values: row.values, params: params)
+    let env = rowEnv(table: table, values: rowValues, params: params)
     var values: [Value] = []
     values.reserveCapacity(returning.count)
     for output in returning { values.append(try SQLEval.evaluate(output.expr, env)) }
