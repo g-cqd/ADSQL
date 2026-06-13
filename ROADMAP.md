@@ -30,18 +30,29 @@ paths and trails on filtered scans and inserts:
 | raw KV scan | 4935 MB/s | 4039 MB/s | **1.2×** | ✓ |
 | 16 concurrent readers | 1.07 M/s | 0.47 M/s | **2.3×** | ✓ |
 | rowid get (p50) | 0.8 µs | 2.2 µs | **2.75×** | ✓ |
-| **`sql search` (filter + ORDER BY/LIMIT)** | 14.3 ms | 1.76 ms | **0.12× (8.2× slower)** | → M4.6 |
-| **relational index scan** | 1.23 M/s | 3.53 M/s | **0.35×** | → M4.6 |
+| **`sql search` (filter + ORDER BY/LIMIT)** | ~~14.3 ms~~ → **5.34 ms** | 1.76 ms | ~~0.12×~~ → **0.33× (3.0× slower)** | M4.6 ✓ (2.66× faster) |
+| **relational index scan** | 1.23 M/s | 3.53 M/s | **0.35×** | → relational lazy-cursor (deferred) |
 | **batch insert (SQL / 3-index)** | 138 k/s | 222 k/s | **0.62×** | → write-path pass (deferred) |
 | batch insert (relational / 5-index) | 118 k/s | 159 k/s | 0.75× | → write-path pass (deferred) |
 
 What closes each gap:
 
-- **Filtered scan / search (M4.6).** `RowCursor.nextRecord` copies the whole
-  record into a fresh `[UInt8]` per scanned row (`Rows.swift`), and the
-  executor re-evaluates predicates an exact index probe already guarantees.
-  Fix: decode directly from the mmap page span (`ValueRef.inline`), drop
-  covered residual conjuncts.
+- **Filtered scan / search (M4.6 ✓).** Three executor changes took it from
+  14.3 ms to 5.34 ms: (1) **zero-copy decode** — `RowSlot` reads columns
+  straight from the mapped page span (`BTree.ValueRef.inline`) instead of
+  copying the whole record per row; (2) **bounded top-N** — an unordered
+  ORDER BY + small LIMIT keeps only `offset+limit` rows instead of
+  materializing and sorting every match; (3) **residual elimination** — the
+  conjuncts an exact index/rowid probe already guarantees are dropped from the
+  WHERE residual. The residual ~3× gap that remains is the per-row
+  index→table descent (shared with SQLite) plus `RecordCodec.cellOffsets`
+  walking/allocating the full offset table to read one sort-key column — a
+  candidate for incremental single-column decode.
+- **Relational index scan (deferred).** The `ADSQLBench table` scan uses the
+  relational API (`withIndexCursor` → `RowCursor.next()` → full
+  `materializeRow`), which still copies and materializes every column; it does
+  not flow through the executor's zero-copy path. A lazy relational cursor
+  would close it.
 - **Insert (deferred write-path pass).** `assembleRow`/`Writer.insert` build a
   fresh `[String: Value]` dictionary per row. Fix: the never-built
   `Relation.insertAssembled` (ordered `[Value]`, no dict), bound once.

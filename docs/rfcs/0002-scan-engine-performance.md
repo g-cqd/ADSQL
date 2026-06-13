@@ -1,8 +1,28 @@
 # RFC 0002 — Scan-Engine Performance (M4.6)
 
-Status: in progress. Closes the filtered-scan headroom recorded in `ROADMAP.md`
-without changing results — correctness is held by the superset+residual
-contract (RFC 0001) and the existing differential suites.
+Status: implemented. Closes the bulk of the filtered-scan headroom recorded in
+`ROADMAP.md` without changing results — correctness is held by the
+superset+residual contract (RFC 0001) and the differential suites.
+
+## Result
+
+`sql search` (`SELECT id, key FROM docs WHERE framework=? AND kind=? ORDER BY
+key LIMIT 20`, 100k rows) went **14.3 ms → 5.34 ms p50 (2.66×)** vs SQLite's
+1.76 ms (now 3.0×, was 8.2×). The three changes contributed roughly:
+
+| Step | search p50 | note |
+|---|---|---|
+| baseline | 14.3 ms | collect all ~8.3k matches, full-sort, full residual |
+| + zero-copy decode | 14.2 ms | record copy was *not* the bottleneck |
+| + bounded top-N | 10.4 ms | stop materializing+sorting all matches for LIMIT 20 |
+| + residual elimination | **5.34 ms** | stop re-decoding framework/kind per row |
+
+The surprise: the per-row record copy (the original hypothesis) barely moved
+the needle. The real costs were materializing every match for an ORDER BY +
+LIMIT and re-checking predicates the index already guaranteed. The remaining
+3× is the per-row index→table descent (shared with SQLite) and
+`cellOffsets` walking/allocating the full offset table to read one sort-key
+column — a future incremental single-column decode.
 
 ## Problem
 
@@ -49,7 +69,16 @@ Safety: the span points into immutable committed pages (COW) for a read
 snapshot, valid for the txn; confining its use to `consume` keeps the contract
 simple. This is the only new unsafe surface and is documented at the call site.
 
-### Slice 2 — Drop residual conjuncts covered by an exact probe
+### Slice 2 — Bounded top-N for ORDER BY + LIMIT
+
+An unordered ORDER BY with a small LIMIT (≤ 4096, no DISTINCT) keeps only
+`offset+limit` rows in an ascending bounded buffer instead of materializing and
+sorting every match: per row the accumulator computes the sort key first and
+projects (decodes output columns) only rows that beat the current worst,
+dropping the rest in O(1). Larger bounds fall back to collect-and-sort. This was
+the single biggest contributor (10.4 ms of the 14.3→5.34 path).
+
+### Slice 3 — Drop residual conjuncts covered by an exact probe
 
 The planner reports the `col = const` conjuncts a rowid/index probe satisfies
 **exactly** (same storage class, no range widening). When the executor actually
@@ -58,10 +87,13 @@ WHERE minus the covered conjuncts; on fallback it keeps the full WHERE.
 
 ## Safety argument
 
-Neither slice can change results:
+No slice can change results:
 
 - Slice 1 changes *where bytes live*, not what is decoded.
-- Slice 2 only removes a predicate the chosen probe already guarantees, and
+- Slice 2 keeps the same top-`offset+limit` rows an ORDER BY + LIMIT would
+  select; it only avoids materializing the rest. Bounded only when there is no
+  DISTINCT and `limit ≥ 1`.
+- Slice 3 only removes a predicate the chosen probe already guarantees, and
   reverts to the full WHERE whenever the probe isn't used. The
   superset+residual contract (RFC 0001) means an over-eager drop would surface
   as a result mismatch in `SQLPlannerResidualTests` (indexed vs unindexed
