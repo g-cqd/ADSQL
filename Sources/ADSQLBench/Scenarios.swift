@@ -114,7 +114,8 @@ enum Scenarios {
       let collected = Mutex<[LatencyHistogram]>([])
 
       for _ in 0..<readers {
-        let reader = try driver.makeReader()
+        // Each reader is confined to the single task it is handed to.
+        nonisolated(unsafe) let reader = try driver.makeReader()
         DispatchQueue.global().async(group: group) {
           var rng = BenchRNG(seed: nowNanos())
           var histogram = LatencyHistogram()
