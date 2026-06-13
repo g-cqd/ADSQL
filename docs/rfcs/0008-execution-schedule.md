@@ -112,7 +112,7 @@ format) feed M6 but are scheduled within F0/F6, not here.
 | F0 · foundations | M5 | ✅ done | `feat(fts): F0` |
 | F1 · tokenizers | M5 | ✅ done | `feat(fts): F1` |
 | F2 · index build + maintenance | M5 | ✅ done | `feat(fts): F2a/F2b/F2c` — postings codec, self-contained build/maintenance, content modes + 'delete' idiom (segments deferred to F6) |
-| F3 · boolean MATCH | M5 | ⏭ next | — |
+| F3 · boolean MATCH | M5 | 🚧 in progress | F3a grammar `feat(fts): F3a`; F3b eval + F3c SQL/MATCH gate next |
 | F4 · ranking (bm25/bm25f) | M5 | ⏳ planned | — |
 | F5 · triggers | M5 | ⏳ planned | — |
 | F6 · apple-docs tables + bench | M5 | ⏳ planned | — |
