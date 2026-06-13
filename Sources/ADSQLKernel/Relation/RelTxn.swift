@@ -287,6 +287,11 @@ extension WriteTxn {
     try Relation.createTable(ctx, definition)
   }
 
+  /// Creates an FTS virtual table (its catalog record + three empty trees).
+  public func createVirtualTable(_ definition: FTSDefinition) throws(DBError) {
+    try Relation.createVirtualTable(ctx, definition)
+  }
+
   /// Drops a table, its indexes, and every page they own.
   public func dropTable(_ name: String) throws(DBError) {
     try Relation.dropTable(ctx, name: name)

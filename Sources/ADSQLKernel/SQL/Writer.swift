@@ -17,6 +17,9 @@ enum Writer {
     case .createTable(let create):
       try createTable(create, txn: txn)
       return ([], RunResult())
+    case .createVirtualTable(let create):
+      try createVirtualTable(create, txn: txn)
+      return ([], RunResult())
     case .createIndex(let create):
       try createIndex(create, txn: txn)
       return ([], RunResult())
@@ -34,12 +37,24 @@ enum Writer {
   // MARK: - DDL
 
   static func createTable(_ create: SQLCreateTable, txn: borrowing WriteTxn) throws(DBError) {
-    if try txn.schema().tables[create.definition.name] != nil {
+    let schema = try txn.schema()
+    if schema.tables[create.definition.name] != nil || schema.ftsTables[create.definition.name] != nil {
       if create.ifNotExists { return }
       throw DBError.invalidDefinition("table \(create.definition.name) already exists")
     }
     try txn.createTable(create.definition)
     for index in create.impliedIndexes { try txn.createIndex(index) }
+  }
+
+  static func createVirtualTable(
+    _ create: SQLCreateVirtualTable, txn: borrowing WriteTxn
+  ) throws(DBError) {
+    let schema = try txn.schema()
+    if schema.tables[create.definition.name] != nil || schema.ftsTables[create.definition.name] != nil {
+      if create.ifNotExists { return }
+      throw DBError.invalidDefinition("table \(create.definition.name) already exists")
+    }
+    try txn.createVirtualTable(create.definition)
   }
 
   static func createIndex(_ create: SQLCreateIndex, txn: borrowing WriteTxn) throws(DBError) {
@@ -51,7 +66,8 @@ enum Writer {
   }
 
   static func dropTable(_ name: String, ifExists: Bool, txn: borrowing WriteTxn) throws(DBError) {
-    if try txn.schema().tables[name] == nil {
+    let schema = try txn.schema()
+    if schema.tables[name] == nil, schema.ftsTables[name] == nil {
       if ifExists { return }
       throw DBError.noSuchTable(name)
     }

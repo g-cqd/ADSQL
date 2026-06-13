@@ -409,7 +409,7 @@ struct SQLParser {
   // MARK: DDL
 
   mutating func create() throws(DBError) -> SQLStatementAST {
-    if checkKeyword("VIRTUAL") { throw DBError.sqlUnsupported("CREATE VIRTUAL TABLE (FTS arrives with M5)") }
+    if matchKeyword("VIRTUAL") { return try createVirtualTable() }
     if checkKeyword("TRIGGER") { throw DBError.sqlUnsupported("CREATE TRIGGER") }
     if checkKeyword("VIEW") { throw DBError.sqlUnsupported("CREATE VIEW") }
     let unique = matchKeyword("UNIQUE")
@@ -439,6 +439,100 @@ struct SQLParser {
     let ifNotExists = try ifNotExistsClause()
     let name = try identifier("table name")
     return .createTable(try createTableBody(name: name, ifNotExists: ifNotExists))
+  }
+
+  /// `CREATE VIRTUAL TABLE [IF NOT EXISTS] <name> USING fts5(col…, option=…)`.
+  /// "VIRTUAL" is already consumed. Each parenthesized argument is a bare column
+  /// name, or an `option=value` (distinguished by the `=`).
+  mutating func createVirtualTable() throws(DBError) -> SQLStatementAST {
+    try expectKeyword("TABLE")
+    let ifNotExists = try ifNotExistsClause()
+    let name = try identifier("virtual table name")
+    try expectKeyword("USING")
+    let module = try identifier("module name")
+    guard module.lowercased() == "fts5" else {
+      throw DBError.sqlUnsupported("virtual table module '\(module)' (only fts5)")
+    }
+    try expectSymbol("(")
+
+    var columns: [String] = []
+    var tokenize: [String] = ["unicode61"]
+    var contentValue: String?
+    var contentRowid: String?
+    var contentlessDelete = false
+    var prefix: [Int] = []
+    var detail: FTSDetail = .full
+    var columnSize = true
+
+    repeat {
+      let ident = try identifier("column or option")
+      if matchSymbol("=") {
+        let value = try ftsOptionValue()
+        switch ident.lowercased() {
+        case "tokenize":
+          let tokens = value.split(whereSeparator: { $0 == " " || $0 == "\t" }).map(String.init)
+          tokenize = tokens.isEmpty ? ["unicode61"] : tokens
+        case "content":
+          contentValue = value
+        case "content_rowid":
+          contentRowid = value
+        case "contentless_delete":
+          contentlessDelete = value != "0"
+        case "prefix":
+          for part in value.split(whereSeparator: { $0 == " " || $0 == "\t" }) {
+            guard let size = Int(part), size > 0 else {
+              throw DBError.sqlSyntax(
+                message: "invalid fts5 prefix '\(part)'", offset: current.offset)
+            }
+            prefix.append(size)
+          }
+        case "detail":
+          switch value.lowercased() {
+          case "full": detail = .full
+          case "column": detail = .column
+          case "none": detail = .none
+          default: throw DBError.sqlUnsupported("fts5 detail '\(value)'")
+          }
+        case "columnsize":
+          columnSize = value != "0"
+        default:
+          throw DBError.sqlUnsupported("fts5 option '\(ident)'")
+        }
+      } else {
+        columns.append(ident)
+      }
+    } while matchSymbol(",")
+    try expectSymbol(")")
+
+    guard !columns.isEmpty else {
+      throw DBError.invalidDefinition("fts5 table \(name) has no columns")
+    }
+    let content: FTSContentMode
+    if let contentValue {
+      content = contentValue.isEmpty
+        ? .contentless(deleteEnabled: contentlessDelete)
+        : .external(table: contentValue, rowid: contentRowid ?? "rowid")
+    } else {
+      content = .selfContained
+    }
+    return .createVirtualTable(SQLCreateVirtualTable(
+      definition: FTSDefinition(
+        name: name, columns: columns, tokenize: tokenize, content: content,
+        prefix: prefix, detail: detail, columnSize: columnSize),
+      ifNotExists: ifNotExists))
+  }
+
+  /// One fts5 option value, stringified (`'quoted'`, identifier, or integer).
+  mutating func ftsOptionValue() throws(DBError) -> String {
+    let token = advance()
+    switch token.kind {
+    case .string(let s): return s
+    case .identifier(let s): return s
+    case .keyword(let s): return s
+    case .integer(let v): return String(v)
+    default:
+      throw DBError.sqlSyntax(message: "expected an fts5 option value", offset: token.offset)
+    }
   }
 
   mutating func ifNotExistsClause() throws(DBError) -> Bool {

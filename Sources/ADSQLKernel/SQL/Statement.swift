@@ -146,7 +146,8 @@ public final class Statement: Sendable {
       return (try query(parameters), RunResult())
     case .pragma(let name, let value):
       return (Pragma.run(name: name, value: value), RunResult())
-    case .insert, .update, .delete, .createTable, .createIndex, .dropTable, .dropIndex:
+    case .insert, .update, .delete, .createTable, .createVirtualTable, .createIndex, .dropTable,
+      .dropIndex:
       return try database.writeSync { txn throws(DBError) in
         try Writer.execute(self.ast, txn: txn, params: parameters)
       }

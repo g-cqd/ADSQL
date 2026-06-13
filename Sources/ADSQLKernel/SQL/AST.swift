@@ -169,6 +169,14 @@ public struct SQLCreateIndex: Equatable, Sendable {
   public var ifNotExists: Bool
 }
 
+/// `CREATE VIRTUAL TABLE … USING fts5(columns, options)`. The parsed FTS
+/// config (columns, tokenizer spec, content mode, prefix/detail/columnsize)
+/// lives in `FTSDefinition`; `DROP TABLE` removes it (no dedicated DROP node).
+public struct SQLCreateVirtualTable: Equatable, Sendable {
+  public var definition: FTSDefinition
+  public var ifNotExists: Bool
+}
+
 // MARK: - Statements
 
 public enum SQLStatementAST: Equatable, Sendable {
@@ -177,6 +185,7 @@ public enum SQLStatementAST: Equatable, Sendable {
   case update(SQLUpdate)
   case delete(SQLDelete)
   case createTable(SQLCreateTable)
+  case createVirtualTable(SQLCreateVirtualTable)
   case createIndex(SQLCreateIndex)
   case dropTable(name: String, ifExists: Bool)
   case dropIndex(name: String, ifExists: Bool)

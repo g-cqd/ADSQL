@@ -165,11 +165,63 @@ public struct IndexDefinition: Equatable, Sendable {
   }
 }
 
+// MARK: - Full-text search (FTS5)
+
+/// How an FTS table sources the column text it indexes.
+public enum FTSContentMode: Equatable, Sendable {
+  /// The FTS table stores the indexed columns itself.
+  case selfContained
+  /// `content='t' content_rowid='c'` — columns/length read from a base table.
+  case external(table: String, rowid: String)
+  /// `content=''` — no stored content; `contentless_delete=1` keeps deletes.
+  case contentless(deleteEnabled: Bool)
+}
+
+/// `detail=` — how much positional data postings carry (trades phrase support
+/// for size), mirroring FTS5.
+public enum FTSDetail: Equatable, Sendable {
+  case full
+  case column
+  case none
+}
+
+/// A parsed `USING fts5(…)` configuration. The `tokenize` spec is stored raw
+/// (whitespace-split tokens, e.g. `["porter","unicode61"]`); tokenizers are
+/// interpreted when they land (F1). Columns are plain text fields.
+public struct FTSDefinition: Equatable, Sendable {
+  public var name: String
+  public var columns: [String]
+  public var tokenize: [String]
+  public var content: FTSContentMode
+  public var prefix: [Int]
+  public var detail: FTSDetail
+  public var columnSize: Bool
+
+  public init(
+    name: String, columns: [String], tokenize: [String] = ["unicode61"],
+    content: FTSContentMode = .selfContained, prefix: [Int] = [],
+    detail: FTSDetail = .full, columnSize: Bool = true
+  ) {
+    self.name = name
+    self.columns = columns
+    self.tokenize = tokenize
+    self.content = content
+    self.prefix = prefix
+    self.detail = detail
+    self.columnSize = columnSize
+  }
+
+  public func columnIndex(of name: String) -> Int? {
+    columns.firstIndex { $0 == name }
+  }
+}
+
 /// An immutable schema snapshot (per committed generation).
 public struct Schema: Sendable {
   public var catalogVersion: UInt64
   public var tables: [String: TableDefinition]
   public var indexes: [String: IndexDefinition]
+  public var ftsTables: [String: FTSDefinition]
 
   /// Indexes of one table, name-sorted for deterministic maintenance order.
   public func indexes(on table: String) -> [IndexDefinition] {

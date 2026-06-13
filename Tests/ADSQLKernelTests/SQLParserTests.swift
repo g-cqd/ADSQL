@@ -290,7 +290,6 @@ struct SQLParserErrorTests {
     ("SELECT * FROM a JOIN b USING (x)", "USING"),
     ("SELECT 1 EXCEPT SELECT 2", "EXCEPT"),
     ("SELECT 1 LIMIT 1, 2", "LIMIT offset"),
-    ("CREATE VIRTUAL TABLE f USING fts5(a)", "VIRTUAL"),
     ("CREATE TABLE t (a INTEGER) WITHOUT ROWID", "WITHOUT ROWID"),
     ("SELECT * FROM t WHERE a IN (SELECT b FROM s)", "json_each"),
     ("SELECT * FROM t WHERE EXISTS (SELECT 1)", "EXISTS"),

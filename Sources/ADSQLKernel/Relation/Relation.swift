@@ -11,12 +11,16 @@
 enum TreeKey: Hashable, Sendable {
   case table(UInt32)
   case index(UInt32)
+  case ftsDict(UInt32)
+  case ftsPostings(UInt32)
+  case ftsStats(UInt32)
 }
 
 public struct RelationState: Sendable {
   var version: Catalog.VersionRow
   var tableRecords: [String: Catalog.TableRecord] = [:]
   var indexRecords: [String: Catalog.IndexRecord] = [:]
+  var ftsRecords: [String: Catalog.FTSRecord] = [:]
   /// Handle last persisted (nil = record not on disk yet).
   var handleBaselines: [TreeKey: TreeHandle?] = [:]
   /// AUTOINCREMENT high-water marks touched this transaction.
@@ -29,7 +33,8 @@ public struct RelationState: Sendable {
     Schema(
       catalogVersion: version.catalogVersion,
       tables: tableRecords.mapValues(\.definition),
-      indexes: indexRecords.mapValues(\.definition))
+      indexes: indexRecords.mapValues(\.definition),
+      ftsTables: ftsRecords.mapValues(\.definition))
   }
 
   func tableName(for id: UInt32) -> String? {
@@ -136,6 +141,13 @@ enum Relation {
       state.indexRecords[name] = record
       state.handleBaselines[.index(record.indexId)] = record.handle
     }
+    unsafe try scanKind(resolver, mainTree, kind: Catalog.kindFTS) { name, valueBytes throws(DBError) in
+      let record = unsafe try Catalog.decodeFTS(valueBytes, name: name)
+      state.ftsRecords[name] = record
+      state.handleBaselines[.ftsDict(record.ftsId)] = record.dict
+      state.handleBaselines[.ftsPostings(record.ftsId)] = record.postings
+      state.handleBaselines[.ftsStats(record.ftsId)] = record.stats
+    }
     return state
   }
 
@@ -207,6 +219,20 @@ enum Relation {
         state.handleBaselines[key] = record.handle
       }
     }
+    for name in state.ftsRecords.keys.sorted() {
+      let record = state.ftsRecords[name]!
+      let dictKey = TreeKey.ftsDict(record.ftsId)
+      let postKey = TreeKey.ftsPostings(record.ftsId)
+      let statsKey = TreeKey.ftsStats(record.ftsId)
+      if state.handleBaselines[dictKey] != record.dict
+        || state.handleBaselines[postKey] != record.postings
+        || state.handleBaselines[statsKey] != record.stats {
+        try putBytes(ctx, &main, key: Catalog.ftsKey(name), value: Catalog.encode(record))
+        state.handleBaselines[dictKey] = record.dict
+        state.handleBaselines[postKey] = record.postings
+        state.handleBaselines[statsKey] = record.stats
+      }
+    }
     for tableId in state.sequences.keys.sorted() {
       let value = state.sequences[tableId]!
       if state.sequenceBaselines[tableId] != value {
@@ -231,7 +257,7 @@ enum Relation {
   static func createTable(_ ctx: TxnContext, _ definition: TableDefinition) throws(DBError) {
     try definition.validate()
     var state = try ensureState(ctx)
-    guard state.tableRecords[definition.name] == nil else {
+    guard state.tableRecords[definition.name] == nil, state.ftsRecords[definition.name] == nil else {
       throw DBError.tableExists(definition.name)
     }
     guard definition.name.utf8.count <= 255 else {
@@ -251,9 +277,38 @@ enum Relation {
     ctx.relation = state
   }
 
+  /// Creates an FTS virtual table: a catalog record owning three (initially
+  /// empty) B+trees. Roots are allocated lazily on first write (F2), exactly
+  /// like a table/index handle. No indexing here — F0 is foundations only.
+  static func createVirtualTable(_ ctx: TxnContext, _ definition: FTSDefinition) throws(DBError) {
+    var state = try ensureState(ctx)
+    guard state.tableRecords[definition.name] == nil, state.ftsRecords[definition.name] == nil else {
+      throw DBError.tableExists(definition.name)
+    }
+    guard definition.name.utf8.count <= 255 else {
+      throw DBError.invalidDefinition("virtual table name too long")
+    }
+    guard !definition.columns.isEmpty else {
+      throw DBError.invalidDefinition("fts5 table \(definition.name) has no columns")
+    }
+    let id = state.version.nextTableId
+    state.version.nextTableId += 1
+    state.ftsRecords[definition.name] = Catalog.FTSRecord(
+      ftsId: id, dict: .empty, postings: .empty, stats: .empty, definition: definition)
+    state.handleBaselines[.ftsDict(id)] = nil as TreeHandle?
+    state.handleBaselines[.ftsPostings(id)] = nil as TreeHandle?
+    state.handleBaselines[.ftsStats(id)] = nil as TreeHandle?
+    state.schemaDirty = true
+    ctx.relation = state
+  }
+
   static func dropTable(_ ctx: TxnContext, name: String) throws(DBError) {
     var state = try ensureState(ctx)
-    guard let record = state.tableRecords[name] else { throw DBError.noSuchTable(name) }
+    guard let record = state.tableRecords[name] else {
+      // `DROP TABLE` also removes an FTS virtual table.
+      if state.ftsRecords[name] != nil { return try dropVirtualTable(ctx, name: name) }
+      throw DBError.noSuchTable(name)
+    }
     // Another table referencing this one blocks the drop.
     for (otherName, other) in state.tableRecords where otherName != name {
       if other.definition.foreignKeys.contains(where: { $0.parentTable == name }) {
@@ -278,6 +333,24 @@ enum Relation {
     state.sequenceBaselines.removeValue(forKey: record.tableId)
     state.schemaDirty = true
 
+    ctx.meta.mainTree = main
+    ctx.relation = state
+  }
+
+  /// Drops an FTS virtual table and frees the three trees it owns.
+  static func dropVirtualTable(_ ctx: TxnContext, name: String) throws(DBError) {
+    var state = try ensureState(ctx)
+    guard let record = state.ftsRecords[name] else { throw DBError.noSuchTable(name) }
+    var main = ctx.meta.mainTree
+    try freeTree(ctx, handle: record.dict)
+    try freeTree(ctx, handle: record.postings)
+    try freeTree(ctx, handle: record.stats)
+    try deleteBytes(ctx, &main, key: Catalog.ftsKey(name))
+    state.ftsRecords.removeValue(forKey: name)
+    state.handleBaselines.removeValue(forKey: .ftsDict(record.ftsId))
+    state.handleBaselines.removeValue(forKey: .ftsPostings(record.ftsId))
+    state.handleBaselines.removeValue(forKey: .ftsStats(record.ftsId))
+    state.schemaDirty = true
     ctx.meta.mainTree = main
     ctx.relation = state
   }

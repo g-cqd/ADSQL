@@ -108,9 +108,9 @@ format) feed M6 but are scheduled within F0/F6, not here.
 
 | Phase | Milestone | State | Commit |
 |---|---|---|---|
-| D0 · schedule artifacts | — | 🚧 in progress | — |
-| F0 · foundations | M5 | ⏭ next | — |
-| F1 · tokenizers | M5 | ⏳ planned | — |
+| D0 · schedule artifacts | — | ✅ done | `docs(rfc): 0008` (5c5ddb4) |
+| F0 · foundations | M5 | ✅ done | `feat(fts): F0` |
+| F1 · tokenizers | M5 | ⏭ next | — |
 | F2 · index build + maintenance | M5 | ⏳ planned | — |
 | F3 · boolean MATCH | M5 | ⏳ planned | — |
 | F4 · ranking (bm25/bm25f) | M5 | ⏳ planned | — |
