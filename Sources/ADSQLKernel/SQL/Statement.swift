@@ -148,7 +148,21 @@ public final class Statement: Sendable {
       let schema = try txn.schema()
       let plan = try self.boundSelect(select, schema: schema)
       let table = try txn.tableRecord(plan.source.table)
-      return try SelectExecutor.run(plan, table: table, resolver: txn.resolver, params: parameters)
+      var index: Catalog.IndexRecord?
+      if let name = plan.access.indexName { index = try txn.indexRecord(name) }
+      return try SelectExecutor.run(
+        plan, table: table, index: index, resolver: txn.resolver, params: parameters)
+    }
+  }
+
+  /// The chosen access path, SQLite-EXPLAIN-shaped (for planner assertions).
+  public func planDescription() throws(DBError) -> String {
+    guard case .select(let select) = ast else {
+      throw DBError.sqlUnsupported("statement does not return rows")
+    }
+    return try database.read { txn throws(DBError) in
+      let plan = try self.boundSelect(select, schema: try txn.schema())
+      return plan.access.describe(table: plan.source.table)
     }
   }
 

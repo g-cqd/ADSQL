@@ -147,13 +147,13 @@ private enum DocsFixture {
   }
 }
 
-private func valueMatches(_ a: Value, _ b: Value) -> Bool {
+func valueMatches(_ a: Value, _ b: Value) -> Bool {
   if a == b { return true }
   if case .real(let x) = a, case .real(let y) = b { return x == y || (x.isNaN && y.isNaN) }
   return false
 }
 
-private func rowsMatch(_ ours: [[Value]], _ theirs: [[Value]], ordered: Bool) -> Bool {
+func rowsMatch(_ ours: [[Value]], _ theirs: [[Value]], ordered: Bool) -> Bool {
   guard ours.count == theirs.count else { return false }
   func sortKey(_ row: [Value]) -> [Value] { row }
   let lhs = ordered ? ours : ours.sorted { lexLess($0, $1) }
@@ -166,7 +166,7 @@ private func rowsMatch(_ ours: [[Value]], _ theirs: [[Value]], ordered: Bool) ->
 }
 
 /// Deterministic total order for multiset comparison (oracle-only).
-private func lexLess(_ a: [Value], _ b: [Value]) -> Bool {
+func lexLess(_ a: [Value], _ b: [Value]) -> Bool {
   for i in 0..<min(a.count, b.count) {
     let c = Value.keyOrder(a[i], b[i])
     if c != 0 { return c < 0 }

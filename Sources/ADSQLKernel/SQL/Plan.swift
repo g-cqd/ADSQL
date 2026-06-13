@@ -58,6 +58,11 @@ struct BoundSelect: Sendable {
   let limit: SQLExpr?
   let offset: SQLExpr?
   let header: SQLColumnHeader
+  let access: AccessPlan
+  /// The access path's natural order satisfies ORDER BY.
+  let accessYieldsOrder: Bool
+  /// Table (rowid) order satisfies ORDER BY — used on index→scan fallback.
+  let rowidOrderSatisfiesOrderBy: Bool
 }
 
 enum Binder {
@@ -98,6 +103,9 @@ enum Binder {
     let orderCollations = select.orderBy.map { collation(of: $0.expr, source: source) }
     let outputCollations = outputs.map { collation(of: $0.expr, source: source) }
     let header = SQLColumnHeader(outputs.map(\.name))
+    let planning = Planner.plan(
+      where: select.whereExpr, orderBy: select.orderBy, source: source,
+      indexes: schema.indexes(on: definition.name), definition: definition)
     return BoundSelect(
       source: source,
       outputs: outputs,
@@ -108,7 +116,10 @@ enum Binder {
       distinct: select.distinct,
       limit: select.limit,
       offset: select.offset,
-      header: header)
+      header: header,
+      access: planning.plan,
+      accessYieldsOrder: planning.yieldsOrder,
+      rowidOrderSatisfiesOrderBy: planning.rowidOrderSatisfiesOrderBy)
   }
 
   private static func appendAllColumns(_ source: TableBinding, to outputs: inout [BoundOutput]) {
