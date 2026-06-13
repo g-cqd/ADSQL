@@ -89,17 +89,23 @@ final class RowSlot {
 enum SelectExecutor {
   static func run<R: PageResolver>(
     _ plan: BoundSelect, tables: [Catalog.TableRecord], index: Catalog.IndexRecord?,
-    resolver: R, params: SQLParameters
+    resolver: R, params: SQLParameters,
+    outer: (context: RowContext, binding: QueryBinding)? = nil,
+    subquery: @escaping SubqueryRunner = rejectSubquery
   ) throws(DBError) -> [SQLRow] {
     if plan.isAggregated {
-      return try runAggregated(plan, tables: tables, index: index, resolver: resolver, params: params)
+      return try runAggregated(
+        plan, tables: tables, index: index, resolver: resolver, params: params,
+        outer: outer, subquery: subquery)
     }
     if plan.isJoin {
-      return try runJoin(plan, tables: tables, index: index, resolver: resolver, params: params)
+      return try runJoin(
+        plan, tables: tables, index: index, resolver: resolver, params: params,
+        outer: outer, subquery: subquery)
     }
     let table = tables[0]
     let context = RowContext(definitions: tables.map(\.definition))
-    let env = rowEnv(plan, context: context, params: params)
+    let env = rowEnv(plan, context: context, params: params, outer: outer, subquery: subquery)
     let paramsEnv = SQLEvalEnv.parametersOnly { p throws(DBError) in try params.lookup(p) }
     let bounds = try sliceBounds(plan, params: params)
 
@@ -329,10 +335,11 @@ enum SelectExecutor {
 
   private static func runJoin<R: PageResolver>(
     _ plan: BoundSelect, tables: [Catalog.TableRecord], index: Catalog.IndexRecord?,
-    resolver: R, params: SQLParameters
+    resolver: R, params: SQLParameters,
+    outer: (context: RowContext, binding: QueryBinding)?, subquery: @escaping SubqueryRunner
   ) throws(DBError) -> [SQLRow] {
     let context = RowContext(definitions: tables.map(\.definition))
-    let env = rowEnv(plan, context: context, params: params)
+    let env = rowEnv(plan, context: context, params: params, outer: outer, subquery: subquery)
     let paramsEnv = SQLEvalEnv.parametersOnly { p throws(DBError) in try params.lookup(p) }
     let collectKeys = !plan.orderBy.isEmpty
 
@@ -373,10 +380,11 @@ enum SelectExecutor {
 
   private static func runAggregated<R: PageResolver>(
     _ plan: BoundSelect, tables: [Catalog.TableRecord], index: Catalog.IndexRecord?,
-    resolver: R, params: SQLParameters
+    resolver: R, params: SQLParameters,
+    outer: (context: RowContext, binding: QueryBinding)?, subquery: @escaping SubqueryRunner
   ) throws(DBError) -> [SQLRow] {
     let context = RowContext(definitions: tables.map(\.definition))
-    let scanEnv = rowEnv(plan, context: context, params: params)
+    let scanEnv = rowEnv(plan, context: context, params: params, outer: outer, subquery: subquery)
     let paramsEnv = SQLEvalEnv.parametersOnly { p throws(DBError) in try params.lookup(p) }
     let columnCounts = plan.binding.tables.map(\.columnNames.count)
     let noGroupBy = plan.groupBy.isEmpty
@@ -667,17 +675,34 @@ enum SelectExecutor {
     }
   }
 
+  /// Runs a correlated scalar subquery against the current outer row; provided
+  /// by the statement layer (which has transaction/schema access).
+  typealias SubqueryRunner =
+    (SQLSelect, RowContext, QueryBinding) throws(DBError) -> Value
+
+  static func rejectSubquery(
+    _: SQLSelect, _: RowContext, _: QueryBinding
+  ) throws(DBError) -> Value {
+    throw DBError.sqlUnsupported("subquery in this context")
+  }
+
   private static func rowEnv(
-    _ plan: BoundSelect, context: RowContext, params: SQLParameters
+    _ plan: BoundSelect, context: RowContext, params: SQLParameters,
+    outer: (context: RowContext, binding: QueryBinding)?,
+    subquery: @escaping SubqueryRunner
   ) -> SQLEvalEnv {
     let binding = plan.binding
     return SQLEvalEnv(
       parameter: { parameter throws(DBError) in try params.lookup(parameter) },
       column: { (qualifier, name, _) throws(DBError) in
-        guard let (table, column) = binding.resolve(qualifier: qualifier, name: name) else {
-          throw DBError.noSuchColumn(table: qualifier ?? binding.tables[0].table, column: name)
+        // The subquery's own tables first, then the correlated outer row.
+        if let (table, column) = binding.resolve(qualifier: qualifier, name: name) {
+          return try context.value(table: table, column: column)
         }
-        return try context.value(table: table, column: column)
+        if let outer, let (table, column) = outer.binding.resolve(qualifier: qualifier, name: name) {
+          return try outer.context.value(table: table, column: column)
+        }
+        throw DBError.noSuchColumn(table: qualifier ?? binding.tables[0].table, column: name)
       },
       collationOf: { (qualifier, name) in
         binding.resolve(qualifier: qualifier, name: name)
@@ -687,9 +712,7 @@ enum SelectExecutor {
         binding.resolve(qualifier: qualifier, name: name)
           .map { binding.tables[$0.table].columnTypes[$0.column] }
       },
-      scalarSubquery: { _ throws(DBError) in
-        throw DBError.sqlUnsupported("subquery (arrives in a later slice)")
-      })
+      scalarSubquery: { sub throws(DBError) in try subquery(sub, context, binding) })
   }
 
   // MARK: - DISTINCT

@@ -188,8 +188,79 @@ public final class Statement: Sendable {
     for binding in plan.binding.tables { tables.append(try txn.tableRecord(binding.table)) }
     var index: Catalog.IndexRecord?
     if let name = plan.access.indexName { index = try txn.indexRecord(name) }
+    // Capture Copyable snapshot handles (not the noncopyable txn) so the
+    // escaping correlated-subquery runner can re-enter the executor.
+    let resolver = txn.resolver
+    let meta = txn.meta
+    let cache = txn.schemaCache
+    let runner: SelectExecutor.SubqueryRunner = {
+      sub, outerContext, outerBinding throws(DBError) in
+      try runScalarSubquery(
+        sub, resolver: resolver, meta: meta, schemaCache: cache, params: params,
+        outerContext: outerContext, outerBinding: outerBinding)
+    }
     return try SelectExecutor.run(
-      plan, tables: tables, index: index, resolver: txn.resolver, params: params)
+      plan, tables: tables, index: index, resolver: txn.resolver, params: params, subquery: runner)
+  }
+
+  /// Runs one correlated scalar subquery against the current outer row,
+  /// returning the first row's first column (or NULL when empty).
+  private static func runScalarSubquery<R: PageResolver>(
+    _ select: SQLSelect, resolver: R, meta: Meta, schemaCache: SchemaCache?,
+    params: SQLParameters, outerContext: SelectExecutor.RowContext, outerBinding: QueryBinding
+  ) throws(DBError) -> Value {
+    let schema: Schema
+    if let schemaCache {
+      schema = try schemaCache.schema(resolver: resolver, meta: meta)
+    } else {
+      schema = try Relation.loadState(resolver: resolver, mainTree: meta.mainTree).schema
+    }
+    guard case .select(let plan) = try Binder.bindQuery(select, schema: schema) else {
+      throw DBError.sqlUnsupported("compound scalar subquery")
+    }
+    var tables: [Catalog.TableRecord] = []
+    for binding in plan.binding.tables {
+      tables.append(try resolveTable(binding.table, resolver: resolver, meta: meta, cache: schemaCache))
+    }
+    var index: Catalog.IndexRecord?
+    if let name = plan.access.indexName {
+      index = try resolveIndex(name, resolver: resolver, meta: meta, cache: schemaCache)
+    }
+    let runner: SelectExecutor.SubqueryRunner = { sub, context, binding throws(DBError) in
+      try runScalarSubquery(
+        sub, resolver: resolver, meta: meta, schemaCache: schemaCache, params: params,
+        outerContext: context, outerBinding: binding)
+    }
+    let rows = try SelectExecutor.run(
+      plan, tables: tables, index: index, resolver: resolver, params: params,
+      outer: (outerContext, outerBinding), subquery: runner)
+    return rows.first?.values.first ?? .null
+  }
+
+  private static func resolveTable<R: PageResolver>(
+    _ name: String, resolver: R, meta: Meta, cache: SchemaCache?
+  ) throws(DBError) -> Catalog.TableRecord {
+    let record =
+      if let cache {
+        try cache.tableRecord(resolver, meta: meta, name: name)
+      } else {
+        try Relation.tableRecord(resolver, mainTree: meta.mainTree, name: name)
+      }
+    guard let record else { throw DBError.noSuchTable(name) }
+    return record
+  }
+
+  private static func resolveIndex<R: PageResolver>(
+    _ name: String, resolver: R, meta: Meta, cache: SchemaCache?
+  ) throws(DBError) -> Catalog.IndexRecord {
+    let record =
+      if let cache {
+        try cache.indexRecord(resolver, meta: meta, name: name)
+      } else {
+        try Relation.indexRecord(resolver, mainTree: meta.mainTree, name: name)
+      }
+    guard let record else { throw DBError.noSuchIndex(name) }
+    return record
   }
 
   /// The chosen access path, SQLite-EXPLAIN-shaped (for planner assertions).
