@@ -122,7 +122,9 @@ struct SQLParserStatementTests {
       "INSERT INTO kv (k, v) VALUES (?, ?), ($a, $b)")
     else { Issue.record("not insert"); return }
     #expect(plain.columns == ["k", "v"])
-    #expect(plain.rows.count == 2)
+    if case .values(let rows) = plain.source { #expect(rows.count == 2) } else {
+      Issue.record("expected VALUES source")
+    }
     #expect(plain.conflict == .abort)
 
     guard case .insert(let orReplace) = try parse(
@@ -290,7 +292,6 @@ struct SQLParserErrorTests {
     ("SELECT 1 LIMIT 1, 2", "LIMIT offset"),
     ("CREATE VIRTUAL TABLE f USING fts5(a)", "VIRTUAL"),
     ("CREATE TABLE t (a INTEGER) WITHOUT ROWID", "WITHOUT ROWID"),
-    ("INSERT INTO t SELECT * FROM s", "SELECT"),
     ("SELECT * FROM t WHERE a IN (SELECT b FROM s)", "json_each"),
     ("SELECT * FROM t WHERE EXISTS (SELECT 1)", "EXISTS"),
     ("SELECT ?1", "?NNN"),

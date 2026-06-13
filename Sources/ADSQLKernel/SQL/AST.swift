@@ -115,9 +115,14 @@ public struct SQLInsert: Equatable, Sendable {
     /// ON CONFLICT(column) DO UPDATE SET ...
     case doUpdate(target: String, sets: [SQLAssignment])
   }
+  /// Row source: literal VALUES tuples or a SELECT.
+  public enum Source: Equatable, Sendable {
+    case values([[SQLExpr]])
+    case select(SQLSelect)
+  }
   public var table: String
   public var columns: [String]
-  public var rows: [[SQLExpr]]
+  public var source: Source
   public var conflict: Conflict = .abort
   public var returning: [SQLResultColumn] = []
   public var offset: Int

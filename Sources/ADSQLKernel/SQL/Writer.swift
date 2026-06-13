@@ -96,17 +96,15 @@ enum Writer {
     var changes = 0
     var lastRowid: Int64 = 0
 
-    for rowExprs in insert.rows {
-      guard rowExprs.count == columnNames.count else {
+    func insertRow(_ rowValues: [Value]) throws(DBError) {
+      guard rowValues.count == columnNames.count else {
         throw DBError.sqlBind(
-          "\(rowExprs.count) values for \(columnNames.count) columns in INSERT")
+          "\(rowValues.count) values for \(columnNames.count) columns in INSERT")
       }
       var values: [String: Value] = [:]
-      for (index, expr) in rowExprs.enumerated() {
-        values[columnNames[index]] = try SQLEval.evaluate(expr, paramsEnv)
-      }
+      for (index, value) in rowValues.enumerated() { values[columnNames[index]] = value }
       guard let rowid = try txn.insert(into: insert.table, values, onConflict: conflict) else {
-        continue  // OR IGNORE skipped a conflicting row
+        return  // OR IGNORE skipped a conflicting row
       }
       changes += 1
       lastRowid = rowid
@@ -118,7 +116,62 @@ enum Writer {
           try projectRow(returning, table: definition, values: row.values, header: header, params: params))
       }
     }
+
+    switch insert.source {
+    case .values(let rows):
+      for rowExprs in rows {
+        var rowValues: [Value] = []
+        rowValues.reserveCapacity(rowExprs.count)
+        for expr in rowExprs { rowValues.append(try SQLEval.evaluate(expr, paramsEnv)) }
+        try insertRow(rowValues)
+      }
+    case .select(let select):
+      // Materialize the full result first (Halloween-safe for INSERT … SELECT
+      // reading the target table), then insert positionally.
+      for rowValues in try runSelectInTxn(select, txn: txn, params: params) {
+        try insertRow(rowValues)
+      }
+    }
     return (returningRows, RunResult(changes: changes, lastInsertRowid: lastRowid))
+  }
+
+  // MARK: - Reading within a write transaction (INSERT … SELECT, subqueries)
+
+  /// Binds and runs a SELECT/compound over a write transaction's own state,
+  /// returning fully materialized rows.
+  static func runSelectInTxn(
+    _ select: SQLSelect, txn: borrowing WriteTxn, params: SQLParameters
+  ) throws(DBError) -> [[Value]] {
+    switch try Binder.bindQuery(select, schema: try txn.schema()) {
+    case .select(let plan):
+      return try runBoundSelect(plan, txn: txn, params: params).map(\.values)
+    case .compound(let compound):
+      var combined: [[Value]] = []
+      for (position, arm) in compound.arms.enumerated() {
+        let armRows = try runBoundSelect(arm.select, txn: txn, params: params).map(\.values)
+        if position == 0 {
+          combined = armRows
+        } else if arm.op == .unionAll {
+          combined += armRows
+        } else {
+          combined = SelectExecutor.distinctRows(
+            combined + armRows, collations: compound.outputCollations)
+        }
+      }
+      return try SelectExecutor.finishCompound(combined, compound: compound, params: params)
+        .map(\.values)
+    }
+  }
+
+  private static func runBoundSelect(
+    _ plan: BoundSelect, txn: borrowing WriteTxn, params: SQLParameters
+  ) throws(DBError) -> [SQLRow] {
+    var tables: [Catalog.TableRecord] = []
+    for binding in plan.binding.tables { tables.append(try txn.tableRecord(binding.table)) }
+    var index: Catalog.IndexRecord?
+    if let name = plan.access.indexName { index = try txn.indexRecord(name) }
+    return try SelectExecutor.run(
+      plan, tables: tables, index: index, resolver: txn.ctx, params: params)
   }
 
   // MARK: - UPDATE (two-phase)

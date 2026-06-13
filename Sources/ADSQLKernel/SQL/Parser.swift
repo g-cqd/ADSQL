@@ -308,18 +308,23 @@ struct SQLParser {
       } while matchSymbol(",")
       try expectSymbol(")")
     }
-    if checkKeyword("SELECT") { throw DBError.sqlUnsupported("INSERT ... SELECT") }
-    try expectKeyword("VALUES")
-    var rows: [[SQLExpr]] = []
-    repeat {
-      try expectSymbol("(")
-      var row: [SQLExpr] = []
+    let source: SQLInsert.Source
+    if checkKeyword("SELECT") {
+      source = .select(try select())
+    } else {
+      try expectKeyword("VALUES")
+      var rows: [[SQLExpr]] = []
       repeat {
-        row.append(try expression())
+        try expectSymbol("(")
+        var row: [SQLExpr] = []
+        repeat {
+          row.append(try expression())
+        } while matchSymbol(",")
+        try expectSymbol(")")
+        rows.append(row)
       } while matchSymbol(",")
-      try expectSymbol(")")
-      rows.append(row)
-    } while matchSymbol(",")
+      source = .values(rows)
+    }
 
     if matchKeyword("ON") {
       try expectKeyword("CONFLICT")
@@ -355,7 +360,7 @@ struct SQLParser {
     }
     let returning = try returningClause()
     return SQLInsert(
-      table: table, columns: columns, rows: rows, conflict: conflict,
+      table: table, columns: columns, source: source, conflict: conflict,
       returning: returning, offset: offset)
   }
 
