@@ -93,6 +93,15 @@ struct BoundSelect: Sendable {
   let whereExpr: SQLExpr?
   let orderBy: [SQLOrderingTerm]
   let orderCollations: [Collation]
+  /// GROUP BY key expressions and their collations (empty for a single
+  /// implicit group when aggregates appear without GROUP BY).
+  let groupBy: [SQLExpr]
+  let groupCollations: [Collation]
+  /// HAVING, rewritten so aggregate calls are `aggregateResult` slots.
+  let having: SQLExpr?
+  /// Aggregate slots referenced by the rewritten outputs/having/orderBy.
+  let aggregates: [AggregateSpec]
+  let isAggregated: Bool
   let distinct: Bool
   let limit: SQLExpr?
   let offset: SQLExpr?
@@ -113,9 +122,6 @@ enum Binder {
     guard select.compounds.isEmpty else {
       throw DBError.sqlUnsupported("UNION/compound SELECT (arrives in a later slice)")
     }
-    guard select.groupBy.isEmpty, select.having == nil else {
-      throw DBError.sqlUnsupported("GROUP BY / HAVING (arrives in a later slice)")
-    }
     guard let from = select.from else {
       throw DBError.sqlUnsupported("SELECT without FROM (arrives in a later slice)")
     }
@@ -135,6 +141,9 @@ enum Binder {
     }
     let binding = QueryBinding(tables: tables)
 
+    // Aggregate calls in outputs/HAVING/ORDER BY are rewritten to slot
+    // references; `aggregates` collects the distinct ones to accumulate.
+    var aggregates: [AggregateSpec] = []
     var outputs: [BoundOutput] = []
     for column in select.columns {
       switch column {
@@ -146,43 +155,149 @@ enum Binder {
         }
         appendAllColumns(table, to: &outputs)
       case .expr(let expr, let alias, let sourceText):
+        let rewritten = try rewriteAggregates(expr, into: &aggregates)
         outputs.append(
-          BoundOutput(name: outputName(expr, alias: alias, sourceText: sourceText), expr: expr))
+          BoundOutput(name: outputName(expr, alias: alias, sourceText: sourceText), expr: rewritten))
       }
     }
+    var having: SQLExpr?
+    if let rawHaving = select.having {
+      having = try rewriteAggregates(rawHaving, into: &aggregates)
+    }
+    // ORDER BY resolves a bare identifier against output aliases first (SQLite
+    // behavior), so `... score*2 AS s ORDER BY s` sorts by the expression.
+    var orderBy = select.orderBy
+    for index in orderBy.indices {
+      if case .column(nil, let name, _) = orderBy[index].expr,
+        let match = outputs.first(where: { $0.name.lowercased() == name.lowercased() })
+      {
+        orderBy[index].expr = match.expr  // already aggregate-rewritten
+      } else {
+        orderBy[index].expr = try rewriteAggregates(orderBy[index].expr, into: &aggregates)
+      }
+    }
+    let isAggregated = !select.groupBy.isEmpty || !aggregates.isEmpty
 
-    let orderCollations = select.orderBy.map { collation(of: $0.expr, binding: binding) }
+    let orderCollations = orderBy.map { collation(of: $0.expr, binding: binding) }
     let outputCollations = outputs.map { collation(of: $0.expr, binding: binding) }
+    let groupCollations = select.groupBy.map { collation(of: $0, binding: binding) }
     let header = SQLColumnHeader(outputs.map(\.name))
     // The planner optimizes the outer table only: column-vs-constant conjuncts
     // on it (join predicates are column-vs-column, hence ignored here and left
     // to the residual). For a LEFT join the outer side is never null-extended,
-    // so pushing its WHERE conjuncts down stays a valid superset.
+    // so pushing its WHERE conjuncts down stays a valid superset. Aggregated
+    // queries scan every row, so the planner's order claims don't apply.
     let source = tables[0]
     let planning = Planner.plan(
       where: select.whereExpr, orderBy: select.orderBy, source: source,
       indexes: schema.indexes(on: source.table), definition: schema.tables[source.table]!)
+    let yieldsOrder = joins.isEmpty && !isAggregated
     return BoundSelect(
       binding: binding,
       joins: joins,
       outputs: outputs,
       outputCollations: outputCollations,
       whereExpr: select.whereExpr,
-      orderBy: select.orderBy,
+      orderBy: orderBy,
       orderCollations: orderCollations,
+      groupBy: select.groupBy,
+      groupCollations: groupCollations,
+      having: having,
+      aggregates: aggregates,
+      isAggregated: isAggregated,
       distinct: select.distinct,
       limit: select.limit,
       offset: select.offset,
       header: header,
       access: planning.plan,
-      accessYieldsOrder: joins.isEmpty && planning.yieldsOrder,
-      rowidOrderSatisfiesOrderBy: joins.isEmpty && planning.rowidOrderSatisfiesOrderBy)
+      accessYieldsOrder: yieldsOrder && planning.yieldsOrder,
+      rowidOrderSatisfiesOrderBy: yieldsOrder && planning.rowidOrderSatisfiesOrderBy)
   }
 
   private static func appendAllColumns(_ table: TableBinding, to outputs: inout [BoundOutput]) {
     for name in table.columnNames {
       outputs.append(
         BoundOutput(name: name, expr: .column(table: table.binding, name: name, offset: 0)))
+    }
+  }
+
+  private static let aggregateNames: Set<String> = [
+    "COUNT", "SUM", "AVG", "MIN", "MAX", "TOTAL", "GROUP_CONCAT",
+  ]
+
+  /// Replaces aggregate calls with `aggregateResult(slot)` references,
+  /// collecting the distinct specs. Recurses through scalar expressions (so
+  /// `COALESCE(SUM(x), 0)` works) but leaves subqueries — a different scope —
+  /// untouched.
+  private static func rewriteAggregates(
+    _ expr: SQLExpr, into aggregates: inout [AggregateSpec]
+  ) throws(DBError) -> SQLExpr {
+    func slot(_ spec: AggregateSpec) -> SQLExpr {
+      if let existing = aggregates.firstIndex(of: spec) { return .aggregateResult(existing) }
+      aggregates.append(spec)
+      return .aggregateResult(aggregates.count - 1)
+    }
+    switch expr {
+    case .literal, .column, .parameter, .scalarSubquery, .aggregateResult:
+      return expr
+    case .function(let name, let args, let star, let offset):
+      let upper = name.uppercased()
+      if aggregateNames.contains(upper) {
+        switch upper {
+        case "COUNT":
+          if star { return slot(AggregateSpec(kind: .countStar)) }
+          guard args.count == 1 else {
+            throw DBError.sqlUnsupported("COUNT expects one argument or *")
+          }
+          return slot(AggregateSpec(kind: .count(args[0])))
+        case "SUM":
+          guard !star, args.count == 1 else { throw DBError.sqlUnsupported("SUM(expr)") }
+          return slot(AggregateSpec(kind: .sum(args[0])))
+        default:
+          throw DBError.sqlUnsupported("aggregate \(upper) (only COUNT and SUM in this slice)")
+        }
+      }
+      var rewritten: [SQLExpr] = []
+      for arg in args { rewritten.append(try rewriteAggregates(arg, into: &aggregates)) }
+      return .function(name: name, args: rewritten, star: star, offset: offset)
+    case .binary(let op, let lhs, let rhs):
+      return .binary(
+        op, try rewriteAggregates(lhs, into: &aggregates),
+        try rewriteAggregates(rhs, into: &aggregates))
+    case .unary(let op, let inner):
+      return .unary(op, try rewriteAggregates(inner, into: &aggregates))
+    case .like(let subject, let pattern, let negated):
+      return .like(
+        try rewriteAggregates(subject, into: &aggregates),
+        pattern: try rewriteAggregates(pattern, into: &aggregates), negated: negated)
+    case .isNull(let inner, let negated):
+      return .isNull(try rewriteAggregates(inner, into: &aggregates), negated: negated)
+    case .inList(let subject, let items, let negated):
+      var rewritten: [SQLExpr] = []
+      for item in items { rewritten.append(try rewriteAggregates(item, into: &aggregates)) }
+      return .inList(
+        try rewriteAggregates(subject, into: &aggregates), rewritten, negated: negated)
+    case .inJSONEach(let subject, let source, let negated):
+      return .inJSONEach(
+        try rewriteAggregates(subject, into: &aggregates),
+        source: try rewriteAggregates(source, into: &aggregates), negated: negated)
+    case .caseWhen(let operand, let whens, let elseExpr):
+      var newOperand: SQLExpr?
+      if let operand { newOperand = try rewriteAggregates(operand, into: &aggregates) }
+      var newWhens: [SQLWhen] = []
+      for when in whens {
+        newWhens.append(
+          SQLWhen(
+            condition: try rewriteAggregates(when.condition, into: &aggregates),
+            result: try rewriteAggregates(when.result, into: &aggregates)))
+      }
+      var newElse: SQLExpr?
+      if let elseExpr { newElse = try rewriteAggregates(elseExpr, into: &aggregates) }
+      return .caseWhen(operand: newOperand, whens: newWhens, elseExpr: newElse)
+    case .cast(let inner, let type):
+      return .cast(try rewriteAggregates(inner, into: &aggregates), type)
+    case .collate(let inner, let collation):
+      return .collate(try rewriteAggregates(inner, into: &aggregates), collation)
     }
   }
 

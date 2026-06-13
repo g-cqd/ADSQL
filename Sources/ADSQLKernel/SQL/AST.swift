@@ -17,6 +17,10 @@ public indirect enum SQLExpr: Equatable, Sendable {
   case function(name: String, args: [SQLExpr], star: Bool, offset: Int)
   case cast(SQLExpr, ColumnType)
   case collate(SQLExpr, Collation)
+  /// Internal: an aggregate's computed value for the current group. The binder
+  /// rewrites COUNT/SUM calls to this so the evaluator computes group output
+  /// rows with the ordinary expression machinery.
+  case aggregateResult(Int)
 }
 
 public struct SQLWhen: Equatable, Sendable {

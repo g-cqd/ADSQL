@@ -91,6 +91,9 @@ enum SelectExecutor {
     _ plan: BoundSelect, tables: [Catalog.TableRecord], index: Catalog.IndexRecord?,
     resolver: R, params: SQLParameters
   ) throws(DBError) -> [SQLRow] {
+    if plan.isAggregated {
+      return try runAggregated(plan, tables: tables, index: index, resolver: resolver, params: params)
+    }
     if plan.isJoin {
       return try runJoin(plan, tables: tables, index: index, resolver: resolver, params: params)
     }
@@ -267,35 +270,35 @@ enum SelectExecutor {
 
   // MARK: - Joins (nested loop, null-extension)
 
-  private static func runJoin<R: PageResolver>(
+  /// Visits every post-WHERE composite row, loading `context` so `body` can
+  /// read columns through the binding. Single-table queries scan the access
+  /// path; joins drive a right-recursive nested loop — ON filters during
+  /// matching, WHERE applies at the leaf (after any LEFT null-extension), and
+  /// LEFT emits one null-extended row when the right side has no match.
+  private static func forEachFilteredRow<R: PageResolver>(
     _ plan: BoundSelect, tables: [Catalog.TableRecord], index: Catalog.IndexRecord?,
-    resolver: R, params: SQLParameters
-  ) throws(DBError) -> [SQLRow] {
-    let context = RowContext(definitions: tables.map(\.definition))
-    let env = rowEnv(plan, context: context, params: params)
-    let paramsEnv = SQLEvalEnv.parametersOnly { p throws(DBError) in try params.lookup(p) }
-    let collectKeys = !plan.orderBy.isEmpty
+    resolver: R, context: RowContext, env: SQLEvalEnv, paramsEnv: SQLEvalEnv,
+    _ body: () throws(DBError) -> Void
+  ) throws(DBError) {
+    func passesWhere() throws(DBError) -> Bool {
+      guard let predicate = plan.whereExpr else { return true }
+      return SQLEval.truth(try SQLEval.evaluate(predicate, env)) == .yes
+    }
 
-    var rows: [[Value]] = []
-    var sortKeys: [[Value]] = []
+    guard plan.isJoin else {
+      let source = try resolveSource(plan, table: tables[0], index: index, env: paramsEnv)
+      try forEachRow(source, table: tables[0], resolver: resolver) {
+        rowid, record throws(DBError) in
+        context.load(0, rowid: rowid, record: record)
+        if try passesWhere() { try body() }
+        return true
+      }
+      return
+    }
 
-    // Recurse to the right through the join tables; the leaf applies the full
-    // WHERE (after any LEFT null-extension) and projects. ON predicates filter
-    // during matching only.
     func descend(_ depth: Int) throws(DBError) {
       if depth == tables.count {
-        if let predicate = plan.whereExpr {
-          if SQLEval.truth(try SQLEval.evaluate(predicate, env)) != .yes { return }
-        }
-        var projected: [Value] = []
-        projected.reserveCapacity(plan.outputs.count)
-        for output in plan.outputs { projected.append(try SQLEval.evaluate(output.expr, env)) }
-        rows.append(projected)
-        if collectKeys {
-          var keys: [Value] = []
-          for term in plan.orderBy { keys.append(try SQLEval.evaluate(term.expr, env)) }
-          sortKeys.append(keys)
-        }
+        if try passesWhere() { try body() }
         return
       }
       let join = plan.joins[depth - 1]
@@ -322,6 +325,33 @@ enum SelectExecutor {
       try descend(1)
       return true
     }
+  }
+
+  private static func runJoin<R: PageResolver>(
+    _ plan: BoundSelect, tables: [Catalog.TableRecord], index: Catalog.IndexRecord?,
+    resolver: R, params: SQLParameters
+  ) throws(DBError) -> [SQLRow] {
+    let context = RowContext(definitions: tables.map(\.definition))
+    let env = rowEnv(plan, context: context, params: params)
+    let paramsEnv = SQLEvalEnv.parametersOnly { p throws(DBError) in try params.lookup(p) }
+    let collectKeys = !plan.orderBy.isEmpty
+
+    var rows: [[Value]] = []
+    var sortKeys: [[Value]] = []
+    try forEachFilteredRow(
+      plan, tables: tables, index: index, resolver: resolver,
+      context: context, env: env, paramsEnv: paramsEnv
+    ) { () throws(DBError) in
+      var projected: [Value] = []
+      projected.reserveCapacity(plan.outputs.count)
+      for output in plan.outputs { projected.append(try SQLEval.evaluate(output.expr, env)) }
+      rows.append(projected)
+      if collectKeys {
+        var keys: [Value] = []
+        for term in plan.orderBy { keys.append(try SQLEval.evaluate(term.expr, env)) }
+        sortKeys.append(keys)
+      }
+    }
 
     if plan.distinct {
       (rows, sortKeys) = deduplicate(
@@ -337,6 +367,122 @@ enum SelectExecutor {
       rows = Array(rows[lower..<upper])
     }
     return rows.map { SQLRow(header: plan.header, values: $0) }
+  }
+
+  // MARK: - Aggregation (GROUP BY / COUNT / SUM / HAVING)
+
+  private static func runAggregated<R: PageResolver>(
+    _ plan: BoundSelect, tables: [Catalog.TableRecord], index: Catalog.IndexRecord?,
+    resolver: R, params: SQLParameters
+  ) throws(DBError) -> [SQLRow] {
+    let context = RowContext(definitions: tables.map(\.definition))
+    let scanEnv = rowEnv(plan, context: context, params: params)
+    let paramsEnv = SQLEvalEnv.parametersOnly { p throws(DBError) in try params.lookup(p) }
+    let columnCounts = plan.binding.tables.map(\.columnNames.count)
+    let noGroupBy = plan.groupBy.isEmpty
+
+    var order: [GroupKey] = []
+    var groups: [GroupKey: (accumulators: GroupAccumulators, representative: [[Value]])] = [:]
+
+    // An aggregate with no GROUP BY always produces exactly one row (COUNT 0,
+    // SUM NULL over an empty input), so seed the single implicit group.
+    let implicitKey = GroupKey([], collations: [])
+    if noGroupBy {
+      let empty = columnCounts.map { Array(repeating: Value.null, count: $0) }
+      groups[implicitKey] = (GroupAccumulators(specs: plan.aggregates), empty)
+      order.append(implicitKey)
+    }
+
+    try forEachFilteredRow(
+      plan, tables: tables, index: index, resolver: resolver,
+      context: context, env: scanEnv, paramsEnv: paramsEnv
+    ) { () throws(DBError) in
+      let key: GroupKey
+      if noGroupBy {
+        key = implicitKey
+      } else {
+        var parts: [Value] = []
+        for expr in plan.groupBy { parts.append(try SQLEval.evaluate(expr, scanEnv)) }
+        key = GroupKey(parts, collations: plan.groupCollations)
+      }
+      if groups[key] == nil {
+        var representative: [[Value]] = []
+        for table in tables.indices {
+          representative.append(
+            context.nullExtended[table]
+              ? Array(repeating: Value.null, count: columnCounts[table])
+              : try context.slots[table].materialize())
+        }
+        groups[key] = (GroupAccumulators(specs: plan.aggregates), representative)
+        order.append(key)
+      }
+      try groups[key]!.accumulators.update(scanEnv)
+    }
+
+    var rows: [[Value]] = []
+    var sortKeys: [[Value]] = []
+    let collectKeys = !plan.orderBy.isEmpty
+    for key in order {
+      let group = groups[key]!
+      let env = aggregateEnv(
+        plan.binding, representative: group.representative,
+        accumulators: group.accumulators, params: params)
+      if let having = plan.having {
+        if SQLEval.truth(try SQLEval.evaluate(having, env)) != .yes { continue }
+      }
+      var projected: [Value] = []
+      projected.reserveCapacity(plan.outputs.count)
+      for output in plan.outputs { projected.append(try SQLEval.evaluate(output.expr, env)) }
+      rows.append(projected)
+      if collectKeys {
+        var keys: [Value] = []
+        for term in plan.orderBy { keys.append(try SQLEval.evaluate(term.expr, env)) }
+        sortKeys.append(keys)
+      }
+    }
+
+    if plan.distinct {
+      (rows, sortKeys) = deduplicate(
+        rows, sortKeys: sortKeys, ordered: collectKeys, collations: plan.outputCollations)
+    }
+    if collectKeys {
+      let permutation = sortedOrder(sortKeys, terms: plan.orderBy, collations: plan.orderCollations)
+      rows = permutation.map { rows[$0] }
+    }
+    if let bounds = try sliceBounds(plan, params: params) {
+      let lower = min(bounds.offset, rows.count)
+      let upper = bounds.limit.map { min(lower + $0, rows.count) } ?? rows.count
+      rows = Array(rows[lower..<upper])
+    }
+    return rows.map { SQLRow(header: plan.header, values: $0) }
+  }
+
+  /// Finalization env for one group: column references read the group's
+  /// representative row; `aggregateResult` slots read the accumulators.
+  private static func aggregateEnv(
+    _ binding: QueryBinding, representative: [[Value]], accumulators: GroupAccumulators,
+    params: SQLParameters
+  ) -> SQLEvalEnv {
+    SQLEvalEnv(
+      parameter: { parameter throws(DBError) in try params.lookup(parameter) },
+      column: { (qualifier, name, _) throws(DBError) in
+        guard let (table, column) = binding.resolve(qualifier: qualifier, name: name) else {
+          throw DBError.noSuchColumn(table: qualifier ?? binding.tables[0].table, column: name)
+        }
+        return representative[table][column]
+      },
+      collationOf: { (qualifier, name) in
+        binding.resolve(qualifier: qualifier, name: name)
+          .map { binding.tables[$0.table].columnCollations[$0.column] }
+      },
+      columnTypeOf: { (qualifier, name) in
+        binding.resolve(qualifier: qualifier, name: name)
+          .map { binding.tables[$0.table].columnTypes[$0.column] }
+      },
+      scalarSubquery: { _ throws(DBError) in
+        throw DBError.sqlUnsupported("subquery (arrives in a later slice)")
+      },
+      aggregateValue: { slot throws(DBError) in accumulators.result(slot) })
   }
 
   // MARK: - Probe evaluation & type-boundary coercion

@@ -106,6 +106,11 @@ struct SQLEvalEnv {
   var columnTypeOf: (_ table: String?, _ name: String) -> ColumnType? = { _, _ in nil }
   /// Correlated scalar subquery executor (installed by the query executor).
   var scalarSubquery: (SQLSelect) throws(DBError) -> Value
+  /// The current group's value for an aggregate slot (installed during
+  /// GROUP BY finalization).
+  var aggregateValue: (Int) throws(DBError) -> Value = { _ throws(DBError) in
+    throw DBError.sqlRuntime("aggregate used outside an aggregate context")
+  }
 
   static func parametersOnly(_ lookup: @escaping (SQLParam) throws(DBError) -> Value) -> SQLEvalEnv {
     SQLEvalEnv(
@@ -147,6 +152,8 @@ enum SQLEval {
       return try env.parameter(param)
     case .column(let table, let name, let offset):
       return try env.column(table, name, offset)
+    case .aggregateResult(let slot):
+      return try env.aggregateValue(slot)
     case .collate(let inner, _):
       return try evaluate(inner, env)
     case .cast(let inner, let type):
