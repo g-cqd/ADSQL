@@ -86,6 +86,18 @@ enum SQLScenario {
       precondition(result.count <= 20)
     }
     print("  [adsql] sql search      \(searchHist.summary())")
+
+    // Duplicate-heavy DISTINCT: ~12 distinct (framework, kind) pairs out of all
+    // rows — the O(n^2) dedup's worst case.
+    let distinct = try db.prepare("SELECT DISTINCT framework, kind FROM documents")
+    var distinctHist = LatencyHistogram()
+    for _ in 0..<20 {
+      let start = nowNanos()
+      let result = try distinct.all()
+      distinctHist.record(nowNanos() - start)
+      precondition(result.count > 0 && result.count <= 24)
+    }
+    print("  [adsql] sql distinct    \(distinctHist.summary())")
   }
 
   // MARK: - SQLite (SQL surface)
@@ -172,5 +184,19 @@ enum SQLScenario {
       searchHist.record(nowNanos() - start)
     }
     print("  [sqlite] sql search      \(searchHist.summary())")
+
+    var distinct: OpaquePointer?
+    sqlite3_prepare_v3(
+      db, "SELECT DISTINCT framework, kind FROM documents",
+      -1, UInt32(SQLITE_PREPARE_PERSISTENT), &distinct, nil)
+    defer { sqlite3_finalize(distinct) }
+    var distinctHist = LatencyHistogram()
+    for _ in 0..<20 {
+      let start = nowNanos()
+      sqlite3_reset(distinct)
+      while sqlite3_step(distinct) == SQLITE_ROW {}
+      distinctHist.record(nowNanos() - start)
+    }
+    print("  [sqlite] sql distinct    \(distinctHist.summary())")
   }
 }

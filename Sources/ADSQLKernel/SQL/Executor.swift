@@ -809,22 +809,19 @@ enum SelectExecutor {
   // MARK: - DISTINCT
 
   /// First-occurrence dedup under `=` semantics (numeric classes unify, the
-  /// same comparison ORDER BY uses). Quadratic; small result sets only. PR5
-  /// replaces this with canonical-key hashing shared with GROUP BY/UNION.
+  /// same comparison ORDER BY uses) via the canonical `GroupKey` — O(n), the
+  /// hashing shared with GROUP BY/UNION (`distinctRows`). `GroupKey`
+  /// canonicalization (integral REAL→INTEGER, NOCASE fold) matches the
+  /// `orderCompare` equality this used to scan for.
   private static func deduplicate(
     _ rows: [[Value]], sortKeys: [[Value]], ordered: Bool, collations: [Collation]
   ) -> (rows: [[Value]], sortKeys: [[Value]]) {
+    var seen = Set<GroupKey>()
+    seen.reserveCapacity(rows.count)
     var keptRows: [[Value]] = []
     var keptKeys: [[Value]] = []
-    for (index, row) in rows.enumerated() {
-      let seen = keptRows.contains { existing in
-        guard existing.count == row.count else { return false }
-        for column in row.indices where orderCompare(existing[column], row[column], collations[column]) != 0 {
-          return false
-        }
-        return true
-      }
-      if seen { continue }
+    for (index, row) in rows.enumerated()
+    where seen.insert(GroupKey(row, collations: collations)).inserted {
       keptRows.append(row)
       if ordered { keptKeys.append(sortKeys[index]) }
     }
