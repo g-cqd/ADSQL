@@ -15,7 +15,7 @@ rationale lives in `docs/rfcs/`.
 | **M4.5 — SQL completeness** | ✅ done | PRAGMA compatibility, BETWEEN, INSERT…SELECT, `ON CONFLICT DO UPDATE` (upsert), correlated scalar subqueries, `db.transaction { }`. |
 | **M4.6 — Scan-engine performance** | ✅ done | Zero-copy row decode (no per-row record copy) + bounded top-N + drop residual conjuncts an exact index probe already covers. Took `sql search` 14.3 → 5.34 ms. See `docs/rfcs/0002-scan-engine-performance.md`. |
 | **M4.7 — Perf + memory-safety pass** | ✅ done | Perf: B7 ordered rowid fetch (warm `Cursor.seekForward`, 5.34 → ~5.0 ms), B1 incremental decode, B3 positional `insertAssembled`, A4 relational lazy `RowView` scan (index scan ~2×). Safety: **`-strict-memory-safety` enabled module-wide** (SE-0458) — every unsafe construct marked `unsafe` or `@safe`-encapsulated, perf-neutral. See `docs/rfcs/0003-…`. |
-| **M4.8 — Query-engine performance** | ▶ active | `SELECT DISTINCT` O(n²)→O(n) (GroupKey); index-nested-loop join (the O(M·N) S1 bug → O(M·logN), reuses the planner's sargable extraction); write-path `Array(s.utf8)` allocs dropped. **Profiling re-attributed gap (b):** the descent/fetch is competitive — the join/scan gap is the per-row interpreter (per-access `binding.resolve` `lowercased()` string resolution + tree-walk), not the descent. Next lever: bind columns to precomputed slots. Hash join + persisted `ANALYZE` deferred (low value for an FK-indexed search DB). See `docs/reviews/0002-…`, `docs/rfcs/0004-…`. |
+| **M4.8 — Query-engine performance** | ✅ done | `SELECT DISTINCT` O(n²)→O(n) (GroupKey); index-nested-loop join (the O(M·N) S1 bug → O(M·logN)); write-path `Array(s.utf8)` allocs dropped; **column references bound to `(table,column)` slots at bind time** — removes the per-row `binding.resolve` `lowercased()` string resolution the profiling fingered (`sql search` ~10%, `distinct` ~17%, `join` ~20%). Profiling re-attributed gap (b): the descent/fetch is competitive; the residual is the per-row tree-walk interpreter (a future VDBE-style flat loop). Hash join + persisted `ANALYZE` deferred (low value for an FK-indexed search DB). See `docs/reviews/0002-…`, `docs/rfcs/0004-…`. |
 | **M5 — FTS + vector indexes** | ⏳ next | First-class full-text search: FTS5 virtual tables, `MATCH`, `bm25()` with custom weights, porter/unicode61 + trigram tokenizers, sync triggers. Same on-disk format. **The apple-docs migration blocker.** (Vector search is app-side — see below — so M5 is effectively FTS5.) |
 | **M6 — Hardening + importer** | ⏳ queued | Expanded fuzz/crash-injection coverage, a SQLite-file importer (loose→strict type coercion), and operational polish. |
 
@@ -32,12 +32,12 @@ paths and trails on filtered scans and inserts:
 | raw KV scan | 4935 MB/s | 4039 MB/s | **1.2×** | ✓ |
 | 16 concurrent readers | 1.07 M/s | 0.47 M/s | **2.3×** | ✓ |
 | rowid get (p50) | 0.8 µs | 2.2 µs | **2.75×** | ✓ |
-| **`sql search` (filter + ORDER BY/LIMIT)** | ~~14.3~~ → ~~5.34~~ → **~5.0 ms** | 1.76 ms | ~~0.12×~~ → **0.35× (2.9× slower)** | M4.6 + M4.7/B7 ✓ |
+| **`sql search` (filter + ORDER BY/LIMIT)** | ~~14.3~~ → ~~5.34~~ → ~~5.0~~ → **~4.6 ms** | 1.76 ms | ~~0.12×~~ → **~0.38×** | M4.6 + M4.7/B7 + M4.8 (slot binding) |
 | **relational index scan** | ~~1.23~~ → **~2.2 M/s** | ~3.1 M/s | ~~0.35×~~ → **~0.69×** | M4.7/A4 ✓ (lazy `RowView`, ~2×) |
 | **batch insert (SQL / 3-index)** | ~138 → ~143 → **~147 k/s** | ~224 k/s | **~0.66×** | M4.7/B3 + M4.8 (utf8 alloc dropped) |
 | batch insert (relational / 5-index) | ~118 → **~125 k/s** | 159 k/s | **~0.79×** | M4.8 (NOCASE double-copy removed) |
-| **`SELECT DISTINCT` (dup-heavy)** | ~~O(n²) (unrunnable)~~ → **74 ms** | 4.6 ms | **0.06×** | M4.8 (O(n) GroupKey; residual = full materialize + no index-distinct) |
-| **`sql join` (indexed equi-join)** | ~~O(M·N) (unrunnable)~~ → **240 ms** | 21.7 ms | **0.09×** | M4.8/INLJ (asymptotic fix; residual = per-row interpreter, not the descent) |
+| **`SELECT DISTINCT` (dup-heavy)** | ~~O(n²) (unrunnable)~~ → ~~74~~ → **~61 ms** | 4.6 ms | **0.08×** | M4.8 (O(n) GroupKey + slot binding; residual = full materialize + no index-distinct) |
+| **`sql join` (indexed equi-join)** | ~~O(M·N) (unrunnable)~~ → ~~240~~ → **~178 ms** | 21.7 ms | **0.12×** | M4.8/INLJ + slot binding (residual = per-row tree-walk interpreter) |
 | **filtered scan / index scan / join residual** | — | — | — | gap (b) re-attributed → per-row column re-resolution + tree-walk; lever = bind columns to slots (M4.8 next) |
 
 What closes each gap:
