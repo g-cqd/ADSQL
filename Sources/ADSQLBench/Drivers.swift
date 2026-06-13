@@ -17,13 +17,17 @@ protocol KVDriver: AnyObject {
   func close()
 }
 
-protocol KVReader: AnyObject {
+/// Sendable because a reader is shared across the concurrent benchmark tasks
+/// (ADSQL: one wait-free snapshot handle; SQLite: a per-task connection). The
+/// conformance lets the bench hand a reader to a task without disabling the
+/// concurrency check (Review 0001 F6).
+protocol KVReader: AnyObject, Sendable {
   func get(_ key: [UInt8]) throws -> Int?
 }
 
 // MARK: - ADSQL
 
-final class ADSQLDriver: KVDriver, KVReader {
+final class ADSQLDriver: KVDriver, KVReader, Sendable {
   static let engineName = "adsql"
   let db: Database
 
@@ -190,7 +194,10 @@ final class SQLiteDriver: KVDriver {
   }
 }
 
-final class SQLiteReadConnection: KVReader {
+/// @unchecked: each instance is a fresh read-only connection confined to the
+/// single benchmark task it was created for; the `sqlite3*`/stmt handles are
+/// never touched from another thread.
+final class SQLiteReadConnection: KVReader, @unchecked Sendable {
   var db: OpaquePointer?
   var selectStmt: OpaquePointer?
 

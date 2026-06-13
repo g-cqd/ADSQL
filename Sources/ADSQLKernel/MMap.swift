@@ -12,7 +12,10 @@ import Darwin
 /// instead; compaction is an offline copy), which is what makes handing out
 /// borrowed views of mapped pages sound.
 @safe public final class MMap: @unchecked Sendable {
-  public let base: UnsafeRawPointer
+  /// The naked mapping pointer is private: callers get only the bounded
+  /// `pageBytes`/`bytes` views, so the unsafe pointer never leaves this type
+  /// (Review 0001 F3).
+  private let base: UnsafeRawPointer
   public let capacity: Int
 
   public init(fileDescriptor: Int32, capacity: Int) throws(DBError) {

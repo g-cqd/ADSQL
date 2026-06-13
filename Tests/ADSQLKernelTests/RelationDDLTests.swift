@@ -1,4 +1,5 @@
 import Dispatch
+import Synchronization
 import Testing
 import ADSQLTestSupport
 @testable import ADSQLKernel
@@ -175,14 +176,15 @@ struct RelationDDLTests {
 
     let readerEntered = DispatchSemaphore(value: 0)
     let ddlDone = DispatchSemaphore(value: 0)
-    nonisolated(unsafe) var pinnedTables: Set<String> = []
+    let pinnedTables = Mutex<Set<String>>([])
     let group = DispatchGroup()
     DispatchQueue.global().async(group: group) {
       try? db.read { (txn) throws(DBError) in
         readerEntered.signal()
         ddlDone.wait()
         // Snapshot from BEFORE the DDL: must not see table t2.
-        pinnedTables = Set(try txn.schema().tables.keys)
+        let tables = Set(try txn.schema().tables.keys)
+        pinnedTables.withLock { $0 = tables }
       }
     }
     readerEntered.wait()
@@ -192,7 +194,7 @@ struct RelationDDLTests {
     #expect(fresh == ["documents", "t2"])
     ddlDone.signal()
     group.wait()
-    #expect(pinnedTables == ["documents"], "old snapshot leaked a newer schema")
+    #expect(pinnedTables.withLock { $0 } == ["documents"], "old snapshot leaked a newer schema")
   }
 
   @Test func failingDDLRequestRollsBackInBatch() async throws {

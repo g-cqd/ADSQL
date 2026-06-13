@@ -310,13 +310,17 @@ public struct ReadTxn: ~Copyable {
         }
         switch ref {
         case .inline(let bytes):
-          result = unsafe .success(try body(RawSpan(_unsafeBytes: bytes)))
+          // bytes is a borrowed view of the mapped page, alive for this scope.
+          result = unsafe .success(
+            try Self.withRawSpan(over: bytes) { (span: RawSpan) throws(DBError) in try body(span) })
         case .overflow:
           let copied = try BTree.copyValue(ref, resolver: resolver)
           var inner: Result<R, DBError>?
           copied.withUnsafeBytes { raw in
             do throws(DBError) {
-              inner = unsafe .success(try body(RawSpan(_unsafeBytes: raw)))
+              // raw is owned by `copied`, alive for this withUnsafeBytes scope.
+              inner = unsafe .success(
+                try Self.withRawSpan(over: raw) { (span: RawSpan) throws(DBError) in try body(span) })
             } catch {
               inner = .failure(error)
             }
@@ -328,6 +332,17 @@ public struct ReadTxn: ~Copyable {
       }
     }
     return try result!.get()
+  }
+
+  /// The single bridge from raw bytes to the safe `RawSpan` type. The
+  /// underscored `_unsafeBytes:` SPI asserts (does not check) the span's
+  /// lifetime and is unstable across compilers, so it is confined here to one
+  /// call site; both callers keep `bytes` alive for the closure's duration
+  /// (Review 0001 F5).
+  private static func withRawSpan<R, E: Error>(
+    over bytes: UnsafeRawBufferPointer, _ body: (RawSpan) throws(E) -> R
+  ) throws(E) -> R {
+    try body(unsafe RawSpan(_unsafeBytes: bytes))
   }
 
   /// Scoped ordered iteration over the snapshot.

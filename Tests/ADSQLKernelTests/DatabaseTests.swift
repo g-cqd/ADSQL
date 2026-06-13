@@ -1,4 +1,5 @@
 import Dispatch
+import Synchronization
 import Testing
 import ADSQLTestSupport
 @testable import ADSQLKernel
@@ -164,31 +165,29 @@ struct DatabaseConcurrencyTests {
     }
 
     let group = DispatchGroup()
-    let stop = DispatchQueue(label: "stop-flag")
-    nonisolated(unsafe) var stopped = false
-    nonisolated(unsafe) var readerFailures: [String] = []
-    let failureLock = DispatchQueue(label: "failures")
+    let stopped = Mutex(false)
+    let readerFailures = Mutex<[String]>([])
 
     // 12 readers hammering snapshots.
     for _ in 0..<12 {
       DispatchQueue.global().async(group: group) {
-        while !stop.sync(execute: { stopped }) {
+        while !stopped.withLock({ $0 }) {
           do {
             try db.read { (txn) throws(DBError) in
               var stamps = Set<UInt64>()
               for key in keys {
                 guard let value = try txn.get(key), let stamp = readStamp(value) else {
-                  failureLock.sync { readerFailures.append("missing key/stamp") }
+                  readerFailures.withLock { $0.append("missing key/stamp") }
                   return
                 }
                 stamps.insert(stamp)
               }
               if stamps.count != 1 {
-                failureLock.sync { readerFailures.append("mixed stamps \(stamps.sorted())") }
+                readerFailures.withLock { $0.append("mixed stamps \(stamps.sorted())") }
               }
             }
           } catch {
-            failureLock.sync { readerFailures.append("read threw: \(error)") }
+            readerFailures.withLock { $0.append("read threw: \(error)") }
             return
           }
         }
@@ -207,11 +206,12 @@ struct DatabaseConcurrencyTests {
         break
       }
     }
-    stop.sync { stopped = true }
+    stopped.withLock { $0 = true }
     group.wait()
 
     #expect(writerError == nil)
-    #expect(readerFailures.isEmpty, "\(readerFailures.prefix(3))")
+    let failures = readerFailures.withLock { $0 }
+    #expect(failures.isEmpty, "\(failures.prefix(3))")
     #expect(db.generation == 151)
 
     // Post-churn structural health.
@@ -233,9 +233,8 @@ struct DatabaseConcurrencyTests {
 
     let readerEntered = DispatchSemaphore(value: 0)
     let writerDone = DispatchSemaphore(value: 0)
-    let readerResult = DispatchQueue(label: "result")
-    nonisolated(unsafe) var observed: [UInt8]?
-    nonisolated(unsafe) var observedGen: UInt64 = 0
+    struct Observation: Sendable { var value: [UInt8]?; var gen: UInt64 = 0 }
+    let observation = Mutex(Observation())
 
     let group = DispatchGroup()
     DispatchQueue.global().async(group: group) {
@@ -245,10 +244,7 @@ struct DatabaseConcurrencyTests {
         writerDone.wait()
         let value = try txn.get(Array("k".utf8))
         let generation = txn.generation
-        readerResult.sync {
-          observed = value
-          observedGen = generation
-        }
+        observation.withLock { $0 = Observation(value: value, gen: generation) }
       }
     }
 
@@ -262,10 +258,9 @@ struct DatabaseConcurrencyTests {
     writerDone.signal()
     group.wait()
 
-    readerResult.sync {
-      #expect(observed == Array("old".utf8))
-      #expect(observedGen == 1)
-    }
+    let observed = observation.withLock { $0 }
+    #expect(observed.value == Array("old".utf8))
+    #expect(observed.gen == 1)
     let current = try db.read { (txn) throws(DBError) in try txn.get(Array("k".utf8)) }
     #expect(current == Array("new-29".utf8))
   }
