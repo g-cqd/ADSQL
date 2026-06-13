@@ -87,6 +87,15 @@ public enum KeyCodec {
     return key
   }
 
+  /// Writes the 8-byte row key into `buffer` (which must hold ≥ 8 bytes),
+  /// avoiding the per-call `[UInt8]` allocation `rowKey` makes — used on the
+  /// index-scan hot path where a row key is built per row only to seek the
+  /// table tree.
+  @inline(__always)
+  public static func writeRowKey(_ rowid: Int64, into buffer: UnsafeMutableRawBufferPointer) {
+    withUnsafeBytes(of: biased(rowid).bigEndian) { unsafe buffer.copyMemory(from: $0) }
+  }
+
   public static func appendRowidSuffix(_ rowid: Int64, to key: inout [UInt8]) {
     appendBE(biased(rowid), to: &key)
   }

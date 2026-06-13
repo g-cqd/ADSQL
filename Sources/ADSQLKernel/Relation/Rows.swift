@@ -218,11 +218,11 @@ public struct RowCursor<R: PageResolver>: ~Copyable {
         } ?? nil
         guard let rowid else { exhausted = true; return }
 
-        let rowKey = KeyCodec.rowKey(rowid)
         var found: Result<Bool, DBError> = .success(false)
-        rowKey.withUnsafeBytes { raw in
+        withUnsafeTemporaryAllocation(byteCount: 8, alignment: 8) { raw in
+          unsafe KeyCodec.writeRowKey(rowid, into: raw)
           do throws(DBError) {
-            found = unsafe .success(try tableCursor.seekForward(raw))
+            found = unsafe .success(try tableCursor.seekForward(UnsafeRawBufferPointer(raw)))
           } catch {
             found = .failure(error)
           }
