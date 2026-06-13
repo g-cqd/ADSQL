@@ -291,7 +291,6 @@ struct SQLParserErrorTests {
     ("SELECT 1 LIMIT 1, 2", "LIMIT offset"),
     ("CREATE VIRTUAL TABLE f USING fts5(a)", "VIRTUAL"),
     ("CREATE TABLE t (a INTEGER) WITHOUT ROWID", "WITHOUT ROWID"),
-    ("PRAGMA journal_mode", "PRAGMA"),
     ("INSERT INTO t SELECT * FROM s", "SELECT"),
     ("SELECT * FROM t WHERE a IN (SELECT b FROM s)", "json_each"),
     ("SELECT * FROM t WHERE EXISTS (SELECT 1)", "EXISTS"),

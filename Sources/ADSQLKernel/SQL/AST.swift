@@ -170,12 +170,18 @@ public enum SQLStatementAST: Equatable, Sendable {
   case createIndex(SQLCreateIndex)
   case dropTable(name: String, ifExists: Bool)
   case dropIndex(name: String, ifExists: Bool)
+  /// `PRAGMA name` / `PRAGMA name = value` / `PRAGMA name(value)`. ADSQL
+  /// accepts these for compatibility; most are no-ops (durability is governed
+  /// by DatabaseOptions, not journal/synchronous pragmas).
+  case pragma(name: String, value: String?)
   case begin
   case commit
   case rollback
 
   public var isReadOnly: Bool {
-    if case .select = self { return true }
-    return false
+    switch self {
+    case .select, .pragma: return true
+    default: return false
+    }
   }
 }

@@ -26,7 +26,7 @@ enum Writer {
     case .dropIndex(let name, let ifExists):
       try dropIndex(name, ifExists: ifExists, txn: txn)
       return ([], RunResult())
-    case .select, .begin, .commit, .rollback:
+    case .select, .pragma, .begin, .commit, .rollback:
       throw DBError.sqlUnsupported("not a write statement")
     }
   }

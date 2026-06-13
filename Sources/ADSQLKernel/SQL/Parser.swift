@@ -103,7 +103,7 @@ struct SQLParser {
   mutating func statement() throws(DBError) -> SQLStatementAST {
     let offset = current.offset
     if checkKeyword("WITH") { throw DBError.sqlUnsupported("common table expressions (WITH)") }
-    if checkKeyword("PRAGMA") { throw DBError.sqlUnsupported("PRAGMA") }
+    if matchKeyword("PRAGMA") { return try pragma() }
     if checkKeyword("EXPLAIN") { throw DBError.sqlUnsupported("EXPLAIN") }
     if checkKeyword("VACUUM") { throw DBError.sqlUnsupported("VACUUM") }
     if checkKeyword("ALTER") { throw DBError.sqlUnsupported("ALTER TABLE") }
@@ -134,6 +134,38 @@ struct SQLParser {
       return .rollback
     }
     throw DBError.sqlSyntax(message: "expected a statement", offset: current.offset)
+  }
+
+  /// `PRAGMA name` / `PRAGMA name = value` / `PRAGMA name(value)`. The name and
+  /// value are taken loosely (pragma names aren't reserved; values may be
+  /// identifiers like WAL/OFF, keywords like DELETE, strings, or numbers).
+  mutating func pragma() throws(DBError) -> SQLStatementAST {
+    let name = try pragmaWord()
+    var value: String?
+    if matchSymbol("=") {
+      value = try pragmaWord()
+    } else if matchSymbol("(") {
+      value = try pragmaWord()
+      try expectSymbol(")")
+    }
+    return .pragma(name: name.lowercased(), value: value)
+  }
+
+  /// One pragma name/value token, stringified. A leading sign is accepted so
+  /// numeric values like `cache_size = -64000` parse.
+  mutating func pragmaWord() throws(DBError) -> String {
+    var sign = ""
+    if matchSymbol("-") { sign = "-" } else if matchSymbol("+") { sign = "" }
+    let token = advance()
+    switch token.kind {
+    case .identifier(let s): return sign + s
+    case .keyword(let s): return sign + s
+    case .string(let s): return s
+    case .integer(let v): return sign + String(v)
+    case .real(let d): return sign + String(d)
+    default:
+      throw DBError.sqlSyntax(message: "expected a pragma name or value", offset: token.offset)
+    }
   }
 
   // MARK: SELECT
