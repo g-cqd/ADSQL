@@ -82,6 +82,14 @@ public final class TxnContext: PageResolver, OverflowPager {
   /// relational use. Value-typed: TxnRestorePoint snapshots it by copy.
   public internal(set) var relation: RelationState?
 
+  /// Active NEW/OLD row frame while a trigger body executes (M5/F5). The write
+  /// path consults it so trigger-body expressions can read `new.col`/`old.col`;
+  /// nil outside a trigger. Stacked frames restore the prior frame on return.
+  var triggerFrame: TriggerFrame?
+  /// Trigger recursion depth: bumped around each fired trigger body so a
+  /// self-referential trigger errors instead of looping forever.
+  var triggerDepth: UInt32 = 0
+
   /// Group-commit nesting: stacked micro-transactions bump the epoch; pages
   /// dirtied by earlier requests are cloned on first touch so a failing
   /// request can restore them (see RequestUndo).

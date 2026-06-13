@@ -396,6 +396,8 @@ extension Relation {
     }
 
     ctx.relation = state
+    // AFTER INSERT row triggers: NEW = the inserted row (rowid filled in).
+    try TriggerEngine.fire(ctx, event: .insert, table: tableName, old: nil, new: row)
     return rowid
   }
 
@@ -434,6 +436,10 @@ extension Relation {
     table.handle = handle
     state.tableRecords[tableName] = table
     ctx.relation = state
+    // AFTER DELETE row triggers: OLD = the removed row. Fires for direct
+    // deletes, FK cascades, and OR REPLACE victims (all route through here),
+    // matching SQLite.
+    try TriggerEngine.fire(ctx, event: .delete, table: tableName, old: row, new: nil)
     return true
   }
 
@@ -532,6 +538,8 @@ extension Relation {
     table.handle = handle
     state.tableRecords[tableName] = table
     ctx.relation = state
+    // AFTER UPDATE row triggers: OLD = pre-update row, NEW = post-update row.
+    try TriggerEngine.fire(ctx, event: .update, table: tableName, old: oldRow, new: newRow)
     return true
   }
 

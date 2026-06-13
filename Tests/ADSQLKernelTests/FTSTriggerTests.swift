@@ -221,4 +221,238 @@ struct FTSTriggerTests {
     try db.prepare("DROP TABLE documents").run()
     #expect(try db.writeSync { (txn) throws(DBError) in try txn.schema().triggers.count } == 0)
   }
+
+  // MARK: - End-to-end FTS sync (the apple-docs shape)
+
+  /// Builds `documents` + `documents_fts` + the ai/ad/au triggers, then drives
+  /// the FTS index entirely through base-table DML, asserting via the MATCH SQL
+  /// surface that the triggers keep the index in step.
+  private func ftsSyncFixture(_ dir: TempDir) throws -> Database {
+    let db = try Database.open(at: dir.file("ftssync.adsql"))
+    try db.prepare("""
+      CREATE TABLE documents(
+        id INTEGER PRIMARY KEY, title TEXT, abstract TEXT, declaration TEXT,
+        headings TEXT, key TEXT)
+      """).run()
+    try db.prepare("""
+      CREATE VIRTUAL TABLE documents_fts USING fts5(
+        title, abstract, declaration, headings, key, tokenize='porter unicode61')
+      """).run()
+    try db.prepare(Self.aiTrigger).run()
+    try db.prepare(Self.adTrigger).run()
+    try db.prepare(Self.auTrigger).run()
+    return db
+  }
+
+  private func matchIds(_ db: Database, _ query: String) throws -> [Int64] {
+    try db.prepare(
+      "SELECT rowid FROM documents_fts WHERE documents_fts MATCH ? ORDER BY rowid"
+    ).all(.text(query)).map { row in
+      guard case .integer(let id) = row[0] else { return Int64(-1) }
+      return id
+    }
+  }
+
+  @Test func insertTriggerSyncsFTS() throws {
+    let dir = TempDir()
+    defer { dir.cleanup() }
+    let db = try ftsSyncFixture(dir)
+    defer { db.close() }
+    // A plain base-table INSERT (no direct FTS write): the AI trigger indexes it.
+    try db.prepare("""
+      INSERT INTO documents(id, title, abstract, declaration, headings, key)
+      VALUES(1, 'swift concurrency', 'async await tasks', 'func run()', 'Overview', 'doc/swift')
+      """).run()
+    try db.prepare("""
+      INSERT INTO documents(id, title, abstract, declaration, headings, key)
+      VALUES(2, 'python guide', 'beginner tutorial', 'def main()', 'Intro', 'doc/python')
+      """).run()
+    #expect(try matchIds(db, "swift") == [1])
+    #expect(try matchIds(db, "tasks") == [1])
+    #expect(try matchIds(db, "tutorial") == [2])
+    #expect(try matchIds(db, "guide") == [2])
+    #expect(try matchIds(db, "nonexistent").isEmpty)
+  }
+
+  @Test func updateTriggerResyncsFTS() throws {
+    let dir = TempDir()
+    defer { dir.cleanup() }
+    let db = try ftsSyncFixture(dir)
+    defer { db.close() }
+    try db.prepare("""
+      INSERT INTO documents(id, title, abstract, declaration, headings, key)
+      VALUES(1, 'swift intro', 'old body text', '', '', 'k1')
+      """).run()
+    #expect(try matchIds(db, "swift") == [1])
+    #expect(try matchIds(db, "old") == [1])
+
+    // UPDATE fires AU: the 'delete' idiom removes the stale doc, then re-inserts.
+    try db.prepare("UPDATE documents SET title = ?, abstract = ? WHERE id = 1").run(
+      .text("rust systems"), .text("new body text"))
+    #expect(try matchIds(db, "swift").isEmpty, "stale term must be gone after UPDATE")
+    #expect(try matchIds(db, "old").isEmpty)
+    #expect(try matchIds(db, "rust") == [1])
+    #expect(try matchIds(db, "new") == [1])
+  }
+
+  @Test func deleteTriggerRemovesFromFTS() throws {
+    let dir = TempDir()
+    defer { dir.cleanup() }
+    let db = try ftsSyncFixture(dir)
+    defer { db.close() }
+    try db.prepare("""
+      INSERT INTO documents(id, title, abstract, declaration, headings, key)
+      VALUES(1, 'swift intro', 'body one', '', '', 'k1')
+      """).run()
+    try db.prepare("""
+      INSERT INTO documents(id, title, abstract, declaration, headings, key)
+      VALUES(2, 'swift advanced', 'body two', '', '', 'k2')
+      """).run()
+    #expect(try matchIds(db, "swift") == [1, 2])
+
+    // DELETE fires AD (the 'delete' idiom), removing doc 1 from the index.
+    try db.prepare("DELETE FROM documents WHERE id = 1").run()
+    #expect(try matchIds(db, "swift") == [2])
+    #expect(try matchIds(db, "one").isEmpty)
+    #expect(try matchIds(db, "two") == [2])
+  }
+
+  @Test func fullSyncSurvivesReopen() throws {
+    let dir = TempDir()
+    defer { dir.cleanup() }
+    let path = dir.file("ftssync-reopen.adsql")
+    do {
+      let db = try Database.open(at: path)
+      defer { db.close() }
+      try db.prepare("""
+        CREATE TABLE documents(
+          id INTEGER PRIMARY KEY, title TEXT, abstract TEXT, declaration TEXT,
+          headings TEXT, key TEXT)
+        """).run()
+      try db.prepare("""
+        CREATE VIRTUAL TABLE documents_fts USING fts5(
+          title, abstract, declaration, headings, key, tokenize='porter unicode61')
+        """).run()
+      try db.prepare(Self.aiTrigger).run()
+      try db.prepare("""
+        INSERT INTO documents(id, title, abstract, declaration, headings, key)
+        VALUES(7, 'metal shaders', 'gpu kernels', '', '', 'k7')
+        """).run()
+    }
+    // Reopen: the trigger re-parses from the catalog and still fires.
+    do {
+      let db = try Database.open(at: path)
+      defer { db.close() }
+      #expect(try matchIds(db, "metal") == [7])
+      try db.prepare("""
+        INSERT INTO documents(id, title, abstract, declaration, headings, key)
+        VALUES(8, 'metal compute', 'threadgroups', '', '', 'k8')
+        """).run()
+      #expect(try matchIds(db, "metal") == [7, 8])
+      _ = try db.verifyIntegrity(deep: true)
+    }
+  }
+
+  // MARK: - Plain (non-FTS) trigger + CSQLite differential
+
+  /// An audit-log trigger writing NEW/OLD values to a second table. Asserts the
+  /// resulting rows match real SQLite running the identical DDL/DML.
+  @Test func plainAuditTriggerMatchesSQLite() throws {
+    let dir = TempDir()
+    defer { dir.cleanup() }
+    let db = try Database.open(at: dir.file("audit.adsql"))
+    defer { db.close() }
+
+    let ddl = [
+      "CREATE TABLE accounts(id INTEGER PRIMARY KEY, name TEXT, balance INTEGER)",
+      "CREATE TABLE audit(seq INTEGER PRIMARY KEY AUTOINCREMENT, kind TEXT, acct INTEGER, old_bal INTEGER, new_bal INTEGER)",
+      """
+      CREATE TRIGGER acct_ai AFTER INSERT ON accounts BEGIN
+        INSERT INTO audit(kind, acct, old_bal, new_bal) VALUES('insert', new.id, NULL, new.balance);
+      END
+      """,
+      """
+      CREATE TRIGGER acct_au AFTER UPDATE ON accounts BEGIN
+        INSERT INTO audit(kind, acct, old_bal, new_bal) VALUES('update', new.id, old.balance, new.balance);
+      END
+      """,
+      """
+      CREATE TRIGGER acct_ad AFTER DELETE ON accounts BEGIN
+        INSERT INTO audit(kind, acct, old_bal, new_bal) VALUES('delete', old.id, old.balance, NULL);
+      END
+      """,
+    ]
+    let dml = [
+      "INSERT INTO accounts(id, name, balance) VALUES(1, 'alice', 100)",
+      "INSERT INTO accounts(id, name, balance) VALUES(2, 'bob', 50)",
+      "UPDATE accounts SET balance = 175 WHERE id = 1",
+      "UPDATE accounts SET balance = balance - 10 WHERE id = 2",
+      "DELETE FROM accounts WHERE id = 1",
+    ]
+    for sql in ddl + dml { try db.prepare(sql).run() }
+
+    let auditQuery = "SELECT kind, acct, old_bal, new_bal FROM audit ORDER BY seq"
+    let ours = try db.prepare(auditQuery).all().map(\.values)
+
+    let mirror = SQLiteMirror()
+    for sql in ddl + dml { try mirror.exec(sql) }
+    let theirs = try mirror.query(auditQuery)
+
+    #expect(rowsMatch(ours, theirs, ordered: true), "adsql \(ours)\nsqlite \(theirs)")
+    // Spot-check the captured NEW/OLD values directly too.
+    #expect(ours == [
+      [.text("insert"), .integer(1), .null, .integer(100)],
+      [.text("insert"), .integer(2), .null, .integer(50)],
+      [.text("update"), .integer(1), .integer(100), .integer(175)],
+      [.text("update"), .integer(2), .integer(50), .integer(40)],
+      [.text("delete"), .integer(1), .integer(175), .null],
+    ])
+  }
+
+  @Test func whenClauseGatesFiring() throws {
+    let dir = TempDir()
+    defer { dir.cleanup() }
+    let db = try Database.open(at: dir.file("when.adsql"))
+    defer { db.close() }
+    try db.prepare("CREATE TABLE t(id INTEGER PRIMARY KEY, qty INTEGER)").run()
+    try db.prepare("CREATE TABLE big(id INTEGER PRIMARY KEY, item INTEGER)").run()
+    try db.prepare("""
+      CREATE TRIGGER only_big AFTER INSERT ON t WHEN new.qty >= 10 BEGIN
+        INSERT INTO big(item) VALUES(new.id);
+      END
+      """).run()
+    try db.prepare("INSERT INTO t(id, qty) VALUES(1, 5)").run()  // WHEN false → skip
+    try db.prepare("INSERT INTO t(id, qty) VALUES(2, 20)").run() // WHEN true → fire
+    let rows = try db.prepare("SELECT item FROM big ORDER BY id").all().map(\.values)
+    #expect(rows == [[.integer(2)]])
+  }
+
+  // MARK: - Recursion guard
+
+  @Test func selfReferentialTriggerErrorsRatherThanLooping() throws {
+    let dir = TempDir()
+    defer { dir.cleanup() }
+    let db = try Database.open(at: dir.file("recurse.adsql"))
+    defer { db.close() }
+    try db.prepare("CREATE TABLE t(id INTEGER PRIMARY KEY, n INTEGER)").run()
+    // Each INSERT fires a trigger that INSERTs again with a different rowid:
+    // an unbounded chain, which the depth guard must cut off with an error.
+    try db.prepare("""
+      CREATE TRIGGER loop AFTER INSERT ON t BEGIN
+        INSERT INTO t(id, n) VALUES(new.id + 1, new.n + 1);
+      END
+      """).run()
+    do {
+      try db.prepare("INSERT INTO t(id, n) VALUES(1, 1)").run()
+      Issue.record("a self-referential trigger must error, not loop")
+    } catch {
+      guard case .sqlRuntime(let why) = error, why.contains("trigger recursion") else {
+        Issue.record("expected trigger-recursion sqlRuntime, got \(error)")
+        return
+      }
+    }
+    // The whole statement rolled back: no partial chain persisted.
+    let count = try db.prepare("SELECT COUNT(*) FROM t").all()[0][0]
+    #expect(count == .integer(0))
+  }
 }

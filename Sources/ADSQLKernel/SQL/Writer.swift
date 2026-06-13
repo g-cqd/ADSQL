@@ -141,7 +141,7 @@ enum Writer {
       columnSlots.append(slot)
     }
 
-    let paramsEnv = SQLEvalEnv.parametersOnly { p throws(DBError) in try params.lookup(p) }
+    let paramsEnv = writeEnv(txn: txn, params: params)
     let returning = try bindReturning(insert.returning, definition: definition)
     let header = returning.map { SQLColumnHeader($0.map(\.name)) }
     var returningRows: [SQLRow] = []
@@ -364,7 +364,8 @@ enum Writer {
     var returningRows: [SQLRow] = []
     var changes = 0
     for match in matches {
-      let env = rowEnv(table: definition, values: match.values, params: params)
+      let env = rowEnv(
+        table: definition, values: match.values, params: params, triggerCtx: txn.ctx)
       var assignments: [String: Value] = [:]
       for set in update.sets { assignments[set.column] = try SQLEval.evaluate(set.value, env) }
       guard try txn.update(update.table, rowid: match.rowid, set: assignments) else { continue }
@@ -443,7 +444,7 @@ enum Writer {
       }
     }
 
-    let paramsEnv = SQLEvalEnv.parametersOnly { p throws(DBError) in try params.lookup(p) }
+    let paramsEnv = writeEnv(txn: txn, params: params)
     var changes = 0
     var lastRowid: Int64 = 0
 
@@ -490,7 +491,7 @@ enum Writer {
     guard case .values(let rows) = insert.source else {
       throw DBError.sqlUnsupported("FTS command requires VALUES")
     }
-    let paramsEnv = SQLEvalEnv.parametersOnly { p throws(DBError) in try params.lookup(p) }
+    let paramsEnv = writeEnv(txn: txn, params: params)
     let rowidPosition = insert.columns.firstIndex { $0.lowercased() == "rowid" }
     var changes = 0
     for rowExprs in rows {
@@ -522,7 +523,7 @@ enum Writer {
     _ delete: SQLDelete, txn: borrowing WriteTxn, params: SQLParameters
   ) throws(DBError) -> (rows: [SQLRow], result: RunResult) {
     guard delete.returning.isEmpty else { throw DBError.sqlUnsupported("RETURNING on an FTS table") }
-    let paramsEnv = SQLEvalEnv.parametersOnly { p throws(DBError) in try params.lookup(p) }
+    let paramsEnv = writeEnv(txn: txn, params: params)
     let docids = try ftsDeleteDocids(delete.whereExpr, env: paramsEnv)
     var changes = 0
     for docid in docids where try txn.ftsRemove(delete.table, docid: docid) { changes += 1 }
@@ -581,7 +582,7 @@ enum Writer {
       var matches: [(rowid: Int64, values: [Value])] = []
       while let row = try cursor.next() {
         if let predicate {
-          let env = rowEnv(table: table, values: row.values, params: params)
+          let env = rowEnv(table: table, values: row.values, params: params, triggerCtx: txn.ctx)
           if SQLEval.truth(try SQLEval.evaluate(predicate, env)) != .yes { continue }
         }
         matches.append((row.rowid, row.values))
@@ -631,22 +632,55 @@ enum Writer {
     return SQLRow(header: header, values: values)
   }
 
-  /// An evaluation env over one materialized row of a single table.
+  /// An evaluation env over one materialized row of a single table. When this
+  /// runs inside a trigger body (a frame is active on `ctx`), `new.col`/`old.col`
+  /// resolve from the frame before the table's own columns — so a trigger body's
+  /// `UPDATE … SET x = new.y WHERE id = old.id` reads NEW/OLD correctly.
   static func rowEnv(
-    table: TableDefinition, values: [Value], params: SQLParameters
+    table: TableDefinition, values: [Value], params: SQLParameters,
+    triggerCtx: TxnContext? = nil
   ) -> SQLEvalEnv {
     SQLEvalEnv(
       parameter: { p throws(DBError) in try params.lookup(p) },
-      column: { (qualifier, name, _) throws(DBError) in
+      column: { (qualifier, name, offset) throws(DBError) in
+        if let triggerCtx,
+          let value = try TriggerEngine.triggerColumn(
+            triggerCtx, qualifier: qualifier, name: name, offset: offset) {
+          return value
+        }
         guard let index = table.columnIndex(of: name) else {
           throw DBError.noSuchColumn(table: qualifier ?? table.name, column: name)
         }
         return values[index]
       },
-      collationOf: { (_, name) in table.columnIndex(of: name).map { table.columns[$0].collation } },
-      columnTypeOf: { (_, name) in table.columnIndex(of: name).map { table.columns[$0].type } },
+      collationOf: { (qualifier, name) in
+        if let triggerCtx,
+          let c = TriggerEngine.triggerCollation(triggerCtx, qualifier: qualifier, name: name) {
+          return c
+        }
+        return table.columnIndex(of: name).map { table.columns[$0].collation }
+      },
+      columnTypeOf: { (qualifier, name) in
+        if let triggerCtx,
+          let t = TriggerEngine.triggerColumnType(triggerCtx, qualifier: qualifier, name: name) {
+          return t
+        }
+        return table.columnIndex(of: name).map { table.columns[$0].type }
+      },
       scalarSubquery: { _ throws(DBError) in
         throw DBError.sqlUnsupported("subquery in this context")
       })
+  }
+
+  /// The base evaluation env for a write statement's VALUES expressions:
+  /// parameters, plus `new.col`/`old.col` when running inside a trigger body
+  /// (a frame active on the txn's context). Outside a trigger it is exactly a
+  /// parameters-only env, so non-trigger writes are unchanged.
+  static func writeEnv(txn: borrowing WriteTxn, params: SQLParameters) -> SQLEvalEnv {
+    let ctx = txn.ctx
+    guard ctx.triggerFrame != nil else {
+      return SQLEvalEnv.parametersOnly { p throws(DBError) in try params.lookup(p) }
+    }
+    return TriggerEngine.bodyEnv(ctx, params: params)
   }
 }

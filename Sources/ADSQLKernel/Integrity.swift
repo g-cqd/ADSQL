@@ -57,6 +57,19 @@ public enum Integrity {
       for page in report.reachablePages { try claim(page, "index \(name)") }
       relationTreePages += report.reachablePages.count
     }
+    // FTS virtual tables own three B+trees (dictionary / postings / stats); they
+    // hang off the catalog FTS record just like a table/index handle.
+    for name in relationState.ftsRecords.keys.sorted() {
+      let record = relationState.ftsRecords[name]!
+      for (label, handle) in [
+        ("dict", record.dict), ("postings", record.postings), ("stats", record.stats),
+      ] {
+        let report = try BTree.validate(
+          resolver: resolver, tree: handle, verifyChecksums: verifyChecksums)
+        for page in report.reachablePages { try claim(page, "fts \(name).\(label)") }
+        relationTreePages += report.reachablePages.count
+      }
+    }
 
     var freeListed = 0
     for entry in try FreeList.allListedPages(resolver: resolver, tree: meta.freeTree) {

@@ -114,9 +114,9 @@ format) feed M6 but are scheduled within F0/F6, not here.
 | F2 · index build + maintenance | M5 | ✅ done | `feat(fts): F2a/F2b/F2c` — postings codec, self-contained build/maintenance, content modes + 'delete' idiom (segments deferred to F6) |
 | F3 · boolean MATCH | M5 | ✅ done | F3a grammar `feat(fts): F3a` + F3b eval `feat(fts): F3b` + F3c SQL `MATCH` surface `feat(fts): F3c` (`SQLBinaryOp.match`, `AccessPlan.fts`/`RowSource.fts`, FTS-driven join). Differential-vs-CSQLite-FTS5 membership gate **passed** (AND/OR/NOT/prefix/phrase/column over a shared corpus). |
 | F4 · ranking (bm25/bm25f) | M5 | ✅ done | F4a scorer `feat(fts): F4a` (`FTS/FTSScorer.swift` — bm25f over the F2 stats, SQLite's IDF clamped to 1e-6, per-field weights) + F4b surface `feat(fts): F4b` (`rank`/`bm25()` → FTS `rank` score slot, `ORDER BY rank LIMIT k` via the existing bounded top-N). Differential-vs-CSQLite-FTS5 **ordering** gate **passed** (plain `rank`, weighted `bm25()`, OR/AND queries — equal top-k rowid order). Block-max WAND top-k deferred to F6 (ships score-all-matches + bounded top-N). |
-| F5 · triggers | M5 | ⏭ next | — |
-| F6 · apple-docs tables + bench | M5 | ⏳ planned | — |
-| P0 · DSL dep-free core | M7 | 🔒 blocked (F5) | — |
+| F5 · triggers | M5 | ✅ done | F5a parse/catalog `feat(fts): F5a` (`CREATE TRIGGER`/`DROP TRIGGER`, raw-text catalog rows under kind `0x67`, re-parsed on load) + F5b firing `feat(fts): F5b` (`FTS/Trigger.swift` — AFTER INSERT/UPDATE/DELETE FOR EACH ROW, NEW/OLD-bound bodies through the existing INSERT/DELETE/UPDATE executors, fired in `DML.swift` incl. cascade/replace, WHEN gate, name-ordered, recursion-depth guard = 6 — sized below the ~9-level TSan stack ceiling since each level re-enters the full write executor — with the chain rolled back on overflow). The three apple-docs ai/ad/au triggers sync `documents_fts` end-to-end and survive reopen; plain-trigger NEW/OLD verified differential-vs-CSQLite. **AST extension complete → Act II (P0) unblocked.** |
+| F6 · apple-docs tables + bench | M5 | ⏭ next | — |
+| P0 · DSL dep-free core | M7 | ⏳ planned (F5 done) | — |
 | P1 · macro tier (swift-syntax) | M7 | 🔒 blocked (P0) | — |
 | P2 · internal codegen | M7 | 🔒 blocked (P1) | — |
 
