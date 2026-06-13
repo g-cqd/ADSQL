@@ -310,9 +310,9 @@ public struct ReadTxn: ~Copyable {
         }
         switch ref {
         case .inline(let bytes):
-          // bytes is a borrowed view of the mapped page, alive for this scope.
-          result = unsafe .success(
-            try Self.withRawSpan(over: bytes) { (span: RawSpan) throws(DBError) in try body(span) })
+          // `bytes` is already a RawSpan bound to the resolver (BTree.get), so
+          // it hands straight to the body — valid for this scope.
+          result = .success(try body(bytes))
         case .overflow:
           let copied = try BTree.copyValue(ref, resolver: resolver)
           var inner: Result<R, DBError>?

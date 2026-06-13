@@ -3,29 +3,42 @@
 /// mutated in place), so committed pages are never touched and readers on
 /// older generations stay consistent without locks.
 public enum BTree {
-  @safe public enum ValueRef {
-    case inline(UnsafeRawBufferPointer)
+  public enum ValueRef: ~Escapable {
+    case inline(RawSpan)
     case overflow(head: UInt64, length: Int)
 
     public var length: Int {
       switch self {
-      case .inline(let v): return v.count
+      case .inline(let v): return v.byteCount
       case .overflow(_, let length): return length
       }
     }
   }
 
+  /// Re-expresses an inline value pointer as a `RawSpan` whose lifetime is the
+  /// resolver that owns the mapping, so a `~Escapable` `ValueRef.inline` cannot
+  /// outlive the snapshot (Review 0001 F2).
+  @_lifetime(borrow resolver)
+  static func boundInline<R: PageResolver>(
+    _ bytes: UnsafeRawBufferPointer, to resolver: borrowing R
+  ) -> RawSpan {
+    let span = unsafe RawSpan(_unsafeBytes: bytes)
+    return unsafe _overrideLifetime(span, borrowing: resolver)
+  }
+
   // MARK: - Lookup
 
   @inline(__always)
-  public static func get(
-    resolver: some PageResolver, meta: Meta, key: UnsafeRawBufferPointer
+  @_lifetime(borrow resolver)
+  public static func get<R: PageResolver>(
+    resolver: borrowing R, meta: Meta, key: UnsafeRawBufferPointer
   ) throws(DBError) -> ValueRef? {
     unsafe try get(resolver: resolver, tree: meta.mainTree, key: key)
   }
 
-  public static func get(
-    resolver: some PageResolver, tree: TreeHandle, key: UnsafeRawBufferPointer
+  @_lifetime(borrow resolver)
+  public static func get<R: PageResolver>(
+    resolver: borrowing R, tree: TreeHandle, key: UnsafeRawBufferPointer
   ) throws(DBError) -> ValueRef? {
     guard tree.rootPage != 0 else { return nil }
     var pageNo = tree.rootPage
@@ -45,7 +58,9 @@ public enum BTree {
     let (index, exact) = unsafe Node.search(leaf, key: key)
     guard exact else { return nil }
     let cell = unsafe Node.leafCell(leaf, index)
-    if let inline = unsafe cell.inlineValue { return unsafe .inline(inline) }
+    if let inline = unsafe cell.inlineValue {
+      return unsafe .inline(boundInline(inline, to: resolver))
+    }
     return .overflow(head: cell.overflowHead, length: Int(cell.overflowLength))
   }
 
@@ -56,7 +71,7 @@ public enum BTree {
   ) throws(DBError) -> [UInt8] {
     switch ref {
     case .inline(let bytes):
-      return unsafe [UInt8](bytes)
+      return bytes.withUnsafeBytes { unsafe [UInt8]($0) }
     case .overflow(let head, let length):
       return try Overflow.read(
         head: head, length: length, pager: ReadOnlyOverflowPager(resolver: resolver))
@@ -72,7 +87,7 @@ public enum BTree {
   ) throws(DBError) -> R {
     switch ref {
     case .inline(let bytes):
-      return unsafe try body(bytes)
+      return try bytes.withUnsafeBytes { (raw) throws(DBError) in unsafe try body(raw) }
     case .overflow(let head, let length):
       let assembled = try Overflow.read(
         head: head, length: length, pager: ReadOnlyOverflowPager(resolver: resolver))
@@ -262,7 +277,7 @@ public enum BTree {
     for i in unsafe 0..<PageHeader.cellCount(page) {
       let cell = unsafe Node.leafCell(page, i)
       if let inline = unsafe cell.inlineValue {
-        unsafe try body(cell.key, .inline(inline))
+        unsafe try body(cell.key, .inline(boundInline(inline, to: resolver)))
       } else {
         unsafe try body(cell.key, .overflow(head: cell.overflowHead, length: Int(cell.overflowLength)))
       }

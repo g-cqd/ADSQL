@@ -128,7 +128,8 @@ public enum FreeList {
         guard case .inline(let value) = ref else {
           throw DBError.integrityFailure("free entry value must be inline")
         }
-        return unsafe (key: [UInt8](key), pages: try decodePages(value))
+        let pages = try value.withUnsafeBytes { (raw) throws(DBError) in unsafe try decodePages(raw) }
+        return unsafe (key: [UInt8](key), pages: pages)
       } ?? nil
       guard let result else { break }
 
@@ -247,7 +248,8 @@ public enum FreeList {
       guard case .inline(let value) = ref else {
         throw DBError.integrityFailure("free entry value must be inline")
       }
-      for page in unsafe try decodePages(value) {
+      let pages = try value.withUnsafeBytes { (raw) throws(DBError) in unsafe try decodePages(raw) }
+      for page in pages {
         listed.append((gen: decoded.gen, page: page))
       }
     }

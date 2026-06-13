@@ -165,7 +165,7 @@ enum Relation {
           // Catalog records are small; an overflow value means corruption.
           throw DBError.integrityFailure("catalog record \(name) not inline")
         }
-        unsafe try body(name, valueBytes)
+        try valueBytes.withUnsafeBytes { (raw) throws(DBError) in unsafe try body(name, raw) }
         return true
       }
       guard proceed == true else { break }

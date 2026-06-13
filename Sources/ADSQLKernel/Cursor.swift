@@ -132,14 +132,15 @@ public struct Cursor<R: PageResolver>: ~Copyable {
 
   /// Scoped zero-copy access to the current entry.
   public mutating func withCurrent<T>(
-    _ body: (UnsafeRawBufferPointer, BTree.ValueRef) throws(DBError) -> T
+    _ body: (UnsafeRawBufferPointer, borrowing BTree.ValueRef) throws(DBError) -> T
   ) throws(DBError) -> T? {
     guard isValid else { return nil }
+    let resolver = self.resolver
     let (leafNo, index) = stack[stack.count - 1]
     let leaf = unsafe try resolver.resolvePage(leafNo)
     let cell = unsafe Node.leafCell(leaf, index)
     if let inline = unsafe cell.inlineValue {
-      return unsafe try body(cell.key, .inline(inline))
+      return unsafe try body(cell.key, .inline(BTree.boundInline(inline, to: resolver)))
     }
     return unsafe try body(
       cell.key, .overflow(head: cell.overflowHead, length: Int(cell.overflowLength)))
@@ -149,11 +150,14 @@ public struct Cursor<R: PageResolver>: ~Copyable {
     unsafe try withCurrent { key, _ in unsafe [UInt8](key) }
   }
 
-  /// Materializes the current value (streams overflow chains).
+  /// Materializes the current value (streams overflow chains). The value ref
+  /// is `~Escapable`, so it is consumed inside the access scope rather than
+  /// returned out of it.
   public mutating func currentValue() throws(DBError) -> [UInt8]? {
-    let ref: BTree.ValueRef? = unsafe try withCurrent { _, ref in ref }
-    guard let ref else { return nil }
-    return try BTree.copyValue(ref, resolver: resolver)
+    let resolver = self.resolver
+    return unsafe try withCurrent { (_, ref) throws(DBError) in
+      try BTree.copyValue(ref, resolver: resolver)
+    }
   }
 
   // MARK: - Internals
