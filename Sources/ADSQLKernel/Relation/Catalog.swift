@@ -6,6 +6,8 @@
 ///   00 74 <tableName>      → TableRecord
 ///   00 69 <indexName>      → IndexRecord
 ///   00 71 <tableId u32 BE> → AUTOINCREMENT high-water u64 LE
+///   00 66 <ftsName>        → FTSRecord
+///   00 67 <triggerName>    → raw CREATE TRIGGER SQL text (UTF-8; re-parsed)
 ///
 /// Tree roots move on every COW commit, so records embed their TreeHandle
 /// and `Relation.serializeState` rewrites changed records at commit time.
@@ -16,6 +18,7 @@ enum Catalog {
   static let kindIndex: UInt8 = 0x69 // 'i'
   static let kindSequence: UInt8 = 0x71 // 'q'
   static let kindFTS: UInt8 = 0x66 // 'f' — FTS virtual-table record (M5/F0)
+  static let kindTrigger: UInt8 = 0x67 // 'g' — CREATE TRIGGER text (M5/F5)
 
   // MARK: - Keys
 
@@ -37,6 +40,10 @@ enum Catalog {
 
   static func ftsKey(_ name: String) -> [UInt8] {
     [prefix, kindFTS] + Array(name.utf8)
+  }
+
+  static func triggerKey(_ name: String) -> [UInt8] {
+    [prefix, kindTrigger] + Array(name.utf8)
   }
 
   /// (lower, upper) bounds for scanning all keys of one kind.

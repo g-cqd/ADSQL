@@ -50,6 +50,9 @@ enum SQLLexer {
     "NATURAL", "RIGHT", "FULL", "USING", "GLOB", "REGEXP", "WITHOUT",
     "HAVING", "ESCAPE", "PRAGMA", "VACUUM", "EXPLAIN", "ALTER", "VIRTUAL",
     "TRIGGER", "VIEW", "ADD", "COLUMN", "RENAME", "TO",
+    // CREATE TRIGGER grammar (M5/F5). Non-reserved in SQLite, so the parser
+    // also lists them in `identifierKeywords` to keep them usable as names.
+    "AFTER", "BEFORE", "INSTEAD", "FOR", "EACH", "ROW", "OF",
   ]
 
   static func tokenize(_ sql: String) throws(DBError) -> [SQLToken] {

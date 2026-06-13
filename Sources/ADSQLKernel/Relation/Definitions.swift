@@ -237,16 +237,63 @@ public struct FTSDefinition: Equatable, Sendable {
   }
 }
 
+// MARK: - Triggers
+
+/// The row event a trigger fires on (M5/F5). `BEFORE` and `INSTEAD OF` are
+/// unsupported — only `AFTER` row triggers, which is all apple-docs's FTS-sync
+/// DDL uses.
+public enum TriggerEvent: UInt8, Equatable, Sendable {
+  case insert = 1
+  case update = 2
+  case delete = 3
+}
+
+/// A parsed `CREATE TRIGGER … AFTER <event> ON <table> FOR EACH ROW [WHEN …]
+/// BEGIN <stmt>; … END`. The body is a list of INSERT/DELETE/UPDATE statements
+/// evaluated with `NEW`/`OLD` bound to the affected row; `whenExpr`, when
+/// present, gates firing. The original `sql` text is retained verbatim — it is
+/// what the catalog stores, and the body re-parses from it on load (mirroring
+/// SQLite's `sqlite_schema`), so the body AST never has to be serialized.
+public struct TriggerDefinition: Equatable, Sendable {
+  public var name: String
+  public var table: String
+  public var event: TriggerEvent
+  public var whenExpr: SQLExpr?
+  public var body: [SQLStatementAST]
+  public var sql: String
+
+  public init(
+    name: String, table: String, event: TriggerEvent, whenExpr: SQLExpr? = nil,
+    body: [SQLStatementAST], sql: String
+  ) {
+    self.name = name
+    self.table = table
+    self.event = event
+    self.whenExpr = whenExpr
+    self.body = body
+    self.sql = sql
+  }
+}
+
 /// An immutable schema snapshot (per committed generation).
 public struct Schema: Sendable {
   public var catalogVersion: UInt64
   public var tables: [String: TableDefinition]
   public var indexes: [String: IndexDefinition]
   public var ftsTables: [String: FTSDefinition]
+  public var triggers: [String: TriggerDefinition]
 
   /// Indexes of one table, name-sorted for deterministic maintenance order.
   public func indexes(on table: String) -> [IndexDefinition] {
     indexes.values.filter { $0.table == table }.sorted { $0.name < $1.name }
+  }
+
+  /// Triggers on `table` for `event`, name-sorted so firing order is
+  /// deterministic (SQLite fires same-event triggers in name order).
+  public func triggers(on table: String, event: TriggerEvent) -> [TriggerDefinition] {
+    triggers.values
+      .filter { $0.table == table && $0.event == event }
+      .sorted { $0.name < $1.name }
   }
 }
 

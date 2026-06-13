@@ -180,6 +180,16 @@ public struct SQLCreateVirtualTable: Equatable, Sendable {
   public var ifNotExists: Bool
 }
 
+/// `CREATE TRIGGER … AFTER INSERT/UPDATE/DELETE ON <table> …`. The parsed
+/// `TriggerDefinition` (name, table, event, optional WHEN, body statements) is
+/// carried alongside the original SQL text, which is what the catalog stores —
+/// the body re-parses on load (like SQLite's `sqlite_schema`). `DROP TRIGGER`
+/// removes it.
+public struct SQLCreateTrigger: Equatable, Sendable {
+  public var definition: TriggerDefinition
+  public var ifNotExists: Bool
+}
+
 // MARK: - Statements
 
 public enum SQLStatementAST: Equatable, Sendable {
@@ -190,8 +200,10 @@ public enum SQLStatementAST: Equatable, Sendable {
   case createTable(SQLCreateTable)
   case createVirtualTable(SQLCreateVirtualTable)
   case createIndex(SQLCreateIndex)
+  case createTrigger(SQLCreateTrigger)
   case dropTable(name: String, ifExists: Bool)
   case dropIndex(name: String, ifExists: Bool)
+  case dropTrigger(name: String, ifExists: Bool)
   /// `PRAGMA name` / `PRAGMA name = value` / `PRAGMA name(value)`. ADSQL
   /// accepts these for compatibility; most are no-ops (durability is governed
   /// by DatabaseOptions, not journal/synchronous pragmas).

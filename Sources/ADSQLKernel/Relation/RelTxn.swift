@@ -385,4 +385,13 @@ extension WriteTxn {
   public func dropIndex(_ name: String) throws(DBError) {
     try Relation.dropIndex(ctx, name: name)
   }
+
+  /// Registers a row trigger (M5/F5); its body fires in the DML path.
+  public func createTrigger(_ definition: TriggerDefinition) throws(DBError) {
+    try Relation.createTrigger(ctx, definition)
+  }
+
+  public func dropTrigger(_ name: String) throws(DBError) {
+    try Relation.dropTrigger(ctx, name: name)
+  }
 }

@@ -23,11 +23,17 @@ enum Writer {
     case .createIndex(let create):
       try createIndex(create, txn: txn)
       return ([], RunResult())
+    case .createTrigger(let create):
+      try createTrigger(create, txn: txn)
+      return ([], RunResult())
     case .dropTable(let name, let ifExists):
       try dropTable(name, ifExists: ifExists, txn: txn)
       return ([], RunResult())
     case .dropIndex(let name, let ifExists):
       try dropIndex(name, ifExists: ifExists, txn: txn)
+      return ([], RunResult())
+    case .dropTrigger(let name, let ifExists):
+      try dropTrigger(name, ifExists: ifExists, txn: txn)
       return ([], RunResult())
     case .select, .pragma, .begin, .commit, .rollback:
       throw DBError.sqlUnsupported("not a write statement")
@@ -63,6 +69,24 @@ enum Writer {
       throw DBError.invalidDefinition("index \(create.definition.name) already exists")
     }
     try txn.createIndex(create.definition)
+  }
+
+  static func createTrigger(
+    _ create: SQLCreateTrigger, txn: borrowing WriteTxn
+  ) throws(DBError) {
+    if try txn.schema().triggers[create.definition.name] != nil {
+      if create.ifNotExists { return }
+      throw DBError.triggerExists(create.definition.name)
+    }
+    try txn.createTrigger(create.definition)
+  }
+
+  static func dropTrigger(_ name: String, ifExists: Bool, txn: borrowing WriteTxn) throws(DBError) {
+    if try txn.schema().triggers[name] == nil {
+      if ifExists { return }
+      throw DBError.noSuchTrigger(name)
+    }
+    try txn.dropTrigger(name)
   }
 
   static func dropTable(_ name: String, ifExists: Bool, txn: borrowing WriteTxn) throws(DBError) {

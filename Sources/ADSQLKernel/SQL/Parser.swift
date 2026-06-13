@@ -103,7 +103,12 @@ struct SQLParser {
   }
 
   /// Keywords we tokenize but allow as plain identifiers in name position.
-  let identifierKeywords: Set<String> = ["KEY", "MATCH", "REPLACE", "DO", "COLUMN", "ADD", "TO"]
+  /// The trigger-grammar words (AFTER/BEFORE/…) are non-reserved in SQLite, so
+  /// they stay usable as table/column names outside a CREATE TRIGGER header.
+  let identifierKeywords: Set<String> = [
+    "KEY", "MATCH", "REPLACE", "DO", "COLUMN", "ADD", "TO",
+    "AFTER", "BEFORE", "INSTEAD", "FOR", "EACH", "ROW", "OF",
+  ]
 
   func sourceText(from startOffset: Int, to endOffset: Int) -> String {
     var lo = startOffset
@@ -133,7 +138,7 @@ struct SQLParser {
     }
     if matchKeyword("UPDATE") { return .update(try update(offset: offset)) }
     if matchKeyword("DELETE") { return .delete(try delete(offset: offset)) }
-    if matchKeyword("CREATE") { return try create() }
+    if matchKeyword("CREATE") { return try create(startOffset: offset) }
     if matchKeyword("DROP") { return try drop() }
     if matchKeyword("BEGIN") {
       _ = matchKeyword("IMMEDIATE") || matchKeyword("DEFERRED") || matchKeyword("EXCLUSIVE")
@@ -423,9 +428,9 @@ struct SQLParser {
 
   // MARK: DDL
 
-  mutating func create() throws(DBError) -> SQLStatementAST {
+  mutating func create(startOffset: Int) throws(DBError) -> SQLStatementAST {
     if matchKeyword("VIRTUAL") { return try createVirtualTable() }
-    if checkKeyword("TRIGGER") { throw DBError.sqlUnsupported("CREATE TRIGGER") }
+    if matchKeyword("TRIGGER") { return try createTrigger(startOffset: startOffset) }
     if checkKeyword("VIEW") { throw DBError.sqlUnsupported("CREATE VIEW") }
     let unique = matchKeyword("UNIQUE")
     if matchKeyword("INDEX") {
@@ -535,6 +540,78 @@ struct SQLParser {
         name: name, columns: columns, tokenize: tokenize, content: content,
         prefix: prefix, detail: detail, columnSize: columnSize),
       ifNotExists: ifNotExists))
+  }
+
+  /// `CREATE TRIGGER [IF NOT EXISTS] <name> AFTER (INSERT|UPDATE|DELETE) ON
+  /// <table> [FOR EACH ROW] [WHEN <expr>] BEGIN <stmt>; … END`. "TRIGGER" is
+  /// already consumed; `startOffset` is the offset of the `CREATE` keyword so
+  /// the whole statement text can be captured verbatim for the catalog.
+  ///
+  /// Only `AFTER` row triggers are supported (BEFORE/INSTEAD OF → unsupported);
+  /// `FOR EACH ROW` is accepted and is also the default (FTS-sync triggers are
+  /// all row triggers). The body is a list of INSERT/DELETE/UPDATE statements.
+  mutating func createTrigger(startOffset: Int) throws(DBError) -> SQLStatementAST {
+    let ifNotExists = try ifNotExistsClause()
+    let name = try identifier("trigger name")
+    if matchKeyword("BEFORE") { throw DBError.sqlUnsupported("BEFORE triggers") }
+    if matchKeyword("INSTEAD") { throw DBError.sqlUnsupported("INSTEAD OF triggers") }
+    _ = matchKeyword("AFTER")
+    let event: TriggerEvent
+    if matchKeyword("INSERT") {
+      event = .insert
+    } else if matchKeyword("UPDATE") {
+      // `UPDATE OF col, …` narrows the columns; unsupported (apple-docs fires on
+      // any column change). Reject explicitly rather than silently widening.
+      if matchKeyword("OF") { throw DBError.sqlUnsupported("UPDATE OF <columns> triggers") }
+      event = .update
+    } else if matchKeyword("DELETE") {
+      event = .delete
+    } else {
+      throw DBError.sqlSyntax(
+        message: "expected INSERT, UPDATE, or DELETE", offset: current.offset)
+    }
+    try expectKeyword("ON")
+    let table = try identifier("table name")
+    if matchKeyword("FOR") {
+      try expectKeyword("EACH")
+      try expectKeyword("ROW")
+    }
+    let whenExpr = matchKeyword("WHEN") ? try expression() : nil
+
+    try expectKeyword("BEGIN")
+    var body: [SQLStatementAST] = []
+    while !checkKeyword("END") {
+      body.append(try triggerBodyStatement())
+      // Each body statement is terminated by `;` (SQLite requires it); the last
+      // one before END must be terminated too.
+      try expectSymbol(";")
+    }
+    guard !body.isEmpty else {
+      throw DBError.sqlSyntax(message: "trigger body has no statements", offset: current.offset)
+    }
+    guard checkKeyword("END") else {
+      throw DBError.sqlSyntax(message: "expected END", offset: current.offset)
+    }
+    let endOffset = current.offset + 3 // "END" is 3 bytes regardless of case
+    _ = advance() // consume END
+
+    let sql = sourceText(from: startOffset, to: endOffset)
+    return .createTrigger(SQLCreateTrigger(
+      definition: TriggerDefinition(
+        name: name, table: table, event: event, whenExpr: whenExpr, body: body, sql: sql),
+      ifNotExists: ifNotExists))
+  }
+
+  /// One statement inside a trigger body: INSERT / DELETE / UPDATE (the row
+  /// actions apple-docs's FTS-sync triggers use). SELECT and nested DDL are
+  /// rejected — a trigger body mutates, it does not query or define.
+  mutating func triggerBodyStatement() throws(DBError) -> SQLStatementAST {
+    let offset = current.offset
+    if matchKeyword("INSERT") { return .insert(try insert(offset: offset, replaceForm: false)) }
+    if matchKeyword("REPLACE") { return .insert(try insert(offset: offset, replaceForm: true)) }
+    if matchKeyword("UPDATE") { return .update(try update(offset: offset)) }
+    if matchKeyword("DELETE") { return .delete(try delete(offset: offset)) }
+    throw DBError.sqlUnsupported("trigger body statement (only INSERT/UPDATE/DELETE)")
   }
 
   /// One fts5 option value, stringified (`'quoted'`, identifier, or integer).
@@ -757,7 +834,11 @@ struct SQLParser {
       let ifExists = try ifExistsClause()
       return .dropIndex(name: try identifier("index name"), ifExists: ifExists)
     }
-    throw DBError.sqlSyntax(message: "expected TABLE or INDEX", offset: current.offset)
+    if matchKeyword("TRIGGER") {
+      let ifExists = try ifExistsClause()
+      return .dropTrigger(name: try identifier("trigger name"), ifExists: ifExists)
+    }
+    throw DBError.sqlSyntax(message: "expected TABLE, INDEX, or TRIGGER", offset: current.offset)
   }
 
   mutating func ifExistsClause() throws(DBError) -> Bool {
