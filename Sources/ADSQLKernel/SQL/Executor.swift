@@ -595,6 +595,54 @@ enum SelectExecutor {
     return (value, bound.inclusive)
   }
 
+  // MARK: - Compounds (UNION / UNION ALL)
+
+  /// First-occurrence dedup of complete result rows under per-column
+  /// collations (UNION semantics), via the canonical group key.
+  static func distinctRows(_ rows: [[Value]], collations: [Collation]) -> [[Value]] {
+    var seen = Set<GroupKey>()
+    var out: [[Value]] = []
+    out.reserveCapacity(rows.count)
+    for row in rows where seen.insert(GroupKey(row, collations: collations)).inserted {
+      out.append(row)
+    }
+    return out
+  }
+
+  /// Applies a compound's ORDER BY (by result-column index) and LIMIT/OFFSET
+  /// to the combined rows, then wraps them with the shared header.
+  static func finishCompound(
+    _ rows: [[Value]], compound: BoundCompound, params: SQLParameters
+  ) throws(DBError) -> [SQLRow] {
+    var result = rows
+    if !compound.order.isEmpty {
+      let terms = compound.order
+      let permutation = result.indices.sorted { lhs, rhs in
+        for term in terms {
+          let comparison = orderCompare(result[lhs][term.index], result[rhs][term.index], term.collation)
+          if comparison != 0 { return term.descending ? comparison > 0 : comparison < 0 }
+        }
+        return lhs < rhs
+      }
+      result = permutation.map { result[$0] }
+    }
+    if compound.limit != nil || compound.offset != nil {
+      let env = SQLEvalEnv.parametersOnly { p throws(DBError) in try params.lookup(p) }
+      var offset = 0
+      if let offsetExpr = compound.offset, let value = try boundValue(offsetExpr, env), value > 0 {
+        offset = Int(clamping: value)
+      }
+      var limit: Int?
+      if let limitExpr = compound.limit, let value = try boundValue(limitExpr, env), value >= 0 {
+        limit = Int(clamping: value)
+      }
+      let lower = min(offset, result.count)
+      let upper = limit.map { min(lower + $0, result.count) } ?? result.count
+      result = Array(result[lower..<upper])
+    }
+    return result.map { SQLRow(header: compound.header, values: $0) }
+  }
+
   // MARK: - Evaluation environment
 
   /// The live row for each table in a query, with per-table null-extension for

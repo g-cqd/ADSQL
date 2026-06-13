@@ -117,11 +117,101 @@ struct BoundSelect: Sendable {
   var isJoin: Bool { !joins.isEmpty }
 }
 
+/// A prepared query: a single SELECT or a UNION/UNION ALL of SELECT arms.
+enum BoundQuery: Sendable {
+  case select(BoundSelect)
+  case compound(BoundCompound)
+}
+
+/// A left-associative compound: arms combined in order (the first arm's op is
+/// nil), then a compound-level ORDER BY/LIMIT/OFFSET resolved against the
+/// first arm's result columns.
+struct BoundCompound: Sendable {
+  struct Arm: Sendable {
+    let op: SQLCompoundOp?
+    let select: BoundSelect
+  }
+  struct CompoundOrder: Sendable {
+    let index: Int          // result-column index
+    let descending: Bool
+    let collation: Collation
+  }
+  let arms: [Arm]
+  let header: SQLColumnHeader
+  let outputCollations: [Collation]
+  let order: [CompoundOrder]
+  let limit: SQLExpr?
+  let offset: SQLExpr?
+}
+
 enum Binder {
-  static func bindSelect(_ select: SQLSelect, schema: Schema) throws(DBError) -> BoundSelect {
-    guard select.compounds.isEmpty else {
-      throw DBError.sqlUnsupported("UNION/compound SELECT (arrives in a later slice)")
+  /// Binds a top-level query: a single SELECT or a compound. The trailing
+  /// ORDER BY/LIMIT/OFFSET on a compound belong to the whole result, so the
+  /// first arm is bound without them.
+  static func bindQuery(_ select: SQLSelect, schema: Schema) throws(DBError) -> BoundQuery {
+    guard !select.compounds.isEmpty else {
+      return .select(try bindSelect(select, schema: schema))
     }
+    var firstArm = select
+    firstArm.compounds = []
+    firstArm.orderBy = []
+    firstArm.limit = nil
+    firstArm.offset = nil
+    var arms: [BoundCompound.Arm] = [
+      BoundCompound.Arm(op: nil, select: try bindSelect(firstArm, schema: schema))
+    ]
+    for compound in select.compounds {
+      arms.append(
+        BoundCompound.Arm(op: compound.op, select: try bindSelect(compound.select, schema: schema)))
+    }
+    let width = arms[0].select.outputs.count
+    for arm in arms where arm.select.outputs.count != width {
+      throw DBError.sqlBind("SELECTs to the left and right of a compound have different column counts")
+    }
+    let first = arms[0].select
+    var order: [BoundCompound.CompoundOrder] = []
+    for term in select.orderBy {
+      order.append(
+        try resolveCompoundOrder(term, outputs: first.outputs, collations: first.outputCollations))
+    }
+    return .compound(
+      BoundCompound(
+        arms: arms, header: first.header, outputCollations: first.outputCollations,
+        order: order, limit: select.limit, offset: select.offset))
+  }
+
+  /// A compound ORDER BY term references a result column by 1-based position
+  /// or by name (SQLite restriction).
+  private static func resolveCompoundOrder(
+    _ term: SQLOrderingTerm, outputs: [BoundOutput], collations: [Collation]
+  ) throws(DBError) -> BoundCompound.CompoundOrder {
+    var expr = term.expr
+    var explicit: Collation?
+    if case .collate(let inner, let collation) = expr {
+      expr = inner
+      explicit = collation
+    }
+    let index: Int
+    switch expr {
+    case .literal(.integer(let position)):
+      guard position >= 1, position <= outputs.count else {
+        throw DBError.sqlBind("ORDER BY position \(position) is out of range")
+      }
+      index = Int(position) - 1
+    case .column(nil, let name, _):
+      guard let match = outputs.firstIndex(where: { $0.name.lowercased() == name.lowercased() })
+      else {
+        throw DBError.sqlBind("ORDER BY \(name) is not a column of the compound result")
+      }
+      index = match
+    default:
+      throw DBError.sqlUnsupported("compound ORDER BY must name a result column or position")
+    }
+    return BoundCompound.CompoundOrder(
+      index: index, descending: term.descending, collation: explicit ?? collations[index])
+  }
+
+  static func bindSelect(_ select: SQLSelect, schema: Schema) throws(DBError) -> BoundSelect {
     guard let from = select.from else {
       throw DBError.sqlUnsupported("SELECT without FROM (arrives in a later slice)")
     }

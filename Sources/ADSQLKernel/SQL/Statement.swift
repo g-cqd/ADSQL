@@ -85,7 +85,7 @@ public final class Statement: Sendable {
 
   private struct CachedPlan: Sendable {
     let catalogVersion: UInt64
-    let plan: BoundSelect
+    let query: BoundQuery
   }
   private let cachedPlan = Mutex<CachedPlan?>(nil)
 
@@ -145,15 +145,36 @@ public final class Statement: Sendable {
       throw DBError.sqlUnsupported("statement does not return rows")
     }
     return try database.read { txn throws(DBError) in
-      let schema = try txn.schema()
-      let plan = try self.boundSelect(select, schema: schema)
-      var tables: [Catalog.TableRecord] = []
-      for binding in plan.binding.tables { tables.append(try txn.tableRecord(binding.table)) }
-      var index: Catalog.IndexRecord?
-      if let name = plan.access.indexName { index = try txn.indexRecord(name) }
-      return try SelectExecutor.run(
-        plan, tables: tables, index: index, resolver: txn.resolver, params: parameters)
+      switch try self.boundQuery(select, schema: try txn.schema()) {
+      case .select(let plan):
+        return try Self.runSelect(plan, txn: txn, params: parameters)
+      case .compound(let compound):
+        var combined: [[Value]] = []
+        for (position, arm) in compound.arms.enumerated() {
+          let armRows = try Self.runSelect(arm.select, txn: txn, params: parameters).map(\.values)
+          if position == 0 {
+            combined = armRows
+          } else if arm.op == .unionAll {
+            combined += armRows
+          } else {
+            combined = SelectExecutor.distinctRows(
+              combined + armRows, collations: compound.outputCollations)
+          }
+        }
+        return try SelectExecutor.finishCompound(combined, compound: compound, params: parameters)
+      }
     }
+  }
+
+  private static func runSelect(
+    _ plan: BoundSelect, txn: borrowing ReadTxn, params: SQLParameters
+  ) throws(DBError) -> [SQLRow] {
+    var tables: [Catalog.TableRecord] = []
+    for binding in plan.binding.tables { tables.append(try txn.tableRecord(binding.table)) }
+    var index: Catalog.IndexRecord?
+    if let name = plan.access.indexName { index = try txn.indexRecord(name) }
+    return try SelectExecutor.run(
+      plan, tables: tables, index: index, resolver: txn.resolver, params: params)
   }
 
   /// The chosen access path, SQLite-EXPLAIN-shaped (for planner assertions).
@@ -162,22 +183,26 @@ public final class Statement: Sendable {
       throw DBError.sqlUnsupported("statement does not return rows")
     }
     return try database.read { txn throws(DBError) in
-      let plan = try self.boundSelect(select, schema: try txn.schema())
-      return plan.access.describe(table: plan.source.table)
+      switch try self.boundQuery(select, schema: try txn.schema()) {
+      case .select(let plan):
+        return plan.access.describe(table: plan.source.table)
+      case .compound(let compound):
+        return "COMPOUND (\(compound.arms.count) SELECT)"
+      }
     }
   }
 
-  private func boundSelect(_ select: SQLSelect, schema: Schema) throws(DBError) -> BoundSelect {
+  private func boundQuery(_ select: SQLSelect, schema: Schema) throws(DBError) -> BoundQuery {
     if let cached = cachedPlan.withLock({ $0 }), cached.catalogVersion == schema.catalogVersion {
-      return cached.plan
+      return cached.query
     }
-    let plan = try Binder.bindSelect(select, schema: schema)
+    let query = try Binder.bindQuery(select, schema: schema)
     cachedPlan.withLock { existing in
       if existing == nil || existing!.catalogVersion <= schema.catalogVersion {
-        existing = CachedPlan(catalogVersion: schema.catalogVersion, plan: plan)
+        existing = CachedPlan(catalogVersion: schema.catalogVersion, query: query)
       }
     }
-    return plan
+    return query
   }
 }
 
