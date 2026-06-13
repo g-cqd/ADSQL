@@ -40,12 +40,37 @@ final class SQLiteMirror {
   }
 
   func query(_ sql: String, _ params: [Value] = []) throws -> [[Value]] {
+    try query(sql) { stmt in bind(stmt, params) }
+  }
+
+  /// Runs `sql` binding `$name` parameters by name.
+  func query(_ sql: String, named: [String: Value]) throws -> [[Value]] {
+    let transient = self.transient
+    return try query(sql) { stmt in
+      for (name, value) in named {
+        let index = sqlite3_bind_parameter_index(stmt, "$\(name)")
+        guard index > 0 else { continue }
+        switch value {
+        case .null: sqlite3_bind_null(stmt, index)
+        case .integer(let v): sqlite3_bind_int64(stmt, index, v)
+        case .real(let d): sqlite3_bind_double(stmt, index, d)
+        case .text(let s): sqlite3_bind_text(stmt, index, s, -1, transient)
+        case .blob(let b):
+          b.withUnsafeBytes {
+            _ = sqlite3_bind_blob(stmt, index, $0.baseAddress, Int32(b.count), transient)
+          }
+        }
+      }
+    }
+  }
+
+  private func query(_ sql: String, _ binder: (OpaquePointer?) -> Void) throws -> [[Value]] {
     var stmt: OpaquePointer?
     guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
       throw DBError.sqlRuntime("sqlite prepare: \(String(cString: sqlite3_errmsg(db)))")
     }
     defer { sqlite3_finalize(stmt) }
-    bind(stmt, params)
+    binder(stmt)
     var rows: [[Value]] = []
     while sqlite3_step(stmt) == SQLITE_ROW {
       let columns = sqlite3_column_count(stmt)

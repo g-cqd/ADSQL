@@ -111,6 +111,34 @@ struct SQLInsertTests {
     #expect(try InsertFixture.state(db) == InsertFixture.state(mirror))
   }
 
+  @Test func transactionBatchesAndRollsBack() throws {
+    let dir = TempDir()
+    defer { dir.cleanup() }
+    let (db, _) = try InsertFixture.make(dir, "txn.adsql")
+    defer { db.close() }
+
+    let baseGeneration = db.generation
+    try db.transaction { (tx) throws(DBError) in
+      for i in 1...100 { try tx.run("INSERT INTO items(id, key) VALUES(\(i), 'k\(i)')") }
+    }
+    // 100 inserts committed as one transaction (one generation bump).
+    #expect(try db.prepare("SELECT COUNT(*) FROM items").all()[0].values == [.integer(100)])
+    #expect(db.generation == baseGeneration + 1)
+
+    struct Sentinel: Error {}
+    let beforeRollback = db.generation
+    #expect(throws: (any Error).self) {
+      try db.transaction { (tx) throws(DBError) in
+        try tx.run("INSERT INTO items(id, key) VALUES(200, 'x')")
+        throw DBError.sqlRuntime("abort the batch")
+      }
+    }
+    // A throw rolls the whole batch back: no row 200, no generation change.
+    #expect(try db.prepare("SELECT COUNT(*) FROM items WHERE id = 200").all()[0].values == [.integer(0)])
+    #expect(db.generation == beforeRollback)
+    _ = try db.verifyIntegrity(deep: true)
+  }
+
   @Test func insertConflictAbortThrows() throws {
     let dir = TempDir()
     defer { dir.cleanup() }

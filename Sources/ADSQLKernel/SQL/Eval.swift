@@ -42,11 +42,9 @@ enum SQLCompare {
     case (.real(let d), .integer(let i)):
       return intFloatCompare(i, d).map { -$0 }
     case (.text(let x), .text(let y)):
-      let xb = Array(x.utf8)
-      let yb = Array(y.utf8)
-      return bytesCompare(
-        collation == .nocase ? KeyCodec.asciiFolded(xb) : xb,
-        collation == .nocase ? KeyCodec.asciiFolded(yb) : yb)
+      // Compare the UTF-8 views directly — no per-comparison Array allocation,
+      // which dominated text-heavy ORDER BY sorts.
+      return collation == .nocase ? compareUTF8NoCase(x, y) : compareUTF8(x, y)
     case (.blob(let x), .blob(let y)):
       return bytesCompare(x, y)
     default:
@@ -68,6 +66,42 @@ enum SQLCompare {
     if fraction > 0 { return -1 }
     if fraction < 0 { return 1 }
     return 0
+  }
+
+  /// Byte-order (SQLite BINARY) comparison of two strings' UTF-8, allocation
+  /// free. UTF-8 byte order equals Unicode scalar order, so this matches
+  /// SQLite's memcmp on stored UTF-8.
+  static func compareUTF8(_ a: String, _ b: String) -> Int {
+    var lhs = a.utf8.makeIterator()
+    var rhs = b.utf8.makeIterator()
+    while true {
+      switch (lhs.next(), rhs.next()) {
+      case (nil, nil): return 0
+      case (nil, _): return -1
+      case (_, nil): return 1
+      case (.some(let x), .some(let y)) where x != y: return x < y ? -1 : 1
+      default: continue
+      }
+    }
+  }
+
+  /// NOCASE comparison: ASCII A–Z folded to lowercase per byte (matching
+  /// SQLite's NOCASE), allocation free.
+  static func compareUTF8NoCase(_ a: String, _ b: String) -> Int {
+    func fold(_ c: UInt8) -> UInt8 { (c >= 0x41 && c <= 0x5A) ? c &+ 0x20 : c }
+    var lhs = a.utf8.makeIterator()
+    var rhs = b.utf8.makeIterator()
+    while true {
+      switch (lhs.next(), rhs.next()) {
+      case (nil, nil): return 0
+      case (nil, _): return -1
+      case (_, nil): return 1
+      case (.some(let x), .some(let y)):
+        let fx = fold(x)
+        let fy = fold(y)
+        if fx != fy { return fx < fy ? -1 : 1 }
+      }
+    }
   }
 
   static func bytesCompare(_ a: [UInt8], _ b: [UInt8]) -> Int {

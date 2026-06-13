@@ -261,12 +261,6 @@ struct StatementCache {
 extension Database {
   /// Parses `sql` (reusing the parse cache) into a reusable `Statement`.
   public func prepare(_ sql: String) throws(DBError) -> Statement {
-    if let parsed = statementCache.withLock({ $0.get(sql) }) {
-      return Statement(database: self, sql: sql, parsed: parsed)
-    }
-    let ast = try SQLParser.parseOne(sql)
-    let parsed = ParsedStatement(ast: ast, isReadOnly: ast.isReadOnly)
-    statementCache.withLock { $0.insert(sql, parsed) }
-    return Statement(database: self, sql: sql, parsed: parsed)
+    Statement(database: self, sql: sql, parsed: try parsedStatement(sql))
   }
 }

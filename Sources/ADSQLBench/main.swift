@@ -58,6 +58,8 @@ do {
         try Scenarios.upserts(engine, dir: dir, config: config)
       case "table":
         try TableScenario.run(engine, dir: dir, config: config)
+      case "sql":
+        try SQLScenario.run(engine, dir: dir, config: config)
       default:
         print("unknown scenario \(scenario)")
         exit(1)
