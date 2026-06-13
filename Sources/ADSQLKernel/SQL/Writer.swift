@@ -75,13 +75,17 @@ enum Writer {
     guard let definition = schema.tables[insert.table] else {
       throw DBError.noSuchTable(insert.table)
     }
-    let conflict: ConflictPolicy
+    var conflict: ConflictPolicy = .abort
+    var upsert: (target: String, sets: [SQLAssignment])?
     switch insert.conflict {
     case .abort: conflict = .abort
     case .replace: conflict = .replace
     case .ignore: conflict = .ignore
-    case .doUpdate:
-      throw DBError.sqlUnsupported("INSERT ... ON CONFLICT DO UPDATE (upsert)")
+    case .doUpdate(let target, let sets):
+      guard definition.columnIndex(of: target) != nil else {
+        throw DBError.noSuchColumn(table: insert.table, column: target)
+      }
+      upsert = (target, sets)
     }
 
     let columnNames = insert.columns.isEmpty ? definition.columns.map(\.name) : insert.columns
@@ -96,6 +100,15 @@ enum Writer {
     var changes = 0
     var lastRowid: Int64 = 0
 
+    func recordReturning(rowid: Int64) throws(DBError) {
+      guard let returning, let header else { return }
+      guard let row = try txn.row(in: insert.table, rowid: rowid) else {
+        throw DBError.integrityFailure("RETURNING row \(rowid) vanished")
+      }
+      returningRows.append(
+        try projectRow(returning, table: definition, values: row.values, header: header, params: params))
+    }
+
     func insertRow(_ rowValues: [Value]) throws(DBError) {
       guard rowValues.count == columnNames.count else {
         throw DBError.sqlBind(
@@ -103,18 +116,19 @@ enum Writer {
       }
       var values: [String: Value] = [:]
       for (index, value) in rowValues.enumerated() { values[columnNames[index]] = value }
+      if let upsert {
+        try applyUpsert(
+          values, target: upsert.target, sets: upsert.sets, table: insert.table,
+          definition: definition, schema: schema, txn: txn, params: params,
+          changes: &changes, lastRowid: &lastRowid, record: recordReturning)
+        return
+      }
       guard let rowid = try txn.insert(into: insert.table, values, onConflict: conflict) else {
         return  // OR IGNORE skipped a conflicting row
       }
       changes += 1
       lastRowid = rowid
-      if let returning, let header {
-        guard let row = try txn.row(in: insert.table, rowid: rowid) else {
-          throw DBError.integrityFailure("RETURNING row \(rowid) vanished")
-        }
-        returningRows.append(
-          try projectRow(returning, table: definition, values: row.values, header: header, params: params))
-      }
+      try recordReturning(rowid: rowid)
     }
 
     switch insert.source {
@@ -133,6 +147,101 @@ enum Writer {
       }
     }
     return (returningRows, RunResult(changes: changes, lastInsertRowid: lastRowid))
+  }
+
+  // MARK: - ON CONFLICT DO UPDATE (upsert)
+
+  /// Inserts the candidate row, or — when it conflicts on the target unique
+  /// column — applies the DO UPDATE SET against the existing row with the
+  /// proposed row visible as `excluded.*`.
+  static func applyUpsert(
+    _ candidate: [String: Value], target: String, sets: [SQLAssignment], table: String,
+    definition: TableDefinition, schema: Schema, txn: borrowing WriteTxn, params: SQLParameters,
+    changes: inout Int, lastRowid: inout Int64, record: (Int64) throws(DBError) -> Void
+  ) throws(DBError) {
+    let existingRowid: Int64?
+    if case .rowidAlias(let aliasColumn, _) = definition.primaryKey, aliasColumn == target {
+      if case .integer(let candidateRowid)? = candidate[target],
+        try txn.row(in: table, rowid: candidateRowid) != nil {
+        existingRowid = candidateRowid
+      } else {
+        existingRowid = nil
+      }
+    } else {
+      guard let index = schema.indexes(on: table).first(where: {
+        $0.unique && $0.columns.count == 1 && $0.columns[0].lowercased() == target.lowercased()
+      }) else {
+        throw DBError.sqlBind("ON CONFLICT target \(target) is not a unique column")
+      }
+      if let value = candidate[target], !value.isNull {
+        existingRowid = try txn.firstRowid(index: index.name, equals: [value])
+      } else {
+        existingRowid = nil  // NULLs never collide in a unique index
+      }
+    }
+
+    guard let rowid = existingRowid else {
+      if let inserted = try txn.insert(into: table, candidate, onConflict: .abort) {
+        changes += 1
+        lastRowid = inserted
+        try record(inserted)
+      }
+      return
+    }
+
+    guard let existing = try txn.row(in: table, rowid: rowid) else {
+      throw DBError.integrityFailure("upsert target row \(rowid) vanished")
+    }
+    let env = excludedEnv(
+      candidate: candidate, existing: existing.values, definition: definition, params: params)
+    var setValues: [String: Value] = [:]
+    for assignment in sets {
+      guard definition.columnIndex(of: assignment.column) != nil else {
+        throw DBError.noSuchColumn(table: table, column: assignment.column)
+      }
+      setValues[assignment.column] = try SQLEval.evaluate(assignment.value, env)
+    }
+    _ = try txn.update(table, rowid: rowid, set: setValues)
+    changes += 1
+    lastRowid = rowid
+    try record(rowid)
+  }
+
+  /// SET-expression env for DO UPDATE: `excluded.col` is the proposed insert
+  /// value (or the column default when not supplied); a bare/table-qualified
+  /// column is the existing row's value.
+  static func excludedEnv(
+    candidate: [String: Value], existing: [Value], definition: TableDefinition,
+    params: SQLParameters
+  ) -> SQLEvalEnv {
+    SQLEvalEnv(
+      parameter: { p throws(DBError) in try params.lookup(p) },
+      column: { (qualifier, name, _) throws(DBError) in
+        if let qualifier, qualifier.lowercased() == "excluded" {
+          if let value = candidate[name] { return value }
+          guard let column = definition.columns.first(where: { $0.name == name }) else {
+            throw DBError.noSuchColumn(table: "excluded", column: name)
+          }
+          switch column.defaultValue {
+          case .value(let value): return value
+          case .datetimeNow: return .text(CivilTime.utcNowString())
+          case nil: return .null
+          }
+        }
+        guard let index = definition.columnIndex(of: name) else {
+          throw DBError.noSuchColumn(table: definition.name, column: name)
+        }
+        return existing[index]
+      },
+      collationOf: { (_, name) in
+        definition.columnIndex(of: name).map { definition.columns[$0].collation }
+      },
+      columnTypeOf: { (_, name) in
+        definition.columnIndex(of: name).map { definition.columns[$0].type }
+      },
+      scalarSubquery: { _ throws(DBError) in
+        throw DBError.sqlUnsupported("subquery in this context")
+      })
   }
 
   // MARK: - Reading within a write transaction (INSERT … SELECT, subqueries)
