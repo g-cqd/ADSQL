@@ -117,6 +117,14 @@ enum SelectExecutor {
     let sliceEnd: Int? =
       (ordered && !plan.distinct && bounds?.limit != nil)
       ? (bounds!.offset + bounds!.limit!) : nil
+    // Bounded top-N: an unordered ORDER BY + (small) LIMIT without DISTINCT
+    // keeps only offset+limit rows instead of materializing and sorting every
+    // match. Larger limits fall back to collect-and-sort.
+    let topN: Int? = {
+      guard collectKeys, !plan.distinct, let limit = bounds?.limit, limit >= 1 else { return nil }
+      let bound = bounds!.offset + limit
+      return bound >= 1 && bound <= 4096 ? bound : nil
+    }()
     let dedupRowids: Bool = {
       if case .index(_, let list) = source { return list.count > 1 }
       return false
@@ -124,8 +132,8 @@ enum SelectExecutor {
 
     let accumulator = Accumulator(
       context: context, env: env, residual: plan.whereExpr, outputs: plan.outputs,
-      orderBy: plan.orderBy, collectKeys: collectKeys, sliceEnd: sliceEnd,
-      dedupRowids: dedupRowids)
+      orderBy: plan.orderBy, orderCollations: plan.orderCollations, collectKeys: collectKeys,
+      sliceEnd: sliceEnd, topN: topN, dedupRowids: dedupRowids)
     try forEachRow(source, table: table, resolver: resolver) { rowid, span throws(DBError) in
       try accumulator.consume(rowid: rowid, span: span)
     }
@@ -136,7 +144,8 @@ enum SelectExecutor {
       (rows, sortKeys) = deduplicate(
         rows, sortKeys: sortKeys, ordered: collectKeys, collations: plan.outputCollations)
     }
-    if collectKeys {
+    // Bounded top-N already holds rows sorted; otherwise sort the collected set.
+    if collectKeys && !accumulator.presorted {
       let order = sortedOrder(sortKeys, terms: plan.orderBy, collations: plan.orderCollations)
       rows = order.map { rows[$0] }
     }
@@ -164,23 +173,34 @@ enum SelectExecutor {
     let residual: SQLExpr?
     let outputs: [BoundOutput]
     let orderBy: [SQLOrderingTerm]
+    let orderCollations: [Collation]
     let collectKeys: Bool
     let sliceEnd: Int?
+    /// Bounded top-N capacity (offset+limit) for an unordered ORDER BY + LIMIT
+    /// without DISTINCT. When set, `rows`/`sortKeys` are kept sorted ascending
+    /// and capped, so unkept rows are never projected and the full sort is
+    /// avoided. nil = collect everything (the caller sorts).
+    let topN: Int?
     var seenRowids: Set<Int64>?
     var rows: [[Value]] = []
     var sortKeys: [[Value]] = []
 
+    var presorted: Bool { topN != nil }
+
     init(
       context: RowContext, env: SQLEvalEnv, residual: SQLExpr?, outputs: [BoundOutput],
-      orderBy: [SQLOrderingTerm], collectKeys: Bool, sliceEnd: Int?, dedupRowids: Bool
+      orderBy: [SQLOrderingTerm], orderCollations: [Collation], collectKeys: Bool,
+      sliceEnd: Int?, topN: Int?, dedupRowids: Bool
     ) {
       self.context = context
       self.env = env
       self.residual = residual
       self.outputs = outputs
       self.orderBy = orderBy
+      self.orderCollations = orderCollations
       self.collectKeys = collectKeys
       self.sliceEnd = sliceEnd
+      self.topN = topN
       self.seenRowids = dedupRowids ? [] : nil
     }
 
@@ -193,10 +213,18 @@ enum SelectExecutor {
       if let residual {
         if SQLEval.truth(try SQLEval.evaluate(residual, env)) != .yes { return true }
       }
-      var projected: [Value] = []
-      projected.reserveCapacity(outputs.count)
-      for output in outputs { projected.append(try SQLEval.evaluate(output.expr, env)) }
-      rows.append(projected)
+
+      if let topN {
+        // Compute the sort key first; only project rows that make the cut.
+        var keys: [Value] = []
+        keys.reserveCapacity(orderBy.count)
+        for term in orderBy { keys.append(try SQLEval.evaluate(term.expr, env)) }
+        if rows.count >= topN, !orderBefore(keys, sortKeys[topN - 1]) { return true }
+        insertSorted(keys, try project())
+        return true
+      }
+
+      rows.append(try project())
       if collectKeys {
         var keys: [Value] = []
         keys.reserveCapacity(orderBy.count)
@@ -205,6 +233,39 @@ enum SelectExecutor {
       }
       if let sliceEnd, rows.count >= sliceEnd { return false }
       return true
+    }
+
+    private func project() throws(DBError) -> [Value] {
+      var projected: [Value] = []
+      projected.reserveCapacity(outputs.count)
+      for output in outputs { projected.append(try SQLEval.evaluate(output.expr, env)) }
+      return projected
+    }
+
+    /// Does sort key `a` order strictly before `b` under ORDER BY?
+    private func orderBefore(_ a: [Value], _ b: [Value]) -> Bool {
+      for position in orderBy.indices {
+        let comparison = orderCompare(a[position], b[position], orderCollations[position])
+        if comparison != 0 { return orderBy[position].descending ? comparison > 0 : comparison < 0 }
+      }
+      return false
+    }
+
+    /// Inserts into the ascending bounded buffer, dropping the worst when over
+    /// capacity.
+    private func insertSorted(_ keys: [Value], _ row: [Value]) {
+      var lo = 0
+      var hi = rows.count
+      while lo < hi {
+        let mid = (lo + hi) / 2
+        if orderBefore(sortKeys[mid], keys) { lo = mid + 1 } else { hi = mid }
+      }
+      rows.insert(row, at: lo)
+      sortKeys.insert(keys, at: lo)
+      if let topN, rows.count > topN {
+        rows.removeLast()
+        sortKeys.removeLast()
+      }
     }
   }
 
