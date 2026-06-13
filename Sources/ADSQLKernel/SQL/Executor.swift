@@ -111,19 +111,20 @@ enum SelectExecutor {
   static func run<R: PageResolver>(
     _ plan: BoundSelect, tables: [Catalog.TableRecord], index: Catalog.IndexRecord?,
     joinIndexes: [Catalog.IndexRecord?] = [],
+    ftsRecords: [String: Catalog.FTSRecord] = [:],
     resolver: R, params: SQLParameters,
     outer: (context: RowContext, binding: QueryBinding)? = nil,
     subquery: @escaping SubqueryRunner = rejectSubquery
   ) throws(DBError) -> [SQLRow] {
     if plan.isAggregated {
       return try runAggregated(
-        plan, tables: tables, index: index, joinIndexes: joinIndexes, resolver: resolver,
-        params: params, outer: outer, subquery: subquery)
+        plan, tables: tables, index: index, joinIndexes: joinIndexes, ftsRecords: ftsRecords,
+        resolver: resolver, params: params, outer: outer, subquery: subquery)
     }
     if plan.isJoin {
       return try runJoin(
-        plan, tables: tables, index: index, joinIndexes: joinIndexes, resolver: resolver,
-        params: params, outer: outer, subquery: subquery)
+        plan, tables: tables, index: index, joinIndexes: joinIndexes, ftsRecords: ftsRecords,
+        resolver: resolver, params: params, outer: outer, subquery: subquery)
     }
     let table = tables[0]
     let context = RowContext(definitions: tables.map(\.definition))
@@ -135,7 +136,8 @@ enum SelectExecutor {
     // its order satisfies ORDER BY (so the sort and a LIMIT early-exit are
     // safe). An index probe whose values do not convert to the column class
     // falls back to a table scan — still correct via the residual WHERE.
-    let source = try resolveSource(plan, table: table, index: index, env: paramsEnv)
+    let source = try resolveSource(
+      plan, table: table, index: index, ftsRecords: ftsRecords, env: paramsEnv)
     let ordered: Bool
     switch source {
     case .table:
@@ -144,6 +146,10 @@ enum SelectExecutor {
       ordered = plan.accessYieldsOrder
     case .index(_, let list):
       ordered = plan.orderBy.isEmpty || (plan.accessYieldsOrder && list.count <= 1)
+    case .fts:
+      // The docid set is ascending; the planner sets accessYieldsOrder only
+      // when there is no ORDER BY, so otherwise the executor sorts.
+      ordered = plan.accessYieldsOrder
     }
 
     // Early-exit under LIMIT is sound only when the source order is final and
@@ -167,11 +173,12 @@ enum SelectExecutor {
 
     // A taken rowid/index probe exactly covers its equality conjuncts, so the
     // residual can drop them; a table scan (incl. the coercion fallback) must
-    // re-check the full WHERE.
+    // re-check the full WHERE. The FTS source covers its MATCH conjunct (already
+    // stripped from the WHERE at bind time), so any remaining WHERE applies.
     let residual: SQLExpr?
     switch source {
     case .table: residual = plan.whereExpr
-    case .rowids, .index: residual = plan.residualWithoutCovered
+    case .rowids, .index, .fts: residual = plan.residualWithoutCovered
     }
     let accumulator = Accumulator(
       context: context, env: env, residual: residual, outputs: plan.outputs,
@@ -206,6 +213,9 @@ enum SelectExecutor {
     case table
     case rowids([Int64])
     case index(Catalog.IndexRecord, [IndexBounds])
+    /// An FTS5 MATCH source: the docids `FTSMatch.evaluate` returns (ascending).
+    /// `query` is the UTF-8 of the resolved MATCH query string.
+    case fts(Catalog.FTSRecord, query: [UInt8])
   }
 
   /// Accumulates surviving rows; `consume` returns false to request early
@@ -342,6 +352,18 @@ enum SelectExecutor {
           resolver: resolver, table: table, mode: .index(index), lowerKey: lower, upperKey: upper)
         unsafe try cursor.forEachRecordSpan(body)
       }
+    case .fts(let record, let queryBytes):
+      // Evaluate the MATCH query to its docid set (F3b), then hand each docid to
+      // `body` with an EMPTY span: the FTS table's `RowSlot` is built from the
+      // synthetic rowid-alias definition, so `compute` returns `.integer(docid)`
+      // for `rowid` and never reads the span. The join then descends on
+      // `base.id = fts.rowid` exactly as for an ordinary rowid source.
+      let query = try FTSQuery.parse(String(decoding: queryBytes, as: UTF8.self))
+      let docids = try FTSMatch.evaluate(query, record: record, resolver: resolver)
+      let empty = unsafe UnsafeRawBufferPointer(start: nil, count: 0)
+      for docid in docids {
+        if try unsafe !body(docid, empty) { return }
+      }
     }
   }
 
@@ -350,9 +372,10 @@ enum SelectExecutor {
   /// falls back to a table scan).
   private static func resolveSource(
     _ plan: BoundSelect, table: Catalog.TableRecord, index: Catalog.IndexRecord?,
-    env paramsEnv: SQLEvalEnv
+    ftsRecords: [String: Catalog.FTSRecord], env paramsEnv: SQLEvalEnv
   ) throws(DBError) -> RowSource {
-    try resolveAccess(plan.access, index: index, table: table, env: paramsEnv)
+    try resolveAccess(
+      plan.access, index: index, table: table, ftsRecords: ftsRecords, env: paramsEnv)
   }
 
   /// Resolves an access plan into a row source against `env`. For the leading
@@ -362,7 +385,7 @@ enum SelectExecutor {
   /// via the residual (single-table WHERE, or the join's ON re-applied).
   private static func resolveAccess(
     _ access: AccessPlan, index: Catalog.IndexRecord?, table: Catalog.TableRecord,
-    env: SQLEvalEnv
+    ftsRecords: [String: Catalog.FTSRecord], env: SQLEvalEnv
   ) throws(DBError) -> RowSource {
     switch access {
     case .tableScan:
@@ -375,6 +398,17 @@ enum SelectExecutor {
       case .scan: return .table
       case .bounds(let list): return .index(index, list)
       }
+    case .fts(let name, let queryExpr):
+      guard let record = ftsRecords[name] else {
+        throw DBError.noSuchTable(name)
+      }
+      // The query is a literal/parameter; evaluate it to text → UTF-8. A NULL or
+      // non-text query matches nothing (empty bytes parse to an empty query).
+      let value = try SQLEval.evaluate(queryExpr, env)
+      guard case .text(let text) = value else {
+        throw DBError.sqlRuntime("MATCH query must be a text value")
+      }
+      return .fts(record, query: Array(text.utf8))
     }
   }
 
@@ -387,7 +421,7 @@ enum SelectExecutor {
   /// LEFT emits one null-extended row when the right side has no match.
   private static func forEachFilteredRow<R: PageResolver>(
     _ plan: BoundSelect, tables: [Catalog.TableRecord], index: Catalog.IndexRecord?,
-    joinIndexes: [Catalog.IndexRecord?],
+    joinIndexes: [Catalog.IndexRecord?], ftsRecords: [String: Catalog.FTSRecord],
     resolver: R, context: RowContext, env: SQLEvalEnv, paramsEnv: SQLEvalEnv,
     _ body: () throws(DBError) -> Void
   ) throws(DBError) {
@@ -397,7 +431,8 @@ enum SelectExecutor {
     }
 
     guard plan.isJoin else {
-      let source = try resolveSource(plan, table: tables[0], index: index, env: paramsEnv)
+      let source = try resolveSource(
+        plan, table: tables[0], index: index, ftsRecords: ftsRecords, env: paramsEnv)
       unsafe try forEachRow(source, table: tables[0], resolver: resolver) {
         rowid, span throws(DBError) in
         unsafe context.load(0, rowid: rowid, span: span)
@@ -421,7 +456,7 @@ enum SelectExecutor {
       // `.index` probe to a scan; `.rowid` probes need no record.
       let joinIndex = depth - 1 < joinIndexes.count ? joinIndexes[depth - 1] : nil
       let innerSource = try resolveAccess(
-        join.access, index: joinIndex, table: tables[depth], env: env)
+        join.access, index: joinIndex, table: tables[depth], ftsRecords: ftsRecords, env: env)
       unsafe try forEachRow(innerSource, table: tables[depth], resolver: resolver) {
         rowid, span throws(DBError) in
         unsafe context.load(depth, rowid: rowid, span: span)
@@ -437,7 +472,8 @@ enum SelectExecutor {
       }
     }
 
-    let outerSource = try resolveSource(plan, table: tables[0], index: index, env: paramsEnv)
+    let outerSource = try resolveSource(
+      plan, table: tables[0], index: index, ftsRecords: ftsRecords, env: paramsEnv)
     unsafe try forEachRow(outerSource, table: tables[0], resolver: resolver) {
       rowid, span throws(DBError) in
       unsafe context.load(0, rowid: rowid, span: span)
@@ -448,7 +484,7 @@ enum SelectExecutor {
 
   private static func runJoin<R: PageResolver>(
     _ plan: BoundSelect, tables: [Catalog.TableRecord], index: Catalog.IndexRecord?,
-    joinIndexes: [Catalog.IndexRecord?],
+    joinIndexes: [Catalog.IndexRecord?], ftsRecords: [String: Catalog.FTSRecord],
     resolver: R, params: SQLParameters,
     outer: (context: RowContext, binding: QueryBinding)?, subquery: @escaping SubqueryRunner
   ) throws(DBError) -> [SQLRow] {
@@ -460,8 +496,8 @@ enum SelectExecutor {
     var rows: [[Value]] = []
     var sortKeys: [[Value]] = []
     try forEachFilteredRow(
-      plan, tables: tables, index: index, joinIndexes: joinIndexes, resolver: resolver,
-      context: context, env: env, paramsEnv: paramsEnv
+      plan, tables: tables, index: index, joinIndexes: joinIndexes, ftsRecords: ftsRecords,
+      resolver: resolver, context: context, env: env, paramsEnv: paramsEnv
     ) { () throws(DBError) in
       var projected: [Value] = []
       projected.reserveCapacity(plan.outputs.count)
@@ -494,7 +530,7 @@ enum SelectExecutor {
 
   private static func runAggregated<R: PageResolver>(
     _ plan: BoundSelect, tables: [Catalog.TableRecord], index: Catalog.IndexRecord?,
-    joinIndexes: [Catalog.IndexRecord?],
+    joinIndexes: [Catalog.IndexRecord?], ftsRecords: [String: Catalog.FTSRecord],
     resolver: R, params: SQLParameters,
     outer: (context: RowContext, binding: QueryBinding)?, subquery: @escaping SubqueryRunner
   ) throws(DBError) -> [SQLRow] {
@@ -517,8 +553,8 @@ enum SelectExecutor {
     }
 
     try forEachFilteredRow(
-      plan, tables: tables, index: index, joinIndexes: joinIndexes, resolver: resolver,
-      context: context, env: scanEnv, paramsEnv: paramsEnv
+      plan, tables: tables, index: index, joinIndexes: joinIndexes, ftsRecords: ftsRecords,
+      resolver: resolver, context: context, env: scanEnv, paramsEnv: paramsEnv
     ) { () throws(DBError) in
       let key: GroupKey
       if noGroupBy {

@@ -858,7 +858,7 @@ struct SQLParser {
 
   /// The equality band: `= == != <>`, `IS [NOT] NULL`, `[NOT] IN/BETWEEN/LIKE`.
   mutating func equalitySuffix(_ lhs: SQLExpr) throws(DBError) -> SQLExpr {
-    if checkKeyword("MATCH") { throw DBError.sqlUnsupported("MATCH (FTS arrives with M5)") }
+    if matchKeyword("MATCH") { return .binary(.match, lhs, try binaryExpr(Self.bpComparison)) }
     if checkKeyword("GLOB") || checkKeyword("REGEXP") { throw DBError.sqlUnsupported("GLOB/REGEXP") }
     if matchSymbol("=") || matchSymbol("==") {
       return .binary(.eq, lhs, try binaryExpr(Self.bpComparison))

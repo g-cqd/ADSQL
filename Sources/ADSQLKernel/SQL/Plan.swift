@@ -18,8 +18,14 @@ struct TableBinding: Sendable {
   let columnCollations: [Collation]
   let indexByName: [String: Int]  // lowercased name → column index
   let rowidAliasIndex: Int?
+  /// True for an FTS5 virtual table reference. Its `definition` is synthetic
+  /// (a single `rowid` alias column), so `f.rowid` resolves to slot 0 and a
+  /// bare `f` reference is the MATCH subject; the planner produces `.fts` from
+  /// the MATCH conjunct rather than from indexes, and the executor drives the
+  /// row source through `FTSMatch.evaluate` (no base scan).
+  let isFTS: Bool
 
-  init(reference: SQLTableRef, definition: TableDefinition) {
+  init(reference: SQLTableRef, definition: TableDefinition, isFTS: Bool = false) {
     self.table = definition.name
     self.binding = (reference.alias ?? definition.name).lowercased()
     self.columnNames = definition.columns.map(\.name)
@@ -31,12 +37,23 @@ struct TableBinding: Sendable {
     }
     self.indexByName = map
     self.rowidAliasIndex = definition.rowidAliasIndex
+    self.isFTS = isFTS
   }
 
   func columnIndex(qualifier: String?, name: String) -> Int? {
     if let qualifier, qualifier.lowercased() != binding { return nil }
     return indexByName[name.lowercased()]
   }
+}
+
+/// The executor and planner model an FTS5 table as an ordinary rowid-keyed
+/// table with a single `rowid` alias column. `RowSlot.compute` returns the
+/// docid for that column without touching any record span, so the empty span
+/// the `.fts` source supplies is never read; `f.rowid` joins the base table.
+func syntheticFTSDefinition(_ name: String) -> TableDefinition {
+  TableDefinition(
+    name, columns: [ColumnDefinition("rowid", .integer)],
+    primaryKey: .rowidAlias(column: "rowid", autoincrement: false))
 }
 
 /// A projected output column: its result-set name and the expression that
@@ -225,12 +242,19 @@ enum Binder {
       throw DBError.sqlUnsupported("SELECT without FROM (arrives in a later slice)")
     }
 
-    // Resolve every table in FROM/JOIN order; the first is the outer table.
+    // Resolve every table in FROM/JOIN order; the first is the outer table. An
+    // FTS5 virtual table isn't in `schema.tables`; it binds against a synthetic
+    // rowid-alias definition (its only queryable column is `rowid`; the indexed
+    // text is reached through MATCH, not column reads).
     func bind(_ reference: SQLTableRef) throws(DBError) -> TableBinding {
-      guard let definition = schema.tables[reference.name] else {
-        throw DBError.noSuchTable(reference.name)
+      if let definition = schema.tables[reference.name] {
+        return TableBinding(reference: reference, definition: definition)
       }
-      return TableBinding(reference: reference, definition: definition)
+      if schema.ftsTables[reference.name] != nil {
+        return TableBinding(
+          reference: reference, definition: syntheticFTSDefinition(reference.name), isFTS: true)
+      }
+      throw DBError.noSuchTable(reference.name)
     }
     var tables: [TableBinding] = [try bind(from)]
     var rawJoins: [(kind: SQLJoinKind, depth: Int, on: SQLExpr)] = []
@@ -247,11 +271,24 @@ enum Binder {
     var joins: [BoundJoin] = []
     for raw in rawJoins {
       let inner = tables[raw.depth]
+      // An FTS inner table has no schema table/indexes; its access comes from a
+      // MATCH conjunct on its ON clause, so pass the synthetic definition and no
+      // indexes (the planner extracts `.fts` from the MATCH, not from indexes).
+      let innerDefinition =
+        inner.isFTS ? syntheticFTSDefinition(inner.table) : schema.tables[inner.table]!
+      let innerIndexes = inner.isFTS ? [] : schema.indexes(on: inner.table)
       let equalities = joinEqualities(raw.on, binding: binding, innerDepth: raw.depth)
       let access = Planner.planJoin(
-        equalities: equalities, inner: inner,
-        indexes: schema.indexes(on: inner.table), definition: schema.tables[inner.table]!)
-      joins.append(BoundJoin(kind: raw.kind, table: raw.depth, on: raw.on, access: access))
+        equalities: equalities, inner: inner, on: raw.on, binding: binding, innerDepth: raw.depth,
+        indexes: innerIndexes, definition: innerDefinition)
+      // A MATCH conjunct the `.fts` access consumes is an access path, never a
+      // row predicate, so drop it from the ON clause re-applied during matching
+      // (evaluating `.binary(.match,…)` at a row is a runtime error).
+      var on = raw.on
+      if case .fts = access, let (_, conjunct) = Planner.ftsMatchConjunct(raw.on, source: inner) {
+        on = removeCovered(raw.on, [conjunct]) ?? .literal(.integer(1))
+      }
+      joins.append(BoundJoin(kind: raw.kind, table: raw.depth, on: on, access: access))
     }
 
     // Aggregate calls in outputs/HAVING/ORDER BY are rewritten to slot
@@ -301,16 +338,30 @@ enum Binder {
     // so pushing its WHERE conjuncts down stays a valid superset. Aggregated
     // queries scan every row, so the planner's order claims don't apply.
     let source = tables[0]
+    // A leading FTS table has no schema table/indexes; its access is the `.fts`
+    // path the planner extracts from a `f MATCH '…'` WHERE conjunct (synthetic
+    // definition, no indexes — MATCH drives the source, columns don't).
+    let sourceDefinition =
+      source.isFTS ? syntheticFTSDefinition(source.table) : schema.tables[source.table]!
+    let sourceIndexes = source.isFTS ? [] : schema.indexes(on: source.table)
     let planning = Planner.plan(
       where: select.whereExpr, orderBy: select.orderBy, source: source,
-      indexes: schema.indexes(on: source.table), definition: schema.tables[source.table]!)
+      indexes: sourceIndexes, definition: sourceDefinition)
     let yieldsOrder = joins.isEmpty && !isAggregated
+    // A leading-FTS MATCH conjunct is an access path the `.fts` source consumes,
+    // never a row predicate — strip it from the base WHERE used as the leaf
+    // residual on *every* path (join/aggregate included), or evaluating
+    // `.binary(.match,…)` per row would be a runtime error.
+    var whereExpr = select.whereExpr
+    if case .fts = planning.plan {
+      whereExpr = removeCovered(whereExpr, planning.coveredConjuncts)
+    }
     // Residual elimination applies to the single-table path only (the join/
     // aggregate paths evaluate the full WHERE at the leaf).
     let residualWithoutCovered =
       yieldsOrder
-      ? removeCovered(select.whereExpr, planning.coveredConjuncts)
-      : select.whereExpr
+      ? removeCovered(whereExpr, planning.coveredConjuncts)
+      : whereExpr
 
     // Final step: resolve every runtime column reference to (table, column)
     // slots so the evaluator never re-resolves names per row. Runs after all
@@ -325,7 +376,7 @@ enum Binder {
       },
       outputs: outputs.map { BoundOutput(name: $0.name, expr: bind($0.expr)) },
       outputCollations: outputCollations,
-      whereExpr: select.whereExpr.map(bind),
+      whereExpr: whereExpr.map(bind),
       residualWithoutCovered: residualWithoutCovered.map(bind),
       orderBy: orderBy.map { SQLOrderingTerm(expr: bind($0.expr), descending: $0.descending) },
       orderCollations: orderCollations,
@@ -395,6 +446,10 @@ enum Binder {
           trailing: probe.trailing.map { bindTrailing($0, binding) })
       }
       return .index(name: name, probes: bound, constraint: constraint)
+    case .fts(let table, let query):
+      // The query string is a literal/parameter; bind it like any expression
+      // (a stray column ref would just stay `.column` and fail at evaluation).
+      return .fts(table: table, query: bindColumns(query, binding))
     }
   }
 

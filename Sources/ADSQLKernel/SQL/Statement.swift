@@ -185,8 +185,23 @@ public final class Statement: Sendable {
   private static func runSelect(
     _ plan: BoundSelect, txn: borrowing ReadTxn, params: SQLParameters
   ) throws(DBError) -> [SQLRow] {
+    // An FTS binding has no schema table; model it to the executor as a
+    // rowid-keyed table whose handle is `.empty` (never scanned — its access is
+    // `.fts`), and resolve its real FTS record for the MATCH evaluation.
     var tables: [Catalog.TableRecord] = []
-    for binding in plan.binding.tables { tables.append(try txn.tableRecord(binding.table)) }
+    var ftsRecords: [String: Catalog.FTSRecord] = [:]
+    for binding in plan.binding.tables {
+      if binding.isFTS {
+        let record = try txn.ftsRecord(binding.table)
+        ftsRecords[binding.table] = record
+        tables.append(
+          Catalog.TableRecord(
+            tableId: record.ftsId, handle: .empty,
+            definition: syntheticFTSDefinition(binding.table)))
+      } else {
+        tables.append(try txn.tableRecord(binding.table))
+      }
+    }
     var index: Catalog.IndexRecord?
     if let name = plan.access.indexName { index = try txn.indexRecord(name) }
     var joinIndexes: [Catalog.IndexRecord?] = []
@@ -209,8 +224,8 @@ public final class Statement: Sendable {
         outerContext: outerContext, outerBinding: outerBinding)
     }
     return try SelectExecutor.run(
-      plan, tables: tables, index: index, joinIndexes: joinIndexes, resolver: txn.resolver,
-      params: params, subquery: runner)
+      plan, tables: tables, index: index, joinIndexes: joinIndexes, ftsRecords: ftsRecords,
+      resolver: txn.resolver, params: params, subquery: runner)
   }
 
   /// Runs one correlated scalar subquery against the current outer row,
@@ -229,8 +244,20 @@ public final class Statement: Sendable {
       throw DBError.sqlUnsupported("compound scalar subquery")
     }
     var tables: [Catalog.TableRecord] = []
+    var ftsRecords: [String: Catalog.FTSRecord] = [:]
     for binding in plan.binding.tables {
-      tables.append(try resolveTable(binding.table, resolver: resolver, meta: meta, cache: schemaCache))
+      if binding.isFTS {
+        guard let record = try Relation.ftsRecord(resolver, mainTree: meta.mainTree, name: binding.table)
+        else { throw DBError.noSuchTable(binding.table) }
+        ftsRecords[binding.table] = record
+        tables.append(
+          Catalog.TableRecord(
+            tableId: record.ftsId, handle: .empty,
+            definition: syntheticFTSDefinition(binding.table)))
+      } else {
+        tables.append(
+          try resolveTable(binding.table, resolver: resolver, meta: meta, cache: schemaCache))
+      }
     }
     var index: Catalog.IndexRecord?
     if let name = plan.access.indexName {
@@ -250,8 +277,8 @@ public final class Statement: Sendable {
         outerContext: context, outerBinding: binding)
     }
     let rows = try SelectExecutor.run(
-      plan, tables: tables, index: index, joinIndexes: joinIndexes, resolver: resolver,
-      params: params, outer: (outerContext, outerBinding), subquery: runner)
+      plan, tables: tables, index: index, joinIndexes: joinIndexes, ftsRecords: ftsRecords,
+      resolver: resolver, params: params, outer: (outerContext, outerBinding), subquery: runner)
     return rows.first?.values.first ?? .null
   }
 

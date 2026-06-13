@@ -48,6 +48,9 @@ public enum SQLBinaryOp: String, Equatable, Sendable {
   case divide = "/"
   case modulo = "%"
   case concat = "||"
+  /// FTS full-text membership: `<fts-table> MATCH <query>`. Never row-evaluated;
+  /// the planner turns this into an `.fts` access path (see Planner/Executor).
+  case match = "MATCH"
 }
 
 public enum SQLUnaryOp: String, Equatable, Sendable {

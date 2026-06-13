@@ -246,6 +246,11 @@ enum SQLEval {
       let rv = try evaluate(r, env)
       guard !lv.isNull, !rv.isNull else { return .null }
       return .text(SQLFunctions.textify(lv) + SQLFunctions.textify(rv))
+    case .binary(.match, _, _):
+      // MATCH is an access path (the planner lowers it to `.fts`), never a
+      // row-level predicate; reaching here means it appeared where it can't
+      // drive an FTS scan (e.g. a projection, or on a non-FTS table).
+      throw DBError.sqlRuntime("MATCH is only valid as a WHERE constraint on an FTS table")
     case .binary(let op, let l, let r):
       return try SQLFunctions.arithmetic(
         op, try evaluate(l, env), try evaluate(r, env))

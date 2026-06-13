@@ -289,7 +289,7 @@ struct SQLParserStatementTests {
 struct SQLParserErrorTests {
   static let unsupported: [(String, String)] = [
     ("WITH x AS (SELECT 1) SELECT * FROM x", "WITH"),
-    ("SELECT * FROM docs WHERE docs MATCH 'q'", "MATCH"),
+    // `… MATCH 'q'` now parses (F3c); it binds/plans to an FTS access path.
     ("SELECT COUNT(DISTINCT a) FROM t", "DISTINCT"),
     ("SELECT AVG(a) FROM t", "AVG"),
     ("SELECT MAX(a) FROM t", "MAX"),

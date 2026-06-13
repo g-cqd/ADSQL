@@ -141,6 +141,16 @@ extension ReadTxn {
     return record
   }
 
+  /// The catalog record (dictionary/postings/stats roots + config) of an FTS5
+  /// table at this snapshot. Single-fetch (the schema cache covers tables and
+  /// indexes only); the SELECT executor uses it to drive a MATCH source.
+  func ftsRecord(_ name: String) throws(DBError) -> Catalog.FTSRecord {
+    guard let record = try Relation.ftsRecord(resolver, mainTree: meta.mainTree, name: name) else {
+      throw DBError.noSuchTable(name)
+    }
+    return record
+  }
+
   /// Point lookup by rowid.
   public func row(in table: String, rowid: Int64) throws(DBError) -> Row? {
     try Relation.readRow(resolver, table: try tableRecord(table), rowid: rowid)

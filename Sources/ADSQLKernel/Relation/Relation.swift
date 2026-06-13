@@ -470,6 +470,26 @@ enum Relation {
     return try result.get()
   }
 
+  /// Single-record FTS catalog fetch (the read path resolves an FTS table's
+  /// dictionary/postings/stats roots without a full catalog load), mirroring
+  /// `tableRecord`/`indexRecord`. nil when the FTS table is absent.
+  static func ftsRecord(
+    _ resolver: some PageResolver, mainTree: TreeHandle, name: String
+  ) throws(DBError) -> Catalog.FTSRecord? {
+    guard let bytes = try getBytes(resolver, mainTree, key: Catalog.ftsKey(name)) else {
+      return nil
+    }
+    var result: Result<Catalog.FTSRecord, DBError> = .failure(.noSuchTable(name))
+    bytes.withUnsafeBytes { raw in
+      do throws(DBError) {
+        result = unsafe .success(try Catalog.decodeFTS(raw, name: name))
+      } catch {
+        result = .failure(error)
+      }
+    }
+    return try result.get()
+  }
+
   /// Returns every page of a tree (nodes + overflow) to the transaction.
   static func freeTree(_ ctx: TxnContext, handle: TreeHandle) throws(DBError) {
     guard handle.rootPage != 0 else { return }

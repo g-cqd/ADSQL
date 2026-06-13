@@ -34,6 +34,10 @@ enum AccessPlan: Sendable {
   case tableScan
   case rowid([SQLExpr])               // one (eq) or many (IN) rowid probes
   case index(name: String, probes: [IndexProbe], constraint: String)
+  /// Full-text MATCH on an FTS5 table: the row source is the docid set
+  /// `FTSMatch.evaluate` returns for `query` (a literal/parameter expression),
+  /// not a B+tree scan. `query` is the MATCH right-hand operand.
+  case fts(table: String, query: SQLExpr)
 }
 
 /// The result of planning: the access path plus order analysis.
@@ -66,6 +70,19 @@ enum Planner {
     where whereExpr: SQLExpr?, orderBy: [SQLOrderingTerm],
     source: TableBinding, indexes: [IndexDefinition], definition: TableDefinition
   ) -> AccessPlanning {
+    // An FTS leading table is driven by its MATCH conjunct, not by indexes. The
+    // conjunct is covered (dropped from the residual); the docid set the source
+    // yields is already ascending, so it trivially satisfies any ORDER BY the
+    // executor re-sorts anyway (yieldsOrder stays conservative: false unless no
+    // ORDER BY). Falls through to a full scan if no MATCH is present.
+    if source.isFTS, let whereExpr,
+      let (query, conjunct) = ftsMatchConjunct(whereExpr, source: source) {
+      return AccessPlanning(
+        plan: .fts(table: source.table, query: query),
+        yieldsOrder: orderBy.isEmpty,
+        rowidOrderSatisfiesOrderBy: false,
+        coveredConjuncts: [conjunct])
+    }
     let constraints = whereExpr.map { extract(conjuncts($0), source: source) } ?? []
     let rowidOrder = rowidOrderSatisfies(orderBy, source: source)
 
@@ -106,8 +123,14 @@ enum Planner {
   /// Returns `.tableScan` when no equality hits the rowid alias or an index.
   static func planJoin(
     equalities: [(column: Int, value: SQLExpr)],
-    inner: TableBinding, indexes: [IndexDefinition], definition: TableDefinition
+    inner: TableBinding, on: SQLExpr, binding: QueryBinding, innerDepth: Int,
+    indexes: [IndexDefinition], definition: TableDefinition
   ) -> AccessPlan {
+    // An FTS inner table is driven by a MATCH conjunct in its ON clause. MATCH
+    // re-evaluates per outer row here (acceptable for F3c; FTS-first avoids it).
+    if inner.isFTS, let (query, _) = ftsMatchConjunct(on, source: inner) {
+      return .fts(table: inner.table, query: query)
+    }
     guard !equalities.isEmpty else { return .tableScan }
     let constraints = equalities.map { Constraint.eq(column: $0.column, value: $0.value, source: $0.value) }
     if let aliasIndex = inner.rowidAliasIndex, let eq = firstEquality(constraints, column: aliasIndex) {
@@ -268,6 +291,36 @@ enum Planner {
     return [expr]
   }
 
+  /// The MATCH conjunct constraining FTS table `source`, as
+  /// `(queryExpr, theWholeConjunct)`. The subject (`lhs` of `<subject> MATCH
+  /// <query>`) is the table itself — written as a bare `tbl` / `alias`, which
+  /// parses to `.column(table: nil, name: <binding>)` (FTS5 syntax). The whole
+  /// `.binary(.match,…)` node is returned so the binder can drop it from the
+  /// residual WHERE/ON. nil if no MATCH names this table.
+  static func ftsMatchConjunct(
+    _ expr: SQLExpr, source: TableBinding
+  ) -> (query: SQLExpr, conjunct: SQLExpr)? {
+    for conjunct in conjuncts(expr) {
+      guard case .binary(.match, let subject, let query) = conjunct else { continue }
+      // `tbl MATCH …` parses the subject as a column reference with no table
+      // qualifier whose name is the binding (alias-or-table), e.g. `f`.
+      if case .column(let qualifier, let name, _) = subject,
+        matchesBinding(qualifier: qualifier, name: name, source: source) {
+        return (query, conjunct)
+      }
+    }
+    return nil
+  }
+
+  /// True when a bare/qualified reference designates the FTS table `source`
+  /// itself (not one of its columns) — the MATCH left operand.
+  private static func matchesBinding(
+    qualifier: String?, name: String, source: TableBinding
+  ) -> Bool {
+    if let qualifier { return qualifier.lowercased() == source.binding }
+    return name.lowercased() == source.binding
+  }
+
   private static func extract(_ conjuncts: [SQLExpr], source: TableBinding) -> [Constraint] {
     var constraints: [Constraint] = []
     for conjunct in conjuncts {
@@ -386,6 +439,8 @@ extension AccessPlan {
       return probes.count > 1 ? "SEARCH \(table) USING ROWID (IN)" : "SEARCH \(table) USING ROWID"
     case .index(let name, _, let constraint):
       return "SEARCH \(table) USING INDEX \(name) (\(constraint))"
+    case .fts(let ftsTable, _):
+      return "SCAN \(ftsTable) VIRTUAL TABLE INDEX (MATCH)"
     }
   }
 
