@@ -14,11 +14,56 @@ enum Writer {
       return try self.update(update, txn: txn, params: params)
     case .delete(let delete):
       return try self.delete(delete, txn: txn, params: params)
-    case .createTable, .createIndex, .dropTable, .dropIndex:
-      throw DBError.sqlUnsupported("DDL arrives in a later slice")
+    case .createTable(let create):
+      try createTable(create, txn: txn)
+      return ([], RunResult())
+    case .createIndex(let create):
+      try createIndex(create, txn: txn)
+      return ([], RunResult())
+    case .dropTable(let name, let ifExists):
+      try dropTable(name, ifExists: ifExists, txn: txn)
+      return ([], RunResult())
+    case .dropIndex(let name, let ifExists):
+      try dropIndex(name, ifExists: ifExists, txn: txn)
+      return ([], RunResult())
     case .select, .begin, .commit, .rollback:
       throw DBError.sqlUnsupported("not a write statement")
     }
+  }
+
+  // MARK: - DDL
+
+  static func createTable(_ create: SQLCreateTable, txn: borrowing WriteTxn) throws(DBError) {
+    if try txn.schema().tables[create.definition.name] != nil {
+      if create.ifNotExists { return }
+      throw DBError.invalidDefinition("table \(create.definition.name) already exists")
+    }
+    try txn.createTable(create.definition)
+    for index in create.impliedIndexes { try txn.createIndex(index) }
+  }
+
+  static func createIndex(_ create: SQLCreateIndex, txn: borrowing WriteTxn) throws(DBError) {
+    if try txn.schema().indexes[create.definition.name] != nil {
+      if create.ifNotExists { return }
+      throw DBError.invalidDefinition("index \(create.definition.name) already exists")
+    }
+    try txn.createIndex(create.definition)
+  }
+
+  static func dropTable(_ name: String, ifExists: Bool, txn: borrowing WriteTxn) throws(DBError) {
+    if try txn.schema().tables[name] == nil {
+      if ifExists { return }
+      throw DBError.noSuchTable(name)
+    }
+    try txn.dropTable(name)
+  }
+
+  static func dropIndex(_ name: String, ifExists: Bool, txn: borrowing WriteTxn) throws(DBError) {
+    if try txn.schema().indexes[name] == nil {
+      if ifExists { return }
+      throw DBError.noSuchIndex(name)
+    }
+    try txn.dropIndex(name)
   }
 
   // MARK: - INSERT
