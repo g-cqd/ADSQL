@@ -109,8 +109,11 @@ enum TableScenario {
         index: "i_documents_framework", bounds: .prefix([.text("swiftui")])
       ) { (cursor) throws(DBError) in
         var n = 0
+        // columns: id,key,title,framework,kind,is_deprecated → kind = index 4.
+        // Zero-copy presence check, matching SQLite's sqlite3_column_bytes path.
+        let kindColumn = 4
         try cursor.forEachRow { (row) throws(DBError) in
-          n += (try row.text("kind")) == nil ? 0 : 1
+          n += try row.withText(at: kindColumn) { $0 == nil ? 0 : 1 }
           return true
         }
         return n

@@ -106,6 +106,50 @@ public enum RecordCodec {
     }
   }
 
+  /// Zero-copy access to the column at `index` when it is TEXT (`withText`) or
+  /// BLOB (`withBlob`): `body` receives the payload bytes *in place* — no
+  /// `String`/`[UInt8]` is materialized — valid only for the call. `body` gets
+  /// `nil` when the column is NULL, is a different type, or the (short) row did
+  /// not store it. Unlike `value(at:)` this does NOT apply a column DEFAULT for a
+  /// missing column (callers needing default-aware reads use `value(at:)`).
+  public static func withText<R>(
+    at index: Int, in span: RawSpan,
+    _ body: (UnsafeRawBufferPointer?) throws(DBError) -> R
+  ) throws(DBError) -> R {
+    unsafe try withPayload(at: index, in: span, expecting: CellTag.text, body)
+  }
+
+  public static func withBlob<R>(
+    at index: Int, in span: RawSpan,
+    _ body: (UnsafeRawBufferPointer?) throws(DBError) -> R
+  ) throws(DBError) -> R {
+    unsafe try withPayload(at: index, in: span, expecting: CellTag.blob, body)
+  }
+
+  private static func withPayload<R>(
+    at index: Int, in span: RawSpan, expecting tag: UInt8,
+    _ body: (UnsafeRawBufferPointer?) throws(DBError) -> R
+  ) throws(DBError) -> R {
+    try span.withUnsafeBytes { (bytes: UnsafeRawBufferPointer) throws(DBError) -> R in
+      var offset = 0
+      let stored = unsafe try readHeader(bytes, &offset)
+      guard index < stored else { return try body(nil) }
+      for _ in 0..<index { unsafe try skipCell(bytes, &offset) }
+      guard offset < bytes.count else {
+        throw DBError.integrityFailure("row record: truncated cell")
+      }
+      guard unsafe bytes[offset] == tag else { return try body(nil) }
+      offset += 1
+      guard let length = unsafe Varint.read(bytes, &offset),
+        length <= UInt64(bytes.count - offset)
+      else {
+        throw DBError.integrityFailure("row record: truncated cell payload")
+      }
+      let payload = unsafe UnsafeRawBufferPointer(rebasing: bytes[offset..<offset + Int(length)])
+      return unsafe try body(payload)
+    }
+  }
+
   /// Reads the leading varint column count and advances `offset` to the first
   /// cell — the entry point for incremental, allocation-free column location.
   public static func readHeader(

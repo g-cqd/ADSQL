@@ -64,6 +64,28 @@ public struct RowView: ~Copyable, ~Escapable {
     return try value(at: index)
   }
 
+  /// Zero-copy access to a TEXT column's UTF-8 bytes (no `String` allocation):
+  /// `body` receives the bytes in place — valid only for the call — or `nil`
+  /// when the column is NULL, not TEXT, or the rowid-alias. Pair with a column
+  /// index resolved once (`definition.columnIndex(of:)`) on hot scans.
+  public func withText<R>(
+    at index: Int, _ body: (UnsafeRawBufferPointer?) throws(DBError) -> R
+  ) throws(DBError) -> R {
+    precondition(index >= 0 && index < definition.columns.count, "column index out of range")
+    if let alias = definition.rowidAliasIndex, index == alias { return try body(nil) }
+    return unsafe try RecordCodec.withText(at: index, in: span, body)
+  }
+
+  /// Zero-copy access to a BLOB column's raw bytes (no `[UInt8]` allocation);
+  /// `body` gets `nil` when the column is NULL or not a BLOB.
+  public func withBlob<R>(
+    at index: Int, _ body: (UnsafeRawBufferPointer?) throws(DBError) -> R
+  ) throws(DBError) -> R {
+    precondition(index >= 0 && index < definition.columns.count, "column index out of range")
+    if let alias = definition.rowidAliasIndex, index == alias { return try body(nil) }
+    return unsafe try RecordCodec.withBlob(at: index, in: span, body)
+  }
+
   public func integer(_ name: String) throws(DBError) -> Int64? {
     if case .integer(let v)? = try value(name) { return v }
     return nil
