@@ -3,7 +3,8 @@
 A pure-Swift, SQLite-compatible embedded database engine for macOS. This file
 is the single source of truth for milestone status, performance headroom, the
 deferred-SQL registry, and the consumer (apple-docs) dependency. Design
-rationale lives in `docs/rfcs/`.
+rationale lives in `docs/rfcs/`; active multi-milestone execution (M5 → M7) is
+scheduled in `docs/rfcs/0008-execution-schedule.md` — the live program tracker.
 
 ## Milestone suite
 
@@ -16,8 +17,9 @@ rationale lives in `docs/rfcs/`.
 | **M4.6 — Scan-engine performance** | ✅ done | Zero-copy row decode (no per-row record copy) + bounded top-N + drop residual conjuncts an exact index probe already covers. Took `sql search` 14.3 → 5.34 ms. See `docs/rfcs/0002-scan-engine-performance.md`. |
 | **M4.7 — Perf + memory-safety pass** | ✅ done | Perf: B7 ordered rowid fetch (warm `Cursor.seekForward`, 5.34 → ~5.0 ms), B1 incremental decode, B3 positional `insertAssembled`, A4 relational lazy `RowView` scan (index scan ~2×). Safety: **`-strict-memory-safety` enabled module-wide** (SE-0458) — every unsafe construct marked `unsafe` or `@safe`-encapsulated, perf-neutral. See `docs/rfcs/0003-…`. |
 | **M4.8 — Query-engine performance** | ✅ done | `SELECT DISTINCT` O(n²)→O(n) (GroupKey); index-nested-loop join (the O(M·N) S1 bug → O(M·logN)); write-path `Array(s.utf8)` allocs dropped; **column references bound to `(table,column)` slots at bind time** — removes the per-row `binding.resolve` `lowercased()` string resolution the profiling fingered (`sql search` ~10%, `distinct` ~17%, `join` ~20%). Profiling re-attributed gap (b): the descent/fetch is competitive; the residual is the per-row tree-walk interpreter (a future VDBE-style flat loop). Hash join + persisted `ANALYZE` deferred (low value for an FK-indexed search DB). See `docs/reviews/0002-…`, `docs/rfcs/0004-…`. |
-| **M5 — FTS + vector indexes** | ⏳ next | First-class full-text search: FTS5 virtual tables, `MATCH`, `bm25()` with custom weights, porter/unicode61 + trigram tokenizers, sync triggers. Same on-disk format. **The apple-docs migration blocker.** (Vector search is app-side — see below — so M5 is effectively FTS5.) |
-| **M6 — Hardening + importer** | ⏳ queued | Expanded fuzz/crash-injection coverage, a SQLite-file importer (loose→strict type coercion), and operational polish. |
+| **M5 — FTS + bm25/bm25f** | 🚧 in progress | First-class full-text search: `CREATE VIRTUAL TABLE … USING fts5`, `MATCH`, `bm25()`/**bm25f** custom weights, porter/unicode61 + trigram tokenizers, block-max WAND top-k, general `CREATE TRIGGER` sync. Same on-disk format (version-bumped). **The apple-docs migration blocker.** Act I of the two-act program (RFC 0008); phases F0–F6. See `docs/rfcs/0007-fts-and-ranking.md`. (Vector search is app-side — see below — so M5 is effectively FTS5.) |
+| **M6 — Hardening + importer** | ⏳ queued | Expanded fuzz/crash-injection coverage, a SQLite-file importer (loose→strict type coercion), and operational polish. Not part of the M5→M7 program (RFC 0008); the FTS format-version bump + crash-injection feed it. |
+| **M7 — Query DSL & metaprogramming** | ⏳ planned | Type-safe, injection-safe query DSL lowering to the public AST via a `prepare(ast:)` seam (result builder + operators, dependency-free); macro tier (`#SQL`, `@Table`, `@dynamicMemberLookup`, `@FixedLayout`) on a **scoped** `swift-syntax` `.macro` plugin (kernel stays zero-dep). Act II of the two-act program (RFC 0008); phases P0–P2, gated on M5/F5. See `docs/rfcs/0006-swift-metaprogramming-and-dsl.md`. |
 
 ## Performance headroom
 
@@ -76,7 +78,10 @@ What closes each gap:
 Parsed-and-rejected today with named `sqlUnsupported` errors (not bugs —
 explicit scope boundaries):
 
-- **M5 (FTS):** `CREATE VIRTUAL TABLE`, `MATCH`, `bm25()`.
+- **M5 (FTS) — 🚧 in progress (RFC 0007, scheduled by RFC 0008):**
+  `CREATE VIRTUAL TABLE`, `MATCH`, `bm25()`, and general `CREATE TRIGGER` (the FTS
+  sync mechanism) are being un-rejected phase-by-phase (F0–F6). Live state: the
+  status table in `docs/rfcs/0008-execution-schedule.md`.
 - **Subqueries:** `EXISTS`, FROM-clause subqueries, `IN (SELECT …)` beyond the
   `json_each` shape, compound scalar subqueries.
 - **Aggregates:** `AVG`/`MIN`/`MAX`/`TOTAL`/`GROUP_CONCAT`, `COUNT(DISTINCT …)`.
@@ -84,7 +89,7 @@ explicit scope boundaries):
   `NATURAL`/`RIGHT`/`FULL`/`CROSS`/comma joins, `JOIN … USING`,
   `SELECT` without `FROM`.
 - **Operators:** `GLOB`/`REGEXP`, `LIKE … ESCAPE`, `IS` beyond `IS [NOT] NULL`.
-- **DDL/DML:** `ALTER TABLE`, `CREATE VIEW`/`TRIGGER`, partial indexes, `DESC`
+- **DDL/DML:** `ALTER TABLE`, `CREATE VIEW` (general `CREATE TRIGGER` → M5/F5), partial indexes, `DESC`
   index columns, `WITHOUT ROWID`, `PRIMARY KEY DESC`, `ON DELETE` actions
   beyond `CASCADE`/`RESTRICT`, `DEFAULT` exprs other than `datetime('now')`,
   `ON CONFLICT … DO UPDATE … WHERE`.
@@ -95,10 +100,12 @@ explicit scope boundaries):
 
 - SQLite's loose/dynamic typing — ADSQL columns are STRICT; coercion happens
   only at explicit boundaries (`CAST`, the M6 importer).
-- `EXPLAIN`, `VACUUM`, triggers, views, `ALTER TABLE` (beyond what the importer
-  needs).
+- `EXPLAIN`, `VACUUM`, views, `ALTER TABLE` (beyond what the importer needs).
+  (General `CREATE TRIGGER` is **in scope** as M5's FTS-sync mechanism — RFC 0007 F5.)
 - Non-macOS platforms (Apple Silicon first; 16 KiB native pages).
-- Third-party dependencies (zero).
+- Third-party **runtime** dependencies (zero). Amended (RFC 0008 D2): the M7 macro
+  tier adopts `swift-syntax`, **scoped to a compile-time-only `.macro` plugin target**
+  (`ADSQLMacros`); `ADSQLKernel` and every shipping artifact stay zero-dep.
 
 ## Consumer dependency (apple-docs / RFC 0001 P5)
 
