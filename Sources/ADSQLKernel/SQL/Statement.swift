@@ -98,7 +98,7 @@ public final class Statement: Sendable {
 
   // MARK: - Execution
 
-  /// All result rows.
+  /// All result rows (a SELECT result set, or a write's RETURNING rows).
   public func all(_ parameters: Value...) throws(DBError) -> [SQLRow] {
     try all(SQLParameters(positional: parameters))
   }
@@ -106,21 +106,21 @@ public final class Statement: Sendable {
     try all(SQLParameters(named: named))
   }
   public func all(_ parameters: SQLParameters) throws(DBError) -> [SQLRow] {
-    try query(parameters)
+    try execute(parameters).rows
   }
 
   /// The first result row, or nil.
   public func get(_ parameters: Value...) throws(DBError) -> SQLRow? {
-    try query(SQLParameters(positional: parameters)).first
+    try execute(SQLParameters(positional: parameters)).rows.first
   }
   public func get(_ named: [String: Value]) throws(DBError) -> SQLRow? {
-    try query(SQLParameters(named: named)).first
+    try execute(SQLParameters(named: named)).rows.first
   }
   public func get(_ parameters: SQLParameters) throws(DBError) -> SQLRow? {
-    try query(parameters).first
+    try execute(parameters).rows.first
   }
 
-  /// Executes for effect; rows (if any) are discarded.
+  /// Executes for effect; any rows (e.g. RETURNING) are discarded.
   @discardableResult
   public func run(_ parameters: Value...) throws(DBError) -> RunResult {
     try run(SQLParameters(positional: parameters))
@@ -131,14 +131,27 @@ public final class Statement: Sendable {
   }
   @discardableResult
   public func run(_ parameters: SQLParameters) throws(DBError) -> RunResult {
-    if case .select = ast {
-      _ = try query(parameters)
-      return RunResult()
-    }
-    throw DBError.sqlUnsupported("write statements arrive in a later slice")
+    try execute(parameters).result
   }
 
   // MARK: - Internals
+
+  /// Routes by statement kind: SELECT/compound reads run in a read snapshot;
+  /// INSERT/UPDATE/DELETE/DDL run in one exclusive write transaction.
+  private func execute(
+    _ parameters: SQLParameters
+  ) throws(DBError) -> (rows: [SQLRow], result: RunResult) {
+    switch ast {
+    case .select:
+      return (try query(parameters), RunResult())
+    case .insert, .update, .delete, .createTable, .createIndex, .dropTable, .dropIndex:
+      return try database.writeSync { txn throws(DBError) in
+        try Writer.execute(self.ast, txn: txn, params: parameters)
+      }
+    case .begin, .commit, .rollback:
+      throw DBError.sqlUnsupported("transaction control belongs to db.transaction/execute")
+    }
+  }
 
   private func query(_ parameters: SQLParameters) throws(DBError) -> [SQLRow] {
     guard case .select(let select) = ast else {
