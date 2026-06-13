@@ -75,8 +75,11 @@ public struct RowCursor<R: PageResolver>: ~Copyable {
     }
   }
 
-  /// The next row, or nil at the end of the bounds.
-  public mutating func next() throws(DBError) -> Row? {
+  /// The next `(rowid, record bytes)` without materializing into a `Row`, or
+  /// nil at the end of the bounds. The lazy-decode scan path builds its own
+  /// on-demand row view over these bytes; `next()` layers full
+  /// materialization on top.
+  public mutating func nextRecord() throws(DBError) -> (rowid: Int64, record: [UInt8])? {
     guard !exhausted else { return nil }
     let entry: (rowid: Int64, record: [UInt8]?)? = try cursor.withCurrent {
       (key, ref) throws(DBError) in
@@ -115,11 +118,17 @@ public struct RowCursor<R: PageResolver>: ~Copyable {
       }
       recordBytes = bytes
     }
-    let values = try Relation.materializeRow(
-      table: table, rowid: entry.rowid, recordBytes: recordBytes)
     exhausted = !(try cursor.next())
+    return (entry.rowid, recordBytes)
+  }
+
+  /// The next fully materialized row, or nil at the end of the bounds.
+  public mutating func next() throws(DBError) -> Row? {
+    guard let (rowid, recordBytes) = try nextRecord() else { return nil }
+    let values = try Relation.materializeRow(
+      table: table, rowid: rowid, recordBytes: recordBytes)
     return Row(
-      rowid: entry.rowid, names: table.definition.columns.map(\.name), values: values)
+      rowid: rowid, names: table.definition.columns.map(\.name), values: values)
   }
 }
 

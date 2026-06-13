@@ -52,6 +52,10 @@ public final class Database: Sendable {
   /// Latest-known schema snapshot, keyed by catalog version (MVCC-correct:
   /// readers verify their snapshot's version row before reuse).
   let relationSchemaCache = SchemaCache()
+  /// Parsed-statement LRU keyed by SQL text (the schema-independent half of
+  /// `prepare`). Bound plans live on each `Statement`, keyed by catalog
+  /// version.
+  let statementCache = Mutex<StatementCache>(StatementCache(capacity: 128))
 
   private init(
     path: String, channel: FileChannel, pager: Pager, options: DatabaseOptions,
