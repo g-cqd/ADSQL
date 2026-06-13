@@ -18,22 +18,34 @@ final class RowSlot {
   private let aliasIndex: Int?
   private(set) var rowid: Int64 = 0
   private var span = UnsafeRawBufferPointer(start: nil, count: 0)
-  private var offsets: [Int]?
   private var cache: [Value?]
+  // Incremental cell location: `offsets[i]` is the byte start of stored cell i,
+  // filled lazily up to the highest column read. Reused across rows (storage
+  // kept), so a sort-key-only scan pays no per-row [Int] allocation and walks
+  // only as far as the columns it touches.
+  private var offsets: [Int]
+  private var locatedCount = 0     // cells whose start is recorded in `offsets`
+  private var scanOffset = 0       // byte offset of the next unlocated cell
+  private var storedCount = 0
+  private var headerParsed = false
 
   init(table: TableDefinition) {
     self.columns = table.columns
     self.aliasIndex = table.rowidAliasIndex
     self.cache = Array(repeating: nil, count: table.columns.count)
+    self.offsets = []
+    self.offsets.reserveCapacity(table.columns.count)
   }
 
-  /// Re-points the slot at a new row's record span; clears the decode cache.
+  /// Re-points the slot at a new row's record span; resets the decode state.
   /// The span must stay valid for as long as the slot is read (the scan driver
   /// guarantees this within the per-row body).
   func load(rowid: Int64, span: UnsafeRawBufferPointer) {
     self.rowid = rowid
     self.span = span
-    self.offsets = nil
+    self.headerParsed = false
+    self.locatedCount = 0
+    self.offsets.removeAll(keepingCapacity: true)
     for index in cache.indices { cache[index] = nil }
   }
 
@@ -55,21 +67,31 @@ final class RowSlot {
 
   private func compute(at index: Int) throws(DBError) -> Value {
     if index == aliasIndex { return .integer(rowid) }
-    let offsets = try ensureOffsets()
-    guard index < offsets.count else {
+    guard let start = try locate(index) else {
       switch columns[index].defaultValue {
       case .value(let value): return value
       case .datetimeNow, nil: return .null
       }
     }
-    return try RecordCodec.decodeCell(span, at: offsets[index])
+    return try RecordCodec.decodeCell(span, at: start)
   }
 
-  private func ensureOffsets() throws(DBError) -> [Int] {
-    if let offsets { return offsets }
-    let computed = try RecordCodec.cellOffsets(span)
-    offsets = computed
-    return computed
+  /// Byte start of stored cell `index`, or nil if beyond the stored count.
+  /// Walks (and records) only as far as `index`, reusing prior work.
+  private func locate(_ index: Int) throws(DBError) -> Int? {
+    if !headerParsed {
+      var offset = 0
+      storedCount = try RecordCodec.readHeader(span, &offset)
+      scanOffset = offset
+      headerParsed = true
+    }
+    if index >= storedCount { return nil }
+    while locatedCount <= index {
+      offsets.append(scanOffset)
+      try RecordCodec.skipCell(span, &scanOffset)
+      locatedCount += 1
+    }
+    return offsets[index]
   }
 }
 

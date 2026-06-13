@@ -85,6 +85,25 @@ public enum RecordCodec {
     return try decodeOne(bytes, &offset)
   }
 
+  /// Reads the leading varint column count and advances `offset` to the first
+  /// cell — the entry point for incremental, allocation-free column location.
+  public static func readHeader(
+    _ bytes: UnsafeRawBufferPointer, _ offset: inout Int
+  ) throws(DBError) -> Int {
+    guard let rawCount = Varint.read(bytes, &offset), rawCount <= 4096 else {
+      throw DBError.integrityFailure("row record: bad column count")
+    }
+    return Int(rawCount)
+  }
+
+  /// Advances `offset` past one cell without materializing its payload (used to
+  /// walk to the i-th cell on the lazy scan path).
+  public static func skipCell(
+    _ bytes: UnsafeRawBufferPointer, _ offset: inout Int
+  ) throws(DBError) {
+    try skipOne(bytes, &offset)
+  }
+
   /// Decodes one tagged cell, advancing `offset` past it.
   private static func decodeOne(
     _ bytes: UnsafeRawBufferPointer, _ offset: inout Int
