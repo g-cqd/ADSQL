@@ -13,7 +13,8 @@ rationale lives in `docs/rfcs/`.
 | **M3 — Relational layer** | ✅ done | Strict typed `Value`/columns; order-preserving `KeyCodec`; `RecordCodec`; catalog + transactional DDL; DML with conflict policies and secondary-index maintenance; FK `ON DELETE CASCADE/RESTRICT`; deep integrity (index ⇄ row bijection). |
 | **M4 — SQL front end** | ✅ done | Lexer → parser → binder → heuristic planner → row-at-a-time executor → writer. Single-table & joined SELECT, WHERE/projection/ORDER BY/LIMIT/OFFSET/DISTINCT, INNER/LEFT joins, GROUP BY + COUNT/SUM + HAVING, UNION/UNION ALL, INSERT/UPDATE/DELETE + RETURNING, DDL. Differential-tested vs CSQLite. See `docs/rfcs/0001-sql-engine.md`. |
 | **M4.5 — SQL completeness** | ✅ done | PRAGMA compatibility, BETWEEN, INSERT…SELECT, `ON CONFLICT DO UPDATE` (upsert), correlated scalar subqueries, `db.transaction { }`. |
-| **M4.6 — Scan-engine performance** | ▶ active | Zero-copy row decode (no per-row record copy) + drop residual conjuncts an exact index probe already covers. Closes the filtered-scan headroom below. See `docs/rfcs/0002-scan-engine-performance.md`. |
+| **M4.6 — Scan-engine performance** | ✅ done | Zero-copy row decode (no per-row record copy) + bounded top-N + drop residual conjuncts an exact index probe already covers. Took `sql search` 14.3 → 5.34 ms. See `docs/rfcs/0002-scan-engine-performance.md`. |
+| **M4.7 — Perf + memory-safety pass** | ✅ done | Perf: B7 ordered rowid fetch (warm `Cursor.seekForward`, 5.34 → ~5.0 ms), B1 incremental decode, B3 positional `insertAssembled`, A4 relational lazy `RowView` scan (index scan ~2×). Safety: **`-strict-memory-safety` enabled module-wide** (SE-0458) — every unsafe construct marked `unsafe` or `@safe`-encapsulated, perf-neutral. See `docs/rfcs/0003-…`. |
 | **M5 — FTS + vector indexes** | ⏳ next | First-class full-text search: FTS5 virtual tables, `MATCH`, `bm25()` with custom weights, porter/unicode61 + trigram tokenizers, sync triggers. Same on-disk format. **The apple-docs migration blocker.** (Vector search is app-side — see below — so M5 is effectively FTS5.) |
 | **M6 — Hardening + importer** | ⏳ queued | Expanded fuzz/crash-injection coverage, a SQLite-file importer (loose→strict type coercion), and operational polish. |
 
@@ -30,10 +31,10 @@ paths and trails on filtered scans and inserts:
 | raw KV scan | 4935 MB/s | 4039 MB/s | **1.2×** | ✓ |
 | 16 concurrent readers | 1.07 M/s | 0.47 M/s | **2.3×** | ✓ |
 | rowid get (p50) | 0.8 µs | 2.2 µs | **2.75×** | ✓ |
-| **`sql search` (filter + ORDER BY/LIMIT)** | ~~14.3 ms~~ → **5.34 ms** | 1.76 ms | ~~0.12×~~ → **0.33× (3.0× slower)** | M4.6 ✓ (2.66× faster) |
-| **relational index scan** | 1.23 M/s | 3.53 M/s | **0.35×** | → relational lazy-cursor (deferred) |
-| **batch insert (SQL / 3-index)** | 138 k/s | 222 k/s | **0.62×** | → write-path pass (deferred) |
-| batch insert (relational / 5-index) | 118 k/s | 159 k/s | 0.75× | → write-path pass (deferred) |
+| **`sql search` (filter + ORDER BY/LIMIT)** | ~~14.3~~ → ~~5.34~~ → **~5.0 ms** | 1.76 ms | ~~0.12×~~ → **0.35× (2.9× slower)** | M4.6 + M4.7/B7 ✓ |
+| **relational index scan** | ~~1.23~~ → **~2.2 M/s** | ~3.1 M/s | ~~0.35×~~ → **~0.69×** | M4.7/A4 ✓ (lazy `RowView`, ~2×) |
+| **batch insert (SQL / 3-index)** | ~138 → **143 k/s** | ~224 k/s | ~~0.62×~~ → **~0.64×** | M4.7/B3 (dict removed; B+tree COW dominates) |
+| batch insert (relational / 5-index) | 118 k/s | 159 k/s | 0.75× | `insertAssembled` available; write-path (COW) is the real lever — deferred |
 
 What closes each gap:
 
@@ -48,17 +49,23 @@ What closes each gap:
   index→table descent (shared with SQLite) plus `RecordCodec.cellOffsets`
   walking/allocating the full offset table to read one sort-key column — a
   candidate for incremental single-column decode.
-- **Relational index scan (deferred).** The `ADSQLBench table` scan uses the
-  relational API (`withIndexCursor` → `RowCursor.next()` → full
-  `materializeRow`), which still copies and materializes every column; it does
-  not flow through the executor's zero-copy path. A lazy relational cursor
-  would close it.
-- **Insert (deferred write-path pass).** `assembleRow`/`Writer.insert` build a
-  fresh `[String: Value]` dictionary per row. Fix: the never-built
-  `Relation.insertAssembled` (ordered `[Value]`, no dict), bound once.
+- **Relational index scan (M4.7/A4 ✓).** Added `RowView` (noncopyable, lazy)
+  + `RowCursor.forEachRow`, layered on the zero-copy `forEachRecordSpan`, so a
+  scan decodes only the columns it touches — no per-row `Row` + names array.
+  ~0.35× → ~0.69× (≈2×). The eager `next()`/`Row` API stays.
+- **Insert (M4.7/B3, partial).** `Relation.insertAssembled` (ordered `[Value]`,
+  no per-row dict) is built and used by `Writer.insert`. Removed the string
+  hashing, but `sql insert` barely moved (~0.64×): the four B+tree COW inserts
+  per row (table + 3 indexes) dominate, not row assembly. The real lever is the
+  **B+tree write path** (page COW / split / free-list) — a future perf item.
 - **Joins / correlated subqueries (deferred).** Inner/sub table is full-scanned
   per outer row (nested loop, no index probe). Fix: push the ON-equality /
   correlated predicate into an index probe (O(M·N) → O(M·log N)).
+- **Memory safety (M4.7 ✓).** `-strict-memory-safety` is on for the kernel: the
+  compiler now flags any new unsafe construct that isn't marked `unsafe` or
+  encapsulated by a `@safe` type. Perf-neutral. A future refinement is the
+  `@safe` Page-wrapper refactor (threading a safe page type through the B+tree
+  core to shrink the marked surface) — see RFC 0003.
 
 ## Deferred SQL constructs
 

@@ -1,12 +1,78 @@
 # RFC 0003 — Swift Memory-Safety & Performance API Adoption
 
-Status: proposed. A catalog of Swift 6.2-generation APIs (the `Span` family,
-`InlineArray`, lifetime dependencies, opt-in strict memory safety, the Swift
-Collections package) and where each one lands in ADSQL — what it makes *safer*,
-what it makes *faster*, and what it would only make *different*. This is a survey
-+ adoption guide for a later implementer, not an implemented change. Nothing here
-may alter results: the superset+residual contract (RFC 0001) and the differential
-suites remain the correctness gate.
+Status: **partially implemented (M4.7, 2026-06)**. A catalog of Swift
+6.2-generation APIs (the `Span` family, `InlineArray`, lifetime dependencies,
+opt-in strict memory safety, the Swift Collections package) and where each one
+lands in ADSQL — what it makes *safer*, *faster*, or only *different*. The
+"M4.7 implementation outcomes" section below records what actually shipped;
+the catalog beneath it is the original survey, kept as the adoption guide for
+the deferred items. Nothing here may alter results: the superset+residual
+contract (RFC 0001) and the differential suites remain the correctness gate.
+
+## M4.7 implementation outcomes (2026-06)
+
+M4.7 executed the chosen "all-in: RawSpan + strict MS" plus four perf items.
+What landed, measured:
+
+**Strict memory safety — shipped, module-wide.** `.strictMemorySafety()`
+(SE-0458) is on for `ADSQLKernel` (`Package.swift`). Every unsafe construct is
+now either marked `unsafe` (~620 expressions: raw-pointer subscripts/loads,
+mmap/madvise, `pread`/`pwrite`, the C atomics shim, page arithmetic) or
+encapsulated by a `@safe` type (the 8 unsafe-storage handles: `BTree.ValueRef`,
+`NodeBuilder.LeafCell`/`LeafValue`, `PageBuf`, `MMap`, `ReaderTable`,
+`RowSlot`, `RowView`). The compiler now enforces that any *new* unsafe use is
+called out. Drove 1280 advisories → 0 across 32 files; perf-neutral (the
+markers are annotations — `sql search` p50 4.97 ms, insert 143k rows/s, scan
+2.16M rows/s, all unchanged). TSan clean, 208 tests green.
+
+- *Approach chosen:* mark + `@safe`-encapsulate, **not** a full `@safe`
+  Page-wrapper refactor of the B+tree core. Because page/value bytes flow as
+  `UnsafeRawBufferPointer` (an unsafe *type*), nearly every *use* is flagged
+  regardless of `@safe`; collapsing that would mean threading a safe page type
+  (or `RawSpan`) through every `Node`/`PageHeader` signature — a large, risky
+  refactor on a working kernel. Recorded as future work (would shrink the
+  marked surface to a small audited core).
+
+**RawSpan signature migration (A1/A2/A3) — evaluated, deferred.** The marked
+reads (`UnsafeRawBufferPointer` subscript / `loadUnaligned`) already **trap on
+out-of-bounds** in non-`-Ounchecked` builds, so memory safety (no UB) is
+already achieved. Migrating decode signatures to `RawSpan`/`Span<UInt8>` would
+only remove some `unsafe` markers, at the cost of signature churn (and possible
+per-byte bounds-check cost on the hot loop) on a now-clean, verified kernel.
+Spike confirmed the closure-yield-`RawSpan` pattern and safe `Span<UInt8>`
+parsing compile at the 6.4 floor without experimental features (returning a
+`~Escapable` still needs `@_lifetime` + `LifetimeDependence`). Deferred as an
+ergonomic refinement, not a safety gap.
+
+**Perf items (four):**
+
+| Item | Result | Verdict |
+|---|---|---|
+| **B1** incremental single-column decode | 5.34 → ~5.3 ms (within noise) | perf-neutral; decode wasn't the bottleneck (confirms RFC 0002) — kept (cleaner) |
+| **B7** ordered rowid fetch (warm `Cursor.seekForward`) | 5.34 → **~5.0 ms** p50, stable | kept — a real, modest win; *new catalog entry below* |
+| **B3** positional `insertAssembled` (no per-row dict) | insert ~0.62× → ~0.64× SQLite (noise) | perf-neutral; the 4 B+tree COW inserts/row dominate, not the dict — kept as a simplification + correct primitive |
+| **A4** relational lazy `RowView` scan | index scan **~0.35× → ~0.69×** SQLite (2.1–2.2M rows/s, ~2×) | clear win — eager `Row` materialized all columns + names array |
+
+**D1 / D4 audit.** The one Swift-level atomic (`FileChannel.close`'s double-
+close guard) uses explicit `.acquiringAndReleasing`; all cross-process atomics
+go through the `ADCAtomics` C shim by design (D2 — Swift `Atomic` can't alias
+shared mmap memory). The five `@unchecked Sendable` types (`FileChannel`,
+`Pager`, `MMap`, `WriterLoop.PendingWrite`, `ReaderTable`) are justified
+(single-owner OS resources / cross-process-atomic discipline) and TSan-verified.
+No changes required.
+
+### B7 (new). Ordered rowid fetch — "the descent is not a floor"
+
+RFC 0002 called the per-row index→table descent a floor shared with SQLite.
+That is only true for an *unordered* fetch. Within one index probe the entries
+arrive in `(columns…, rowid)` order, so the rowids handed to the table fetch are
+**ascending**. The index-scan path (`Rows.swift forEachRecordSpan`) now reuses a
+single warm table `Cursor` via `Cursor.seekForward` — a leaf-local search that
+skips the root→leaf descent when the next rowid lies within the leaf the cursor
+already holds, falling back to a full `seek` otherwise. Provably equivalent to
+`seek` (fast path only when the key is bounded by the current leaf's
+first/last); a unit test asserts the equivalence. Measured `sql search`
+5.34 → ~5.0 ms. ROI: med (only same-leaf hits benefit), effort: low. **Shipped.**
 
 ## Goals
 
@@ -66,7 +132,7 @@ number. KPIs: `ADSQLBench` `sql search` p50 and the relational index-scan rows/s
 
 ## Catalog A — Memory safety
 
-### A1. `RawSpan` / `Span<UInt8>` on the scan path
+### A1. `RawSpan` / `Span<UInt8>` on the scan path — deferred (M4.7; see outcomes)
 **safety · ROI: high (safety) / neutral (perf) · effort: med-high**
 
 `forEachRecordSpan` (`Rows.swift:129`) hands an `UnsafeRawBufferPointer` to a
@@ -97,7 +163,7 @@ compile. Two paths:
 region without it. Convert `BTree.withValueBytes` / `Relation.withRowValue`
 (`Rows.swift:145,149`) to yield a `RawSpan` instead of an `UnsafeRawBufferPointer`.
 
-### A2. `RawSpan` in `ByteCodec`
+### A2. `RawSpan` in `ByteCodec` — deferred (M4.7; see outcomes)
 **safety · ROI: med · effort: low-med**
 
 `Varint.read` (`ByteCodec.swift:14`) and the `loadLE16/32/64` extensions (`:41-54`)
@@ -108,7 +174,7 @@ become the span's own checks. This propagates safety to every caller
 (`Node.compare`, `RecordCodec.cellOffsets/decodeCell`, key compares) once A1 yields
 spans. Keep the `UnsafeRawBufferPointer` overloads until callers migrate.
 
-### A3. `MutableRawSpan` / `MutableSpan` for page writers
+### A3. `MutableRawSpan` / `MutableSpan` for page writers — deferred (M4.7; see outcomes)
 **safety · ROI: med · effort: med**
 
 `PageBuf` exposes `public let raw: UnsafeMutableRawBufferPointer` (`PageBuf.swift:5`)
@@ -119,7 +185,7 @@ accessor (SE-0467) and migrate writers to it. The page-aligned allocation in
 `PageBuf.init` (`:9-12`) is **legitimate and stays** — only the *access* becomes
 safe. Same `~Escapable` rule as A1: vend via accessor/closure, never store the span.
 
-### A4. Opt-in strict memory safety (`StrictMemorySafety`)
+### A4. Opt-in strict memory safety (`StrictMemorySafety`) — SHIPPED (M4.7; see outcomes)
 **reliability · ROI: high · effort: med (annotation churn) · sequence last**
 
 SE-0458 (Swift 6.2) adds an opt-in mode (`swiftSettings: [.strictMemorySafety()]`,
@@ -151,7 +217,7 @@ discarded inside one call — sort-key assembly, record encode staging — pairi
 
 ## Catalog B — Performance & allocation reduction
 
-### B1. Incremental single-column decode  ★ codebase-endorsed next lever
+### B1. Incremental single-column decode  ★ — SHIPPED (M4.7; perf-neutral)
 **perf · ROI: high · effort: med**
 
 `RecordCodec.cellOffsets` (`RecordCodec.swift:66`) allocates a fresh `[Int]` of
@@ -189,7 +255,7 @@ NOCASE = ASCII fold on the fly, mirroring `compareUTF8NoCase`). Net effect:
 `ValueRef` in `Eval`; (iii) materialize at projection only. Highest-effort item
 here; gate strictly on a benchmark.
 
-### B3. `OutputRawSpan` / `MutableRawSpan` on the write path
+### B3. `OutputRawSpan` / `MutableRawSpan` on the write path — superseded (M4.7: positional `insertAssembled`)
 **perf · ROI: med · effort: med**
 
 `RecordCodec.encode` (`RecordCodec.swift:21`) grows a `var out: [UInt8] = []` and,

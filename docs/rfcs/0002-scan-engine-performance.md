@@ -110,7 +110,17 @@ No slice can change results:
   (approach SQLite; the per-row index→table descent is the shared floor, so
   parity is the ceiling, not the promise).
 
+## Follow-up (M4.7)
+
+The "per-row index→table descent is the shared floor" claim above held only for
+an *unordered* fetch. Within one index probe the rowids are ascending, so a warm
+table cursor (`Cursor.seekForward`, leaf-local) skips most re-descents — **B7**
+in RFC 0003 took `sql search` 5.34 → ~5.0 ms. The relational scan and write-path
+items below also landed in M4.7 (A4 lazy `RowView`, B3 `insertAssembled`); see
+RFC 0003's outcomes section.
+
 ## Out of scope
 
-The write-path `insertAssembled` headroom and join/correlated-subquery index
-probing are tracked separately in `ROADMAP.md`.
+The join/correlated-subquery index probing is tracked separately in
+`ROADMAP.md`. (The write-path `insertAssembled` headroom landed in M4.7/B3 —
+the residual insert gap is now the B+tree COW write path, a future item.)
