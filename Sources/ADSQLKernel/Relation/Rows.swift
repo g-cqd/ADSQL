@@ -42,7 +42,7 @@ public struct Row: Equatable, Sendable {
   init(rowid: Int64, definition: TableDefinition, span: UnsafeRawBufferPointer) {
     self.rowid = rowid
     self.definition = definition
-    self.span = span
+    unsafe self.span = unsafe span
   }
 
   /// The value of the column at `index` (schema order). Columns a short row did
@@ -52,15 +52,15 @@ public struct Row: Equatable, Sendable {
     precondition(index >= 0 && index < definition.columns.count, "column index out of range")
     if let alias = definition.rowidAliasIndex, index == alias { return .integer(rowid) }
     var offset = 0
-    let stored = try RecordCodec.readHeader(span, &offset)
+    let stored = unsafe try RecordCodec.readHeader(span, &offset)
     if index >= stored {
       switch definition.columns[index].defaultValue {
       case .value(let v): return v
       case .datetimeNow, nil: return .null
       }
     }
-    for _ in 0..<index { try RecordCodec.skipCell(span, &offset) }
-    return try RecordCodec.decodeCell(span, at: offset)
+    for _ in 0..<index { unsafe try RecordCodec.skipCell(span, &offset) }
+    return unsafe try RecordCodec.decodeCell(span, at: offset)
   }
 
   /// The value of the named column, or nil when no such column exists.
@@ -123,7 +123,7 @@ public struct RowCursor<R: PageResolver>: ~Copyable {
       var valid = false
       lowerKey.withUnsafeBytes { raw in
         do throws(DBError) {
-          _ = try cursor.seek(raw)
+          _ = unsafe try cursor.seek(raw)
           valid = cursor.isValid
         } catch {
           failure = error
@@ -142,15 +142,15 @@ public struct RowCursor<R: PageResolver>: ~Copyable {
   /// materialization on top.
   public mutating func nextRecord() throws(DBError) -> (rowid: Int64, record: [UInt8])? {
     guard !exhausted else { return nil }
-    let entry: (rowid: Int64, record: [UInt8]?)? = try cursor.withCurrent {
+    let entry: (rowid: Int64, record: [UInt8]?)? = unsafe try cursor.withCurrent {
       (key, ref) throws(DBError) in
       if let upperKey {
         let inBounds = upperKey.withUnsafeBytes { upper in
-          Node.compare(key, UnsafeRawBufferPointer(rebasing: upper[...])) < 0
+          unsafe Node.compare(key, UnsafeRawBufferPointer(rebasing: upper[...])) < 0
         }
         guard inBounds else { return nil }
       }
-      guard let rowid = KeyCodec.rowid(fromSuffixOf: key) else {
+      guard let rowid = unsafe KeyCodec.rowid(fromSuffixOf: key) else {
         throw DBError.integrityFailure("malformed key in \(table.definition.name)")
       }
       switch mode {
@@ -193,13 +193,13 @@ public struct RowCursor<R: PageResolver>: ~Copyable {
     switch mode {
     case .table:
       while !exhausted {
-        let step: Bool? = try cursor.withCurrent { (key, ref) throws(DBError) -> Bool? in
-          if let upperKey, !Self.inBounds(key, below: upperKey) { return nil }
-          guard let rowid = KeyCodec.rowid(fromSuffixOf: key) else {
+        let step: Bool? = unsafe try cursor.withCurrent { (key, ref) throws(DBError) -> Bool? in
+          if let upperKey, unsafe !Self.inBounds(key, below: upperKey) { return nil }
+          guard let rowid = unsafe KeyCodec.rowid(fromSuffixOf: key) else {
             throw DBError.integrityFailure("malformed key in \(table.definition.name)")
           }
-          return try BTree.withValueBytes(ref, resolver: resolver) { span throws(DBError) in
-            try body(rowid, span)
+          return unsafe try BTree.withValueBytes(ref, resolver: resolver) { span throws(DBError) in
+            unsafe try body(rowid, span)
           }
         } ?? nil
         guard let proceed = step else { exhausted = true; return }
@@ -214,9 +214,9 @@ public struct RowCursor<R: PageResolver>: ~Copyable {
       // two cursors never alias.
       var tableCursor = Cursor(resolver: resolver, tree: table.handle)
       while !exhausted {
-        let rowid: Int64? = try cursor.withCurrent { (key, _) throws(DBError) -> Int64? in
-          if let upperKey, !Self.inBounds(key, below: upperKey) { return nil }
-          guard let rowid = KeyCodec.rowid(fromSuffixOf: key) else {
+        let rowid: Int64? = unsafe try cursor.withCurrent { (key, _) throws(DBError) -> Int64? in
+          if let upperKey, unsafe !Self.inBounds(key, below: upperKey) { return nil }
+          guard let rowid = unsafe KeyCodec.rowid(fromSuffixOf: key) else {
             throw DBError.integrityFailure("malformed key in \(table.definition.name)")
           }
           return rowid
@@ -227,7 +227,7 @@ public struct RowCursor<R: PageResolver>: ~Copyable {
         var found: Result<Bool, DBError> = .success(false)
         rowKey.withUnsafeBytes { raw in
           do throws(DBError) {
-            found = .success(try tableCursor.seekForward(raw))
+            found = unsafe .success(try tableCursor.seekForward(raw))
           } catch {
             found = .failure(error)
           }
@@ -236,9 +236,9 @@ public struct RowCursor<R: PageResolver>: ~Copyable {
           throw DBError.integrityFailure(
             "dangling index entry: \(table.definition.name) rowid \(rowid)")
         }
-        let proceed: Bool = try tableCursor.withCurrent { (_, rowRef) throws(DBError) in
-          try BTree.withValueBytes(rowRef, resolver: resolver) { span throws(DBError) in
-            try body(rowid, span)
+        let proceed: Bool = unsafe try tableCursor.withCurrent { (_, rowRef) throws(DBError) in
+          unsafe try BTree.withValueBytes(rowRef, resolver: resolver) { span throws(DBError) in
+            unsafe try body(rowid, span)
           }
         } ?? false
         if !proceed { return }
@@ -251,7 +251,7 @@ public struct RowCursor<R: PageResolver>: ~Copyable {
     _ key: UnsafeRawBufferPointer, below upperKey: [UInt8]
   ) -> Bool {
     upperKey.withUnsafeBytes { upper in
-      Node.compare(key, UnsafeRawBufferPointer(rebasing: upper[...])) < 0
+      unsafe Node.compare(key, UnsafeRawBufferPointer(rebasing: upper[...])) < 0
     }
   }
 
@@ -262,8 +262,8 @@ public struct RowCursor<R: PageResolver>: ~Copyable {
     _ body: (borrowing RowView) throws(DBError) -> Bool
   ) throws(DBError) {
     let definition = table.definition
-    try forEachRecordSpan { (rowid, span) throws(DBError) -> Bool in
-      try body(RowView(rowid: rowid, definition: definition, span: span))
+    unsafe try forEachRecordSpan { (rowid, span) throws(DBError) -> Bool in
+      unsafe try body(RowView(rowid: rowid, definition: definition, span: span))
     }
   }
 
@@ -335,15 +335,15 @@ extension Relation {
     var outcome: Result<Int64?, DBError> = .success(nil)
     prefix.withUnsafeBytes { raw in
       do throws(DBError) {
-        _ = try cursor.seek(raw)
+        _ = unsafe try cursor.seek(raw)
         guard cursor.isValid else { return }
-        let hit: Int64?? = try cursor.withCurrent { (key, _) throws(DBError) in
+        let hit: Int64?? = unsafe try cursor.withCurrent { (key, _) throws(DBError) in
           guard key.count == prefix.count + 8,
             prefix.withUnsafeBytes({ p in
-              key.prefix(prefix.count).elementsEqual(UnsafeRawBufferPointer(rebasing: p[...]))
+              unsafe key.prefix(prefix.count).elementsEqual(UnsafeRawBufferPointer(rebasing: p[...]))
             })
           else { return nil }
-          return KeyCodec.rowid(fromSuffixOf: key)
+          return unsafe KeyCodec.rowid(fromSuffixOf: key)
         }
         outcome = .success(hit ?? nil)
       } catch {

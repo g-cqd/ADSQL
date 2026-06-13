@@ -96,7 +96,7 @@ public final class FileChannel: StorageChannel, @unchecked Sendable {
         // Partial vectored write: finish the remainder element-wise.
         var skip = n
         var resumeAt = at + n
-        for buf in unsafe batch {
+        for unsafe buf in unsafe batch {
           if skip >= buf.count {
             skip -= buf.count
             continue

@@ -35,9 +35,9 @@ enum SQLFunctions {
   private static func format(_ d: Double, precision: Int) -> String {
     var buffer = [CChar](repeating: 0, count: 48)
     let result = "%.\(precision)g".withCString { fmt in
-      withVaList([d]) { args in
+      unsafe withVaList([d]) { args in
         buffer.withUnsafeMutableBufferPointer { out in
-          vsnprintf(out.baseAddress!, out.count, fmt, args)
+          unsafe vsnprintf(out.baseAddress!, out.count, fmt, args)
         }
       }
     }

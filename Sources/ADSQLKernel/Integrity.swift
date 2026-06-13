@@ -110,11 +110,11 @@ public enum Integrity {
       var cursor = Cursor(resolver: resolver, tree: index.handle)
       var positioned = try cursor.move(to: .first)
       while positioned {
-        let entryKey: [UInt8]? = try cursor.withCurrent { (key, _) throws(DBError) in
-          [UInt8](key)
+        let entryKey: [UInt8]? = unsafe try cursor.withCurrent { (key, _) throws(DBError) in
+          unsafe [UInt8](key)
         }
         guard let entryKey else { break }
-        guard let rowid = entryKey.withUnsafeBytes({ KeyCodec.rowid(fromSuffixOf: $0) }) else {
+        guard let rowid = entryKey.withUnsafeBytes({ unsafe KeyCodec.rowid(fromSuffixOf: $0) }) else {
           throw DBError.integrityFailure("index \(indexName): malformed entry key")
         }
         guard
@@ -162,7 +162,7 @@ extension Database {
     writeQueue.sync {
       let status = path.withCString { src in
         destination.withCString { dst in
-          clonefile(src, dst, 0)
+          unsafe clonefile(src, dst, 0)
         }
       }
       if status != 0 {

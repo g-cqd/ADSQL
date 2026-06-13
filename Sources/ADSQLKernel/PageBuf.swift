@@ -9,7 +9,7 @@
   public init(zeroed: Bool = true) {
     let ptr = UnsafeMutableRawPointer.allocate(
       byteCount: Format.pageSize, alignment: Format.pageSize)
-    self.raw = unsafe UnsafeMutableRawBufferPointer(start: ptr, count: Format.pageSize)
+    unsafe self.raw = unsafe UnsafeMutableRawBufferPointer(start: ptr, count: Format.pageSize)
     if zeroed {
       unsafe raw.initializeMemory(as: UInt8.self, repeating: 0)
     }

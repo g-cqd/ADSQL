@@ -6,7 +6,7 @@ import Darwin
 public enum CivilTime {
   public static func utcNowString() -> String {
     var ts = timespec()
-    clock_gettime(CLOCK_REALTIME, &ts)
+    unsafe clock_gettime(CLOCK_REALTIME, &ts)
     return string(forEpochSeconds: Int64(ts.tv_sec))
   }
 

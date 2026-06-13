@@ -47,7 +47,7 @@ enum Relation {
     key.withUnsafeBytes { keyBytes in
       value.withUnsafeBytes { valueBytes in
         do throws(DBError) {
-          try BTree.put(ctx: ctx, tree: &tree, key: keyBytes, value: valueBytes)
+          unsafe try BTree.put(ctx: ctx, tree: &tree, key: keyBytes, value: valueBytes)
         } catch {
           failure = error
         }
@@ -63,7 +63,7 @@ enum Relation {
     var result: Result<Bool, DBError> = .success(false)
     key.withUnsafeBytes { keyBytes in
       do throws(DBError) {
-        result = .success(try BTree.delete(ctx: ctx, tree: &tree, key: keyBytes))
+        result = unsafe .success(try BTree.delete(ctx: ctx, tree: &tree, key: keyBytes))
       } catch {
         result = .failure(error)
       }
@@ -81,7 +81,7 @@ enum Relation {
     var result: Result<R?, DBError> = .success(nil)
     key.withUnsafeBytes { keyBytes in
       do throws(DBError) {
-        if let ref = try BTree.get(resolver: resolver, tree: tree, key: keyBytes) {
+        if let ref = unsafe try BTree.get(resolver: resolver, tree: tree, key: keyBytes) {
           result = .success(try body(ref))
         }
       } catch {
@@ -97,7 +97,7 @@ enum Relation {
     var result: Result<[UInt8]?, DBError> = .success(nil)
     key.withUnsafeBytes { keyBytes in
       do throws(DBError) {
-        guard let ref = try BTree.get(resolver: resolver, tree: tree, key: keyBytes) else {
+        guard let ref = unsafe try BTree.get(resolver: resolver, tree: tree, key: keyBytes) else {
           return
         }
         result = .success(try BTree.copyValue(ref, resolver: resolver))
@@ -118,7 +118,7 @@ enum Relation {
     if let versionBytes = try getBytes(resolver, mainTree, key: Catalog.versionKey) {
       var decoded: Result<Catalog.VersionRow, DBError> = .success(Catalog.VersionRow())
       versionBytes.withUnsafeBytes { raw in
-        do throws(DBError) { decoded = .success(try Catalog.decodeVersion(raw)) } catch {
+        do throws(DBError) { decoded = unsafe .success(try Catalog.decodeVersion(raw)) } catch {
           decoded = .failure(error)
         }
       }
@@ -126,13 +126,13 @@ enum Relation {
     }
 
     // Tables first (index records resolve table names through them).
-    try scanKind(resolver, mainTree, kind: Catalog.kindTable) { name, valueBytes throws(DBError) in
-      let record = try Catalog.decodeTable(valueBytes, name: name)
+    unsafe try scanKind(resolver, mainTree, kind: Catalog.kindTable) { name, valueBytes throws(DBError) in
+      let record = unsafe try Catalog.decodeTable(valueBytes, name: name)
       state.tableRecords[name] = record
       state.handleBaselines[.table(record.tableId)] = record.handle
     }
-    try scanKind(resolver, mainTree, kind: Catalog.kindIndex) { name, valueBytes throws(DBError) in
-      let record = try Catalog.decodeIndex(valueBytes, name: name)
+    unsafe try scanKind(resolver, mainTree, kind: Catalog.kindIndex) { name, valueBytes throws(DBError) in
+      let record = unsafe try Catalog.decodeIndex(valueBytes, name: name)
       state.indexRecords[name] = record
       state.handleBaselines[.index(record.indexId)] = record.handle
     }
@@ -149,7 +149,7 @@ enum Relation {
     var failure: DBError?
     lower.withUnsafeBytes { raw in
       do throws(DBError) {
-        _ = try cursor.seek(raw)
+        _ = unsafe try cursor.seek(raw)
         positioned = cursor.isValid
       } catch {
         failure = error
@@ -157,15 +157,15 @@ enum Relation {
     }
     if let failure { throw failure }
     while positioned {
-      let proceed: Bool? = try cursor.withCurrent { (key, ref) throws(DBError) in
-        guard key.count >= 2, key[0] == Catalog.prefix, key[1] == kind else { return false }
+      let proceed: Bool? = unsafe try cursor.withCurrent { (key, ref) throws(DBError) in
+        guard key.count >= 2, unsafe key[0] == Catalog.prefix, unsafe key[1] == kind else { return false }
         _ = upper
-        let name = String(decoding: key[2...], as: UTF8.self)
+        let name = unsafe String(decoding: key[2...], as: UTF8.self)
         guard case .inline(let valueBytes) = ref else {
           // Catalog records are small; an overflow value means corruption.
           throw DBError.integrityFailure("catalog record \(name) not inline")
         }
-        try body(name, valueBytes)
+        unsafe try body(name, valueBytes)
         return true
       }
       guard proceed == true else { break }
@@ -211,7 +211,7 @@ enum Relation {
       let value = state.sequences[tableId]!
       if state.sequenceBaselines[tableId] != value {
         var bytes: [UInt8] = []
-        withUnsafeBytes(of: value.littleEndian) { bytes.append(contentsOf: $0) }
+        withUnsafeBytes(of: value.littleEndian) { unsafe bytes.append(contentsOf: $0) }
         try putBytes(ctx, &main, key: Catalog.sequenceKey(tableId), value: bytes)
         state.sequenceBaselines[tableId] = value
       }
@@ -331,7 +331,7 @@ enum Relation {
     var result: Result<Catalog.TableRecord, DBError> = .failure(.noSuchTable(name))
     bytes.withUnsafeBytes { raw in
       do throws(DBError) {
-        result = .success(try Catalog.decodeTable(raw, name: name))
+        result = unsafe .success(try Catalog.decodeTable(raw, name: name))
       } catch {
         result = .failure(error)
       }
@@ -348,7 +348,7 @@ enum Relation {
     var result: Result<Catalog.IndexRecord, DBError> = .failure(.noSuchIndex(name))
     bytes.withUnsafeBytes { raw in
       do throws(DBError) {
-        result = .success(try Catalog.decodeIndex(raw, name: name))
+        result = unsafe .success(try Catalog.decodeIndex(raw, name: name))
       } catch {
         result = .failure(error)
       }

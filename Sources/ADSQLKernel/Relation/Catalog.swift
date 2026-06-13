@@ -30,7 +30,7 @@ enum Catalog {
 
   static func sequenceKey(_ tableId: UInt32) -> [UInt8] {
     var key: [UInt8] = [prefix, kindSequence]
-    withUnsafeBytes(of: tableId.bigEndian) { key.append(contentsOf: $0) }
+    withUnsafeBytes(of: tableId.bigEndian) { unsafe key.append(contentsOf: $0) }
     return key
   }
 
@@ -50,15 +50,15 @@ enum Catalog {
   static func encode(_ version: VersionRow) -> [UInt8] {
     var out: [UInt8] = []
     out.reserveCapacity(16)
-    withUnsafeBytes(of: version.catalogVersion.littleEndian) { out.append(contentsOf: $0) }
-    withUnsafeBytes(of: version.nextTableId.littleEndian) { out.append(contentsOf: $0) }
-    withUnsafeBytes(of: version.nextIndexId.littleEndian) { out.append(contentsOf: $0) }
+    withUnsafeBytes(of: version.catalogVersion.littleEndian) { unsafe out.append(contentsOf: $0) }
+    withUnsafeBytes(of: version.nextTableId.littleEndian) { unsafe out.append(contentsOf: $0) }
+    withUnsafeBytes(of: version.nextIndexId.littleEndian) { unsafe out.append(contentsOf: $0) }
     return out
   }
 
   static func decodeVersion(_ bytes: UnsafeRawBufferPointer) throws(DBError) -> VersionRow {
     guard bytes.count >= 16 else { throw DBError.integrityFailure("catalog version row too short") }
-    return VersionRow(
+    return unsafe VersionRow(
       catalogVersion: UInt64(littleEndian: bytes.loadUnaligned(fromByteOffset: 0, as: UInt64.self)),
       nextTableId: UInt32(littleEndian: bytes.loadUnaligned(fromByteOffset: 8, as: UInt32.self)),
       nextIndexId: UInt32(littleEndian: bytes.loadUnaligned(fromByteOffset: 12, as: UInt32.self)))
@@ -92,20 +92,20 @@ enum Catalog {
     _ bytes: UnsafeRawBufferPointer, _ offset: inout Int
   ) throws(DBError) -> String {
     guard offset < bytes.count else { throw DBError.integrityFailure("catalog: truncated name") }
-    let length = Int(bytes[offset])
+    let length = unsafe Int(bytes[offset])
     offset += 1
     guard offset + length <= bytes.count else {
       throw DBError.integrityFailure("catalog: truncated name body")
     }
-    let name = String(decoding: bytes[offset..<offset + length], as: UTF8.self)
+    let name = unsafe String(decoding: bytes[offset..<offset + length], as: UTF8.self)
     offset += length
     return name
   }
 
   private static func appendHandle(_ handle: TreeHandle, to out: inout [UInt8]) {
-    withUnsafeBytes(of: handle.rootPage.littleEndian) { out.append(contentsOf: $0) }
-    withUnsafeBytes(of: handle.depth.littleEndian) { out.append(contentsOf: $0) }
-    withUnsafeBytes(of: handle.count.littleEndian) { out.append(contentsOf: $0) }
+    withUnsafeBytes(of: handle.rootPage.littleEndian) { unsafe out.append(contentsOf: $0) }
+    withUnsafeBytes(of: handle.depth.littleEndian) { unsafe out.append(contentsOf: $0) }
+    withUnsafeBytes(of: handle.count.littleEndian) { unsafe out.append(contentsOf: $0) }
   }
 
   private static func readHandle(
@@ -114,7 +114,7 @@ enum Catalog {
     guard offset + 18 <= bytes.count else {
       throw DBError.integrityFailure("catalog: truncated tree handle")
     }
-    let handle = TreeHandle(
+    let handle = unsafe TreeHandle(
       rootPage: UInt64(littleEndian: bytes.loadUnaligned(fromByteOffset: offset, as: UInt64.self)),
       depth: UInt16(littleEndian: bytes.loadUnaligned(fromByteOffset: offset + 8, as: UInt16.self)),
       count: UInt64(littleEndian: bytes.loadUnaligned(fromByteOffset: offset + 10, as: UInt64.self)))
@@ -132,12 +132,12 @@ enum Catalog {
 
   static func encode(_ record: TableRecord) -> [UInt8] {
     var out: [UInt8] = [recordVersion]
-    withUnsafeBytes(of: record.tableId.littleEndian) { out.append(contentsOf: $0) }
+    withUnsafeBytes(of: record.tableId.littleEndian) { unsafe out.append(contentsOf: $0) }
     appendHandle(record.handle, to: &out)
     out.append(0) // tableFlags reserved
     let definition = record.definition
     withUnsafeBytes(of: UInt16(definition.columns.count).littleEndian) {
-      out.append(contentsOf: $0)
+      unsafe out.append(contentsOf: $0)
     }
     for column in definition.columns {
       appendName(column.name, to: &out)
@@ -156,15 +156,15 @@ enum Catalog {
         Varint.append(Varint.zigzag(v), to: &out)
       case .value(.real(let d)):
         out.append(3)
-        withUnsafeBytes(of: d.bitPattern.littleEndian) { out.append(contentsOf: $0) }
+        withUnsafeBytes(of: d.bitPattern.littleEndian) { unsafe out.append(contentsOf: $0) }
       case .value(.text(let s)):
         out.append(4)
         let utf8 = Array(s.utf8)
-        withUnsafeBytes(of: UInt16(utf8.count).littleEndian) { out.append(contentsOf: $0) }
+        withUnsafeBytes(of: UInt16(utf8.count).littleEndian) { unsafe out.append(contentsOf: $0) }
         out.append(contentsOf: utf8)
       case .value(.blob(let b)):
         out.append(5)
-        withUnsafeBytes(of: UInt16(b.count).littleEndian) { out.append(contentsOf: $0) }
+        withUnsafeBytes(of: UInt16(b.count).littleEndian) { unsafe out.append(contentsOf: $0) }
         out.append(contentsOf: b)
       case .datetimeNow:
         out.append(6)
@@ -192,37 +192,37 @@ enum Catalog {
     _ bytes: UnsafeRawBufferPointer, name: String
   ) throws(DBError) -> TableRecord {
     var offset = 0
-    guard bytes.count >= 1, bytes[0] == recordVersion else {
+    guard bytes.count >= 1, unsafe bytes[0] == recordVersion else {
       throw DBError.integrityFailure("catalog: bad table record version")
     }
     offset = 1
     guard offset + 4 <= bytes.count else {
       throw DBError.integrityFailure("catalog: truncated table id")
     }
-    let tableId = UInt32(littleEndian: bytes.loadUnaligned(fromByteOffset: offset, as: UInt32.self))
+    let tableId = unsafe UInt32(littleEndian: bytes.loadUnaligned(fromByteOffset: offset, as: UInt32.self))
     offset += 4
-    let handle = try readHandle(bytes, &offset)
+    let handle = unsafe try readHandle(bytes, &offset)
     guard offset < bytes.count else { throw DBError.integrityFailure("catalog: truncated flags") }
     offset += 1 // tableFlags
     guard offset + 2 <= bytes.count else {
       throw DBError.integrityFailure("catalog: truncated column count")
     }
-    let columnCount = Int(
+    let columnCount = unsafe Int(
       UInt16(littleEndian: bytes.loadUnaligned(fromByteOffset: offset, as: UInt16.self)))
     offset += 2
 
     var columns: [ColumnDefinition] = []
     columns.reserveCapacity(columnCount)
     for _ in 0..<columnCount {
-      let columnName = try readName(bytes, &offset)
+      let columnName = unsafe try readName(bytes, &offset)
       guard offset + 3 <= bytes.count else {
         throw DBError.integrityFailure("catalog: truncated column")
       }
-      guard let type = ColumnType(rawValue: bytes[offset]) else {
+      guard let type = unsafe ColumnType(rawValue: bytes[offset]) else {
         throw DBError.integrityFailure("catalog: unknown column type")
       }
-      let flags = bytes[offset + 1]
-      let defaultKind = bytes[offset + 2]
+      let flags = unsafe bytes[offset + 1]
+      let defaultKind = unsafe bytes[offset + 2]
       offset += 3
       var defaultValue: DefaultValue?
       switch defaultKind {
@@ -231,7 +231,7 @@ enum Catalog {
       case 1:
         defaultValue = .value(.null)
       case 2:
-        guard let raw = Varint.read(bytes, &offset) else {
+        guard let raw = unsafe Varint.read(bytes, &offset) else {
           throw DBError.integrityFailure("catalog: truncated default int")
         }
         defaultValue = .value(.integer(Varint.unzigzag(raw)))
@@ -239,22 +239,22 @@ enum Catalog {
         guard offset + 8 <= bytes.count else {
           throw DBError.integrityFailure("catalog: truncated default real")
         }
-        let bits = UInt64(littleEndian: bytes.loadUnaligned(fromByteOffset: offset, as: UInt64.self))
+        let bits = unsafe UInt64(littleEndian: bytes.loadUnaligned(fromByteOffset: offset, as: UInt64.self))
         offset += 8
         defaultValue = .value(.real(Double(bitPattern: bits)))
       case 4, 5:
         guard offset + 2 <= bytes.count else {
           throw DBError.integrityFailure("catalog: truncated default length")
         }
-        let length = Int(
+        let length = unsafe Int(
           UInt16(littleEndian: bytes.loadUnaligned(fromByteOffset: offset, as: UInt16.self)))
         offset += 2
         guard offset + length <= bytes.count else {
           throw DBError.integrityFailure("catalog: truncated default body")
         }
-        let payload = bytes[offset..<offset + length]
+        let payload = unsafe bytes[offset..<offset + length]
         offset += length
-        defaultValue = defaultKind == 4
+        defaultValue = unsafe defaultKind == 4
           ? .value(.text(String(decoding: payload, as: UTF8.self)))
           : .value(.blob([UInt8](payload)))
       case 6:
@@ -270,18 +270,18 @@ enum Catalog {
     }
 
     guard offset < bytes.count else { throw DBError.integrityFailure("catalog: truncated pk") }
-    let pkKind = bytes[offset]
+    let pkKind = unsafe bytes[offset]
     offset += 1
     let primaryKey: PrimaryKey
     switch pkKind {
     case 0:
       primaryKey = .implicitRowid
     case 1:
-      let column = try readName(bytes, &offset)
+      let column = unsafe try readName(bytes, &offset)
       guard offset < bytes.count else {
         throw DBError.integrityFailure("catalog: truncated autoincrement flag")
       }
-      let autoincrement = bytes[offset] != 0
+      let autoincrement = unsafe bytes[offset] != 0
       offset += 1
       primaryKey = .rowidAlias(column: column, autoincrement: autoincrement)
     default:
@@ -289,19 +289,19 @@ enum Catalog {
     }
 
     guard offset < bytes.count else { throw DBError.integrityFailure("catalog: truncated fk count") }
-    let fkCount = Int(bytes[offset])
+    let fkCount = unsafe Int(bytes[offset])
     offset += 1
     var foreignKeys: [ForeignKey] = []
     for _ in 0..<fkCount {
       guard offset < bytes.count else {
         throw DBError.integrityFailure("catalog: truncated fk")
       }
-      let colCount = Int(bytes[offset])
+      let colCount = unsafe Int(bytes[offset])
       offset += 1
       var childColumns: [String] = []
-      for _ in 0..<colCount { childColumns.append(try readName(bytes, &offset)) }
-      let parent = try readName(bytes, &offset)
-      guard offset < bytes.count, let action = FKAction(rawValue: bytes[offset]) else {
+      for _ in 0..<colCount { unsafe childColumns.append(try readName(bytes, &offset)) }
+      let parent = unsafe try readName(bytes, &offset)
+      guard offset < bytes.count, let action = unsafe FKAction(rawValue: bytes[offset]) else {
         throw DBError.integrityFailure("catalog: bad fk action")
       }
       offset += 1
@@ -321,8 +321,8 @@ enum Catalog {
 
   static func encode(_ record: IndexRecord) -> [UInt8] {
     var out: [UInt8] = [recordVersion]
-    withUnsafeBytes(of: record.indexId.littleEndian) { out.append(contentsOf: $0) }
-    withUnsafeBytes(of: record.tableId.littleEndian) { out.append(contentsOf: $0) }
+    withUnsafeBytes(of: record.indexId.littleEndian) { unsafe out.append(contentsOf: $0) }
+    withUnsafeBytes(of: record.tableId.littleEndian) { unsafe out.append(contentsOf: $0) }
     appendHandle(record.handle, to: &out)
     out.append(record.definition.unique ? 1 : 0)
     appendName(record.definition.table, to: &out)
@@ -335,31 +335,31 @@ enum Catalog {
     _ bytes: UnsafeRawBufferPointer, name: String
   ) throws(DBError) -> IndexRecord {
     var offset = 0
-    guard bytes.count >= 1, bytes[0] == recordVersion else {
+    guard bytes.count >= 1, unsafe bytes[0] == recordVersion else {
       throw DBError.integrityFailure("catalog: bad index record version")
     }
     offset = 1
     guard offset + 8 <= bytes.count else {
       throw DBError.integrityFailure("catalog: truncated index ids")
     }
-    let indexId = UInt32(littleEndian: bytes.loadUnaligned(fromByteOffset: offset, as: UInt32.self))
-    let tableId = UInt32(
+    let indexId = unsafe UInt32(littleEndian: bytes.loadUnaligned(fromByteOffset: offset, as: UInt32.self))
+    let tableId = unsafe UInt32(
       littleEndian: bytes.loadUnaligned(fromByteOffset: offset + 4, as: UInt32.self))
     offset += 8
-    let handle = try readHandle(bytes, &offset)
+    let handle = unsafe try readHandle(bytes, &offset)
     guard offset < bytes.count else {
       throw DBError.integrityFailure("catalog: truncated index flags")
     }
-    let unique = bytes[offset] & 1 != 0
+    let unique = unsafe bytes[offset] & 1 != 0
     offset += 1
-    let table = try readName(bytes, &offset)
+    let table = unsafe try readName(bytes, &offset)
     guard offset < bytes.count else {
       throw DBError.integrityFailure("catalog: truncated index column count")
     }
-    let colCount = Int(bytes[offset])
+    let colCount = unsafe Int(bytes[offset])
     offset += 1
     var columns: [String] = []
-    for _ in 0..<colCount { columns.append(try readName(bytes, &offset)) }
+    for _ in 0..<colCount { unsafe columns.append(try readName(bytes, &offset)) }
     return IndexRecord(
       indexId: indexId, tableId: tableId, handle: handle,
       definition: IndexDefinition(name, on: table, columns: columns, unique: unique))

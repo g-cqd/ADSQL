@@ -45,7 +45,7 @@ extension DBError: CustomStringConvertible {
   public var description: String {
     switch self {
     case .io(let errno, let op):
-      let detail = String(cString: strerror(errno))
+      let detail = unsafe String(cString: strerror(errno))
       return "I/O error in \(op): \(detail) (errno \(errno))"
     case .badMagic: return "not an ADSQL database (bad magic)"
     case .unsupportedFormatVersion(let v): return "unsupported format version \(v)"

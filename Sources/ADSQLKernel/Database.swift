@@ -149,7 +149,7 @@ public final class Database: Sendable {
     // meta from the mapped meta pages (checksums make torn reads safe).
     let refreshed: Meta? =
       if options.readOnly {
-        try? Meta.recover(meta0: pager.map.pageBytes(0), meta1: pager.map.pageBytes(1))
+        unsafe try? Meta.recover(meta0: pager.map.pageBytes(0), meta1: pager.map.pageBytes(1))
       } else {
         nil
       }
@@ -269,7 +269,7 @@ public struct ReadTxn: ~Copyable {
     var result: Result<[UInt8]?, DBError> = .success(nil)
     key.withUnsafeBytes { keyBytes in
       do throws(DBError) {
-        guard let ref = try BTree.get(resolver: resolver, meta: meta, key: keyBytes) else {
+        guard let ref = unsafe try BTree.get(resolver: resolver, meta: meta, key: keyBytes) else {
           return
         }
         result = .success(try BTree.copyValue(ref, resolver: resolver))
@@ -285,7 +285,7 @@ public struct ReadTxn: ~Copyable {
     var result: Result<Bool, DBError> = .success(false)
     key.withUnsafeBytes { keyBytes in
       do throws(DBError) {
-        result = .success(try BTree.get(resolver: resolver, meta: meta, key: keyBytes) != nil)
+        result = unsafe .success(try BTree.get(resolver: resolver, meta: meta, key: keyBytes) != nil)
       } catch {
         result = .failure(error)
       }
@@ -304,19 +304,19 @@ public struct ReadTxn: ~Copyable {
     var result: Result<R, DBError>?
     key.withUnsafeBytes { keyBytes in
       do throws(DBError) {
-        guard let ref = try BTree.get(resolver: resolver, meta: meta, key: keyBytes) else {
+        guard let ref = unsafe try BTree.get(resolver: resolver, meta: meta, key: keyBytes) else {
           result = .success(try body(nil))
           return
         }
         switch ref {
         case .inline(let bytes):
-          result = .success(try body(RawSpan(_unsafeBytes: bytes)))
+          result = unsafe .success(try body(RawSpan(_unsafeBytes: bytes)))
         case .overflow:
           let copied = try BTree.copyValue(ref, resolver: resolver)
           var inner: Result<R, DBError>?
           copied.withUnsafeBytes { raw in
             do throws(DBError) {
-              inner = .success(try body(RawSpan(_unsafeBytes: raw)))
+              inner = unsafe .success(try body(RawSpan(_unsafeBytes: raw)))
             } catch {
               inner = .failure(error)
             }
@@ -343,9 +343,9 @@ public struct ReadTxn: ~Copyable {
   public func forEach(
     _ body: ([UInt8], [UInt8]) throws(DBError) -> Void
   ) throws(DBError) {
-    try BTree.forEach(resolver: resolver, meta: meta) { (key, ref) throws(DBError) in
-      if key.first == Format.reservedKeyPrefix { return }
-      try body([UInt8](key), try BTree.copyValue(ref, resolver: resolver))
+    unsafe try BTree.forEach(resolver: resolver, meta: meta) { (key, ref) throws(DBError) in
+      if unsafe key.first == Format.reservedKeyPrefix { return }
+      unsafe try body([UInt8](key), try BTree.copyValue(ref, resolver: resolver))
     }
   }
 }
@@ -362,7 +362,7 @@ public struct WriteTxn: ~Copyable {
     key.withUnsafeBytes { keyBytes in
       value.withUnsafeBytes { valueBytes in
         do throws(DBError) {
-          try BTree.put(ctx: ctx, key: keyBytes, value: valueBytes)
+          unsafe try BTree.put(ctx: ctx, key: keyBytes, value: valueBytes)
         } catch {
           failure = error
         }
@@ -378,7 +378,7 @@ public struct WriteTxn: ~Copyable {
     var result: Result<Bool, DBError> = .success(false)
     key.withUnsafeBytes { keyBytes in
       do throws(DBError) {
-        result = .success(try BTree.delete(ctx: ctx, key: keyBytes))
+        result = unsafe .success(try BTree.delete(ctx: ctx, key: keyBytes))
       } catch {
         result = .failure(error)
       }
@@ -392,7 +392,7 @@ public struct WriteTxn: ~Copyable {
     var result: Result<[UInt8]?, DBError> = .success(nil)
     key.withUnsafeBytes { keyBytes in
       do throws(DBError) {
-        guard let ref = try BTree.get(resolver: ctx, meta: ctx.meta, key: keyBytes) else {
+        guard let ref = unsafe try BTree.get(resolver: ctx, meta: ctx.meta, key: keyBytes) else {
           return
         }
         result = .success(try BTree.copyValue(ref, resolver: ctx))

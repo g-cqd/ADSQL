@@ -120,7 +120,7 @@ extension Relation {
   ) throws(DBError) -> [Value] {
     var decoded: Result<[Value], DBError> = .success([])
     recordBytes.withUnsafeBytes { raw in
-      do throws(DBError) { decoded = .success(try RecordCodec.decode(raw)) } catch {
+      do throws(DBError) { decoded = unsafe .success(try RecordCodec.decode(raw)) } catch {
         decoded = .failure(error)
       }
     }
@@ -185,15 +185,15 @@ extension Relation {
     var outcome: Result<Int64?, DBError> = .success(nil)
     prefix.withUnsafeBytes { raw in
       do throws(DBError) {
-        _ = try cursor.seek(raw)
+        _ = unsafe try cursor.seek(raw)
         guard cursor.isValid else { return }
-        let hit: Int64?? = try cursor.withCurrent { (key, _) throws(DBError) in
+        let hit: Int64?? = unsafe try cursor.withCurrent { (key, _) throws(DBError) in
           guard key.count == prefix.count + 8,
             prefix.withUnsafeBytes({ p in
-              key.prefix(prefix.count).elementsEqual(UnsafeRawBufferPointer(rebasing: p[...]))
+              unsafe key.prefix(prefix.count).elementsEqual(UnsafeRawBufferPointer(rebasing: p[...]))
             })
           else { return nil }
-          return KeyCodec.rowid(fromSuffixOf: key)
+          return unsafe KeyCodec.rowid(fromSuffixOf: key)
         }
         if let rowid = hit ?? nil, rowid != excluding {
           outcome = .success(rowid)
@@ -216,7 +216,7 @@ extension Relation {
     if let bytes = try getBytes(ctx, ctx.meta.mainTree, key: Catalog.sequenceKey(tableId)),
       bytes.count >= 8 {
       let value = bytes.withUnsafeBytes {
-        UInt64(littleEndian: $0.loadUnaligned(as: UInt64.self))
+        unsafe UInt64(littleEndian: $0.loadUnaligned(as: UInt64.self))
       }
       state.sequences[tableId] = value
       state.sequenceBaselines[tableId] = value
@@ -244,8 +244,8 @@ extension Relation {
     var cursor = Cursor(resolver: ctx, tree: table.handle)
     var next: Int64 = 1
     if try cursor.move(to: .last) {
-      let last: Int64?? = try cursor.withCurrent { (key, _) throws(DBError) in
-        KeyCodec.rowid(fromSuffixOf: key)
+      let last: Int64?? = unsafe try cursor.withCurrent { (key, _) throws(DBError) in
+        unsafe KeyCodec.rowid(fromSuffixOf: key)
       }
       if let maxRowid = last ?? nil {
         guard maxRowid < Int64.max else {
@@ -526,9 +526,9 @@ extension Relation {
     var cursor = Cursor(resolver: ctx, tree: table.handle)
     var positioned = try cursor.move(to: .first)
     while positioned {
-      let entry: (rowid: Int64, bytes: [UInt8])? = try cursor.withCurrent {
+      let entry: (rowid: Int64, bytes: [UInt8])? = unsafe try cursor.withCurrent {
         (key, ref) throws(DBError) in
-        guard let rowid = KeyCodec.rowid(fromSuffixOf: key) else {
+        guard let rowid = unsafe KeyCodec.rowid(fromSuffixOf: key) else {
           throw DBError.integrityFailure("malformed row key in \(table.definition.name)")
         }
         return (rowid: rowid, bytes: try BTree.copyValue(ref, resolver: ctx))

@@ -31,12 +31,12 @@ import Darwin
 
   init(databasePath: String, claimWriterLock: Bool) throws(DBError) {
     let path = databasePath + "-lock"
-    let fd = path.withCString { open($0, O_RDWR | O_CREAT | O_CLOEXEC, 0o644) }
+    let fd = path.withCString { unsafe open($0, O_RDWR | O_CREAT | O_CLOEXEC, 0o644) }
     guard fd >= 0 else { try throwErrno("open(\(path))") }
     self.fd = fd
 
     var st = stat()
-    guard fstat(fd, &st) == 0 else {
+    guard unsafe fstat(fd, &st) == 0 else {
       close(fd)
       try throwErrno("fstat(lock)")
     }
@@ -46,32 +46,32 @@ import Darwin
         try throwErrno("ftruncate(lock)")
       }
     }
-    let mapped = mmap(nil, Format.lockFileSize, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0)
-    guard let mapped, mapped != MAP_FAILED else {
+    let mapped = unsafe mmap(nil, Format.lockFileSize, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0)
+    guard let mapped = unsafe mapped, unsafe mapped != MAP_FAILED else {
       close(fd)
       try throwErrno("mmap(lock)")
     }
-    self.base = mapped
+    unsafe self.base = unsafe mapped
 
     // Header magic (idempotent across processes).
-    let headerMagic = base.load(fromByteOffset: 0, as: UInt64.self)
+    let headerMagic = unsafe base.load(fromByteOffset: 0, as: UInt64.self)
     if headerMagic == 0 {
       Format.lockMagicBytes.withUnsafeBytes { magic in
-        base.copyMemory(from: magic.baseAddress!, byteCount: 8)
+        unsafe base.copyMemory(from: magic.baseAddress!, byteCount: 8)
       }
-      base.storeBytes(of: UInt32(1).littleEndian, toByteOffset: 8, as: UInt32.self)
-      base.storeBytes(
+      unsafe base.storeBytes(of: UInt32(1).littleEndian, toByteOffset: 8, as: UInt32.self)
+      unsafe base.storeBytes(
         of: UInt32(Format.readerSlotCount).littleEndian, toByteOffset: 12, as: UInt32.self)
     }
 
     if claimWriterLock {
       var lock = flock(
         l_start: 0, l_len: 1, l_pid: 0, l_type: Int16(F_WRLCK), l_whence: Int16(SEEK_SET))
-      if fcntl(fd, F_SETLK, &lock) == -1 {
+      if unsafe fcntl(fd, F_SETLK, &lock) == -1 {
         var probe = lock
-        _ = fcntl(fd, F_GETLK, &probe)
+        _ = unsafe fcntl(fd, F_GETLK, &probe)
         let holder = probe.l_pid
-        munmap(base, Format.lockFileSize)
+        unsafe munmap(base, Format.lockFileSize)
         close(fd)
         throw DBError.writerLockHeld(byPid: holder)
       }
@@ -83,7 +83,7 @@ import Darwin
 
   deinit {
     releaseSlot()
-    munmap(base, Format.lockFileSize)
+    unsafe munmap(base, Format.lockFileSize)
     close(fd) // also drops the fcntl lock
   }
 
@@ -91,7 +91,7 @@ import Darwin
 
   @inline(__always)
   private func slotPointer(_ index: Int, _ field: Int) -> UnsafeMutableRawPointer {
-    base + Format.lockHeaderSize + index * Format.readerSlotSize + field
+    unsafe base + Format.lockHeaderSize + index * Format.readerSlotSize + field
   }
 
   private func claimSlot() throws(DBError) {
@@ -100,10 +100,10 @@ import Darwin
     // several handles in one process claim distinct slots.
     let owner = pid | (UInt64.random(in: 1...0xFFFF) << 40)
     for index in 0..<Format.readerSlotCount {
-      let pidPtr = slotPointer(index, SlotOffset.ownerPid)
-      if adc_load_acquire_u64(pidPtr) == 0,
-        adc_cas_acq_rel_u64(pidPtr, 0, owner) {
-        adc_store_release_u64(slotPointer(index, SlotOffset.generation), 0)
+      let pidPtr = unsafe slotPointer(index, SlotOffset.ownerPid)
+      if unsafe adc_load_acquire_u64(pidPtr) == 0,
+        unsafe adc_cas_acq_rel_u64(pidPtr, 0, owner) {
+        unsafe adc_store_release_u64(slotPointer(index, SlotOffset.generation), 0)
         slotIndex = index
         return
       }
@@ -113,15 +113,15 @@ import Darwin
 
   private func releaseSlot() {
     guard slotIndex >= 0 else { return }
-    adc_store_release_u64(slotPointer(slotIndex, SlotOffset.generation), 0)
-    adc_store_release_u64(slotPointer(slotIndex, SlotOffset.ownerPid), 0)
+    unsafe adc_store_release_u64(slotPointer(slotIndex, SlotOffset.generation), 0)
+    unsafe adc_store_release_u64(slotPointer(slotIndex, SlotOffset.ownerPid), 0)
     slotIndex = -1
   }
 
   /// Publishes this handle's minimum active reader generation (0 = none).
   func publish(minGeneration: UInt64) {
     guard slotIndex >= 0 else { return }
-    adc_store_release_u64(slotPointer(slotIndex, SlotOffset.generation), minGeneration)
+    unsafe adc_store_release_u64(slotPointer(slotIndex, SlotOffset.generation), minGeneration)
   }
 
   /// Minimum generation across every live slot (any process), or nil when
@@ -129,8 +129,8 @@ import Darwin
   func minimumGeneration() -> UInt64? {
     var minimum: UInt64?
     for index in 0..<Format.readerSlotCount {
-      guard adc_load_acquire_u64(slotPointer(index, SlotOffset.ownerPid)) != 0 else { continue }
-      let generation = adc_load_acquire_u64(slotPointer(index, SlotOffset.generation))
+      guard unsafe adc_load_acquire_u64(slotPointer(index, SlotOffset.ownerPid)) != 0 else { continue }
+      let generation = unsafe adc_load_acquire_u64(slotPointer(index, SlotOffset.generation))
       guard generation != 0 else { continue }
       if minimum == nil || generation < minimum! { minimum = generation }
     }
@@ -140,13 +140,13 @@ import Darwin
   /// Clears slots owned by dead processes (kill(pid, 0) == ESRCH).
   func sweepStaleSlots() {
     for index in 0..<Format.readerSlotCount {
-      let pidPtr = slotPointer(index, SlotOffset.ownerPid)
-      let owner = adc_load_acquire_u64(pidPtr)
+      let pidPtr = unsafe slotPointer(index, SlotOffset.ownerPid)
+      let owner = unsafe adc_load_acquire_u64(pidPtr)
       guard owner != 0 else { continue }
       let pid = pid_t(truncatingIfNeeded: owner & 0xFF_FFFF_FFFF)
       if kill(pid, 0) == -1 && errno == ESRCH {
-        adc_store_release_u64(slotPointer(index, SlotOffset.generation), 0)
-        _ = adc_cas_acq_rel_u64(pidPtr, owner, 0)
+        unsafe adc_store_release_u64(slotPointer(index, SlotOffset.generation), 0)
+        _ = unsafe adc_cas_acq_rel_u64(pidPtr, owner, 0)
       }
     }
   }

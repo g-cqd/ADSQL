@@ -31,7 +31,7 @@ public enum RecordCodec {
         Varint.append(Varint.zigzag(v), to: &out)
       case .real(let d):
         out.append(CellTag.real)
-        withUnsafeBytes(of: d.bitPattern.littleEndian) { out.append(contentsOf: $0) }
+        withUnsafeBytes(of: d.bitPattern.littleEndian) { unsafe out.append(contentsOf: $0) }
       case .text(let s):
         out.append(CellTag.text)
         let utf8 = Array(s.utf8)
@@ -48,13 +48,13 @@ public enum RecordCodec {
 
   public static func decode(_ bytes: UnsafeRawBufferPointer) throws(DBError) -> [Value] {
     var offset = 0
-    guard let rawCount = Varint.read(bytes, &offset), rawCount <= 4096 else {
+    guard let rawCount = unsafe Varint.read(bytes, &offset), rawCount <= 4096 else {
       throw DBError.integrityFailure("row record: bad column count")
     }
     var values: [Value] = []
     values.reserveCapacity(Int(rawCount))
     for _ in 0..<rawCount {
-      values.append(try decodeOne(bytes, &offset))
+      unsafe values.append(try decodeOne(bytes, &offset))
     }
     return values
   }
@@ -65,14 +65,14 @@ public enum RecordCodec {
   /// strings, so it is cheap on the lazy-decode scan path.
   public static func cellOffsets(_ bytes: UnsafeRawBufferPointer) throws(DBError) -> [Int] {
     var offset = 0
-    guard let rawCount = Varint.read(bytes, &offset), rawCount <= 4096 else {
+    guard let rawCount = unsafe Varint.read(bytes, &offset), rawCount <= 4096 else {
       throw DBError.integrityFailure("row record: bad column count")
     }
     var offsets: [Int] = []
     offsets.reserveCapacity(Int(rawCount))
     for _ in 0..<rawCount {
       offsets.append(offset)
-      try skipOne(bytes, &offset)
+      unsafe try skipOne(bytes, &offset)
     }
     return offsets
   }
@@ -82,7 +82,7 @@ public enum RecordCodec {
     _ bytes: UnsafeRawBufferPointer, at start: Int
   ) throws(DBError) -> Value {
     var offset = start
-    return try decodeOne(bytes, &offset)
+    return unsafe try decodeOne(bytes, &offset)
   }
 
   /// Reads the leading varint column count and advances `offset` to the first
@@ -90,7 +90,7 @@ public enum RecordCodec {
   public static func readHeader(
     _ bytes: UnsafeRawBufferPointer, _ offset: inout Int
   ) throws(DBError) -> Int {
-    guard let rawCount = Varint.read(bytes, &offset), rawCount <= 4096 else {
+    guard let rawCount = unsafe Varint.read(bytes, &offset), rawCount <= 4096 else {
       throw DBError.integrityFailure("row record: bad column count")
     }
     return Int(rawCount)
@@ -101,7 +101,7 @@ public enum RecordCodec {
   public static func skipCell(
     _ bytes: UnsafeRawBufferPointer, _ offset: inout Int
   ) throws(DBError) {
-    try skipOne(bytes, &offset)
+    unsafe try skipOne(bytes, &offset)
   }
 
   /// Decodes one tagged cell, advancing `offset` past it.
@@ -111,13 +111,13 @@ public enum RecordCodec {
     guard offset < bytes.count else {
       throw DBError.integrityFailure("row record: truncated cell")
     }
-    let tag = bytes[offset]
+    let tag = unsafe bytes[offset]
     offset += 1
     switch tag {
     case CellTag.null:
       return .null
     case CellTag.integer:
-      guard let raw = Varint.read(bytes, &offset) else {
+      guard let raw = unsafe Varint.read(bytes, &offset) else {
         throw DBError.integrityFailure("row record: truncated integer")
       }
       return .integer(Varint.unzigzag(raw))
@@ -125,21 +125,21 @@ public enum RecordCodec {
       guard offset + 8 <= bytes.count else {
         throw DBError.integrityFailure("row record: truncated real")
       }
-      let bits = UInt64(littleEndian: bytes.loadUnaligned(fromByteOffset: offset, as: UInt64.self))
+      let bits = unsafe UInt64(littleEndian: bytes.loadUnaligned(fromByteOffset: offset, as: UInt64.self))
       offset += 8
       return .real(Double(bitPattern: bits))
     case CellTag.text:
-      guard let length = Varint.read(bytes, &offset), length <= UInt64(bytes.count - offset) else {
+      guard let length = unsafe Varint.read(bytes, &offset), length <= UInt64(bytes.count - offset) else {
         throw DBError.integrityFailure("row record: truncated text")
       }
-      let slice = bytes[offset..<offset + Int(length)]
+      let slice = unsafe bytes[offset..<offset + Int(length)]
       offset += Int(length)
-      return .text(String(decoding: slice, as: UTF8.self))
+      return unsafe .text(String(decoding: slice, as: UTF8.self))
     case CellTag.blob:
-      guard let length = Varint.read(bytes, &offset), length <= UInt64(bytes.count - offset) else {
+      guard let length = unsafe Varint.read(bytes, &offset), length <= UInt64(bytes.count - offset) else {
         throw DBError.integrityFailure("row record: truncated blob")
       }
-      let value = Value.blob([UInt8](bytes[offset..<offset + Int(length)]))
+      let value = unsafe Value.blob([UInt8](bytes[offset..<offset + Int(length)]))
       offset += Int(length)
       return value
     default:
@@ -154,13 +154,13 @@ public enum RecordCodec {
     guard offset < bytes.count else {
       throw DBError.integrityFailure("row record: truncated cell")
     }
-    let tag = bytes[offset]
+    let tag = unsafe bytes[offset]
     offset += 1
     switch tag {
     case CellTag.null:
       return
     case CellTag.integer:
-      guard Varint.read(bytes, &offset) != nil else {
+      guard unsafe Varint.read(bytes, &offset) != nil else {
         throw DBError.integrityFailure("row record: truncated integer")
       }
     case CellTag.real:
@@ -169,7 +169,7 @@ public enum RecordCodec {
       }
       offset += 8
     case CellTag.text, CellTag.blob:
-      guard let length = Varint.read(bytes, &offset), length <= UInt64(bytes.count - offset) else {
+      guard let length = unsafe Varint.read(bytes, &offset), length <= UInt64(bytes.count - offset) else {
         throw DBError.integrityFailure("row record: truncated cell payload")
       }
       offset += Int(length)

@@ -17,7 +17,7 @@
   private let columns: [ColumnDefinition]
   private let aliasIndex: Int?
   private(set) var rowid: Int64 = 0
-  private var span = UnsafeRawBufferPointer(start: nil, count: 0)
+  private var span = unsafe UnsafeRawBufferPointer(start: nil, count: 0)
   private var cache: [Value?]
   // Incremental cell location: `offsets[i]` is the byte start of stored cell i,
   // filled lazily up to the highest column read. Reused across rows (storage
@@ -42,7 +42,7 @@
   /// guarantees this within the per-row body).
   func load(rowid: Int64, span: UnsafeRawBufferPointer) {
     self.rowid = rowid
-    self.span = span
+    unsafe self.span = unsafe span
     self.headerParsed = false
     self.locatedCount = 0
     self.offsets.removeAll(keepingCapacity: true)
@@ -73,7 +73,7 @@
       case .datetimeNow, nil: return .null
       }
     }
-    return try RecordCodec.decodeCell(span, at: start)
+    return unsafe try RecordCodec.decodeCell(span, at: start)
   }
 
   /// Byte start of stored cell `index`, or nil if beyond the stored count.
@@ -81,14 +81,14 @@
   private func locate(_ index: Int) throws(DBError) -> Int? {
     if !headerParsed {
       var offset = 0
-      storedCount = try RecordCodec.readHeader(span, &offset)
+      storedCount = unsafe try RecordCodec.readHeader(span, &offset)
       scanOffset = offset
       headerParsed = true
     }
     if index >= storedCount { return nil }
     while locatedCount <= index {
       offsets.append(scanOffset)
-      try RecordCodec.skipCell(span, &scanOffset)
+      unsafe try RecordCodec.skipCell(span, &scanOffset)
       locatedCount += 1
     }
     return offsets[index]
@@ -164,8 +164,8 @@ enum SelectExecutor {
       context: context, env: env, residual: residual, outputs: plan.outputs,
       orderBy: plan.orderBy, orderCollations: plan.orderCollations, collectKeys: collectKeys,
       sliceEnd: sliceEnd, topN: topN, dedupRowids: dedupRowids)
-    try forEachRow(source, table: table, resolver: resolver) { rowid, span throws(DBError) in
-      try accumulator.consume(rowid: rowid, span: span)
+    unsafe try forEachRow(source, table: table, resolver: resolver) { rowid, span throws(DBError) in
+      unsafe try accumulator.consume(rowid: rowid, span: span)
     }
 
     var rows = accumulator.rows
@@ -239,7 +239,7 @@ enum SelectExecutor {
         if seenRowids!.contains(rowid) { return true }
         seenRowids!.insert(rowid)
       }
-      context.load(0, rowid: rowid, span: span)
+      unsafe context.load(0, rowid: rowid, span: span)
       if let residual {
         if SQLEval.truth(try SQLEval.evaluate(residual, env)) != .yes { return true }
       }
@@ -310,14 +310,14 @@ enum SelectExecutor {
     case .table:
       var cursor = try RowCursor(
         resolver: resolver, table: table, mode: .table, lowerKey: nil, upperKey: nil)
-      try cursor.forEachRecordSpan(body)
+      unsafe try cursor.forEachRecordSpan(body)
     case .rowids(let rowids):
       for rowid in rowids {
         let outcome: Bool? = try Relation.withRowValue(
           resolver, table.handle, key: KeyCodec.rowKey(rowid)
         ) { ref throws(DBError) in
-          try BTree.withValueBytes(ref, resolver: resolver) { span throws(DBError) in
-            try body(rowid, span)
+          unsafe try BTree.withValueBytes(ref, resolver: resolver) { span throws(DBError) in
+            unsafe try body(rowid, span)
           }
         }
         if outcome == false { return }  // nil = no such row → skip
@@ -327,7 +327,7 @@ enum SelectExecutor {
         let (lower, upper) = try Relation.scanBounds(bounds, index: index, table: table)
         var cursor = try RowCursor(
           resolver: resolver, table: table, mode: .index(index), lowerKey: lower, upperKey: upper)
-        try cursor.forEachRecordSpan(body)
+        unsafe try cursor.forEachRecordSpan(body)
       }
     }
   }
@@ -372,9 +372,9 @@ enum SelectExecutor {
 
     guard plan.isJoin else {
       let source = try resolveSource(plan, table: tables[0], index: index, env: paramsEnv)
-      try forEachRow(source, table: tables[0], resolver: resolver) {
+      unsafe try forEachRow(source, table: tables[0], resolver: resolver) {
         rowid, span throws(DBError) in
-        context.load(0, rowid: rowid, span: span)
+        unsafe context.load(0, rowid: rowid, span: span)
         if try passesWhere() { try body() }
         return true
       }
@@ -388,9 +388,9 @@ enum SelectExecutor {
       }
       let join = plan.joins[depth - 1]
       var matched = false
-      try forEachRow(.table, table: tables[depth], resolver: resolver) {
+      unsafe try forEachRow(.table, table: tables[depth], resolver: resolver) {
         rowid, span throws(DBError) in
-        context.load(depth, rowid: rowid, span: span)
+        unsafe context.load(depth, rowid: rowid, span: span)
         if SQLEval.truth(try SQLEval.evaluate(join.on, env)) == .yes {
           matched = true
           try descend(depth + 1)
@@ -404,9 +404,9 @@ enum SelectExecutor {
     }
 
     let outerSource = try resolveSource(plan, table: tables[0], index: index, env: paramsEnv)
-    try forEachRow(outerSource, table: tables[0], resolver: resolver) {
+    unsafe try forEachRow(outerSource, table: tables[0], resolver: resolver) {
       rowid, span throws(DBError) in
-      context.load(0, rowid: rowid, span: span)
+      unsafe context.load(0, rowid: rowid, span: span)
       try descend(1)
       return true
     }
@@ -745,7 +745,7 @@ enum SelectExecutor {
 
     func load(_ table: Int, rowid: Int64, span: UnsafeRawBufferPointer) {
       nullExtended[table] = false
-      slots[table].load(rowid: rowid, span: span)
+      unsafe slots[table].load(rowid: rowid, span: span)
     }
     func setNull(_ table: Int) { nullExtended[table] = true }
 

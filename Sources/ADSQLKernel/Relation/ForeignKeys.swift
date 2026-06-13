@@ -49,7 +49,7 @@ extension Relation {
     var positioned = false
     prefix.withUnsafeBytes { raw in
       do throws(DBError) {
-        _ = try cursor.seek(raw)
+        _ = unsafe try cursor.seek(raw)
         positioned = cursor.isValid
       } catch {
         failure = error
@@ -57,13 +57,13 @@ extension Relation {
     }
     if let failure { throw failure }
     while positioned {
-      let rowid: Int64?? = try cursor.withCurrent { (key, _) throws(DBError) in
+      let rowid: Int64?? = unsafe try cursor.withCurrent { (key, _) throws(DBError) in
         let matches = prefix.withUnsafeBytes { p in
-          key.count >= p.count
+          unsafe key.count >= p.count
             && key.prefix(p.count).elementsEqual(UnsafeRawBufferPointer(rebasing: p[...]))
         }
         guard matches else { return nil }
-        return KeyCodec.rowid(fromSuffixOf: key)
+        return unsafe KeyCodec.rowid(fromSuffixOf: key)
       }
       guard let hit = rowid ?? nil else { break }
       rowids.append(hit)

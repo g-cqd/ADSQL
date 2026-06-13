@@ -99,7 +99,7 @@ public final class SchemaCache: Sendable {
     var result: Result<UInt64, DBError> = .success(0)
     bytes.withUnsafeBytes { raw in
       do throws(DBError) {
-        result = .success(try Catalog.decodeVersion(raw).catalogVersion)
+        result = unsafe .success(try Catalog.decodeVersion(raw).catalogVersion)
       } catch {
         result = .failure(error)
       }

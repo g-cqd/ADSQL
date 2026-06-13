@@ -96,7 +96,7 @@ public enum KeyCodec {
     guard key.count >= 8 else { return nil }
     var raw: UInt64 = 0
     for i in 0..<8 {
-      raw = (raw << 8) | UInt64(key[key.count - 8 + i])
+      raw = unsafe (raw << 8) | UInt64(key[key.count - 8 + i])
     }
     return Int64(bitPattern: raw ^ 0x8000_0000_0000_0000)
   }
@@ -121,7 +121,7 @@ public enum KeyCodec {
 
   @inline(__always)
   static func appendBE(_ value: UInt64, to key: inout [UInt8]) {
-    withUnsafeBytes(of: value.bigEndian) { key.append(contentsOf: $0) }
+    withUnsafeBytes(of: value.bigEndian) { unsafe key.append(contentsOf: $0) }
   }
 
   static func appendEscaped(_ bytes: [UInt8], to key: inout [UInt8]) {

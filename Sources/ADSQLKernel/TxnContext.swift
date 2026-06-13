@@ -76,8 +76,8 @@ public final class TxnContext: PageResolver, OverflowPager {
   // MARK: - Page access
 
   public func resolvePage(_ pageNo: UInt64) throws(DBError) -> UnsafeRawBufferPointer {
-    if let buf = dirty[pageNo] { return buf.readOnly }
-    return try source.page(pageNo)
+    if let buf = dirty[pageNo] { return unsafe buf.readOnly }
+    return unsafe try source.page(pageNo)
   }
 
   @inline(__always)
@@ -101,7 +101,7 @@ public final class TxnContext: PageResolver, OverflowPager {
   public func shadow(_ pageNo: UInt64) throws(DBError) -> (pageNo: UInt64, buf: PageBuf) {
     if let buf = dirty[pageNo] {
       if requestEpoch != 0, buf.requestEpoch != requestEpoch {
-        let clone = PageBuf(copying: buf.readOnly)
+        let clone = unsafe PageBuf(copying: buf.readOnly)
         clone.requestEpoch = requestEpoch
         dirty[pageNo] = clone
         undoReplaced.append((pageNo: pageNo, previous: buf))
@@ -109,7 +109,7 @@ public final class TxnContext: PageResolver, OverflowPager {
       }
       return (pageNo, buf)
     }
-    let copy = PageBuf(copying: try source.page(pageNo))
+    let copy = unsafe PageBuf(copying: try source.page(pageNo))
     copy.requestEpoch = requestEpoch
     let newNo = allocator.allocate()
     dirty[newNo] = copy
@@ -153,11 +153,11 @@ public final class TxnContext: PageResolver, OverflowPager {
 
   public func allocateOverflowPage() throws(DBError) -> (pageNo: UInt64, buffer: UnsafeMutableRawBufferPointer) {
     let (pageNo, buf) = allocatePage()
-    return (pageNo, buf.raw)
+    return unsafe (pageNo, buf.raw)
   }
 
   public func readOverflowPage(_ pageNo: UInt64) throws(DBError) -> UnsafeRawBufferPointer {
-    try resolvePage(pageNo)
+    unsafe try resolvePage(pageNo)
   }
 
   public func freeOverflowPage(_ pageNo: UInt64) throws(DBError) {
@@ -171,6 +171,6 @@ public struct CommittedResolver: PageResolver {
   public init(source: PageSource) { self.source = source }
   @inline(__always)
   public func resolvePage(_ pageNo: UInt64) throws(DBError) -> UnsafeRawBufferPointer {
-    try source.page(pageNo)
+    unsafe try source.page(pageNo)
   }
 }
