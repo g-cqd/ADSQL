@@ -91,6 +91,9 @@ struct BoundSelect: Sendable {
   let outputs: [BoundOutput]
   let outputCollations: [Collation]
   let whereExpr: SQLExpr?
+  /// WHERE with the conjuncts an exact probe covers removed — used (single
+  /// table only) when the executor takes that probe, else `whereExpr`.
+  let residualWithoutCovered: SQLExpr?
   let orderBy: [SQLOrderingTerm]
   let orderCollations: [Collation]
   /// GROUP BY key expressions and their collations (empty for a single
@@ -282,12 +285,19 @@ enum Binder {
       where: select.whereExpr, orderBy: select.orderBy, source: source,
       indexes: schema.indexes(on: source.table), definition: schema.tables[source.table]!)
     let yieldsOrder = joins.isEmpty && !isAggregated
+    // Residual elimination applies to the single-table path only (the join/
+    // aggregate paths evaluate the full WHERE at the leaf).
+    let residualWithoutCovered =
+      yieldsOrder
+      ? removeCovered(select.whereExpr, planning.coveredConjuncts)
+      : select.whereExpr
     return BoundSelect(
       binding: binding,
       joins: joins,
       outputs: outputs,
       outputCollations: outputCollations,
       whereExpr: select.whereExpr,
+      residualWithoutCovered: residualWithoutCovered,
       orderBy: orderBy,
       orderCollations: orderCollations,
       groupBy: select.groupBy,
@@ -302,6 +312,20 @@ enum Binder {
       access: planning.plan,
       accessYieldsOrder: yieldsOrder && planning.yieldsOrder,
       rowidOrderSatisfiesOrderBy: yieldsOrder && planning.rowidOrderSatisfiesOrderBy)
+  }
+
+  /// WHERE with `covered` top-level conjuncts removed (nil if none remain).
+  /// The covered nodes are the exact AST nodes the planner consumed, so `==`
+  /// matches them.
+  private static func removeCovered(_ expr: SQLExpr?, _ covered: [SQLExpr]) -> SQLExpr? {
+    guard let expr, !covered.isEmpty else { return expr }
+    func conjuncts(_ e: SQLExpr) -> [SQLExpr] {
+      if case .binary(.and, let lhs, let rhs) = e { return conjuncts(lhs) + conjuncts(rhs) }
+      return [e]
+    }
+    let kept = conjuncts(expr).filter { conjunct in !covered.contains { $0 == conjunct } }
+    guard let first = kept.first else { return nil }
+    return kept.dropFirst().reduce(first) { .binary(.and, $0, $1) }
   }
 
   private static func appendAllColumns(_ table: TableBinding, to outputs: inout [BoundOutput]) {

@@ -125,6 +125,43 @@ struct SQLPlannerPathTests {
   }
 }
 
+// MARK: - Residual elimination (covered-conjunct removal)
+
+@Suite("SQL planner residual elimination")
+struct SQLResidualEliminationTests {
+  private func residual(_ db: Database, _ sql: String) throws -> SQLExpr?? {
+    try db.read { (txn) throws(DBError) in
+      guard case .select(let select) = try SQLParser.parseOne(sql),
+        case .select(let plan) = try Binder.bindQuery(select, schema: try txn.schema())
+      else { return Optional<SQLExpr?>.none }
+      return plan.residualWithoutCovered
+    }
+  }
+
+  @Test func dropsExactlyCoveredConjuncts() throws {
+    let dir = TempDir()
+    defer { dir.cleanup() }
+    let db = try IndexedDocs.adsql(dir, "residual.adsql", withIndexes: true)
+    defer { db.close() }
+
+    // Fully covered by a single-column / composite equality probe → no residual.
+    #expect(try residual(db, "SELECT id FROM docs WHERE framework = 'UIKit'") == .some(nil))
+    #expect(try residual(db, "SELECT id FROM docs WHERE id = 5") == .some(nil))
+    #expect(try residual(db, "SELECT id FROM docs WHERE id IN (1, 2, 3)") == .some(nil))
+
+    // Equality prefix covered, trailing range kept as residual.
+    if case .some(.some(let r)) = try residual(db, "SELECT id FROM docs WHERE score = 3 AND weight > 1.0") {
+      // The remaining residual is the weight range only (framework/score dropped).
+      if case .binary(.gt, _, _) = r {} else { Issue.record("expected weight range residual, got \(r)") }
+    } else {
+      Issue.record("expected a residual for the trailing range")
+    }
+
+    // A pure range (no exact equality) keeps the full WHERE as residual.
+    #expect(try residual(db, "SELECT id FROM docs WHERE score > 2") != .some(nil))
+  }
+}
+
 // MARK: - Superset + residual property test
 
 @Suite("SQL planner residual equivalence")

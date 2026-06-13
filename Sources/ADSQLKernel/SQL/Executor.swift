@@ -130,8 +130,16 @@ enum SelectExecutor {
       return false
     }()
 
+    // A taken rowid/index probe exactly covers its equality conjuncts, so the
+    // residual can drop them; a table scan (incl. the coercion fallback) must
+    // re-check the full WHERE.
+    let residual: SQLExpr?
+    switch source {
+    case .table: residual = plan.whereExpr
+    case .rowids, .index: residual = plan.residualWithoutCovered
+    }
     let accumulator = Accumulator(
-      context: context, env: env, residual: plan.whereExpr, outputs: plan.outputs,
+      context: context, env: env, residual: residual, outputs: plan.outputs,
       orderBy: plan.orderBy, orderCollations: plan.orderCollations, collectKeys: collectKeys,
       sliceEnd: sliceEnd, topN: topN, dedupRowids: dedupRowids)
     try forEachRow(source, table: table, resolver: resolver) { rowid, span throws(DBError) in

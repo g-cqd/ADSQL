@@ -45,14 +45,19 @@ struct AccessPlanning: Sendable {
   /// Rowid (table) order satisfies ORDER BY — used when an index probe falls
   /// back to a table scan at execution time.
   let rowidOrderSatisfiesOrderBy: Bool
+  /// The original WHERE conjuncts this probe satisfies *exactly* (the
+  /// equality-prefix `col = const` / rowid eq / rowid IN). The executor may
+  /// drop them from the residual when it uses the probe (not the scan
+  /// fallback). The trailing range column is never exact, so it is excluded.
+  var coveredConjuncts: [SQLExpr] = []
 }
 
 enum Planner {
   // MARK: - Sargable constraints
 
   private enum Constraint {
-    case eq(column: Int, value: SQLExpr)
-    case inList(column: Int, values: [SQLExpr])
+    case eq(column: Int, value: SQLExpr, source: SQLExpr)
+    case inList(column: Int, values: [SQLExpr], source: SQLExpr)
     case lower(column: Int, value: SQLExpr, inclusive: Bool)
     case upper(column: Int, value: SQLExpr, inclusive: Bool)
   }
@@ -66,16 +71,16 @@ enum Planner {
 
     // 1. Rowid point / IN (the rowid-alias column).
     if let aliasIndex = source.rowidAliasIndex {
-      if let value = firstEquality(constraints, column: aliasIndex) {
+      if let eq = firstEquality(constraints, column: aliasIndex) {
         return AccessPlanning(
-          plan: .rowid([value]), yieldsOrder: true,
-          rowidOrderSatisfiesOrderBy: rowidOrder)
+          plan: .rowid([eq.value]), yieldsOrder: true,
+          rowidOrderSatisfiesOrderBy: rowidOrder, coveredConjuncts: [eq.source])
       }
-      if let values = firstInList(constraints, column: aliasIndex) {
-        let ordered = values.count <= 1 || orderBy.isEmpty
+      if let inList = firstInList(constraints, column: aliasIndex) {
+        let ordered = inList.values.count <= 1 || orderBy.isEmpty
         return AccessPlanning(
-          plan: .rowid(values), yieldsOrder: ordered,
-          rowidOrderSatisfiesOrderBy: rowidOrder)
+          plan: .rowid(inList.values), yieldsOrder: ordered,
+          rowidOrderSatisfiesOrderBy: rowidOrder, coveredConjuncts: [inList.source])
       }
     }
 
@@ -110,9 +115,11 @@ enum Planner {
 
       // Longest leading equality prefix.
       var equality: [SQLExpr] = []
+      var covered: [SQLExpr] = []
       var prefixLen = 0
-      while prefixLen < columns.count, let value = firstEquality(constraints, column: columns[prefixLen]) {
-        equality.append(value)
+      while prefixLen < columns.count, let eq = firstEquality(constraints, column: columns[prefixLen]) {
+        equality.append(eq.value)
+        covered.append(eq.source)
         prefixLen += 1
       }
 
@@ -131,16 +138,17 @@ enum Planner {
 
       // IN on a sole leading column (no equality prefix consumed yet).
       if prefixLen == 0, trailing == nil, columns.count >= 1,
-        let values = firstInList(constraints, column: columns[0])
+        let inList = firstInList(constraints, column: columns[0])
       {
-        let yields = values.count <= 1 || orderBy.isEmpty
+        let yields = inList.values.count <= 1 || orderBy.isEmpty
         let planning = AccessPlanning(
           plan: .index(
             name: index.name,
-            probes: values.map { IndexProbe(equality: [$0], trailing: nil) },
-            constraint: "\(index.columns[0]) IN (\(values.count))"),
+            probes: inList.values.map { IndexProbe(equality: [$0], trailing: nil) },
+            constraint: "\(index.columns[0]) IN (\(inList.values.count))"),
           yieldsOrder: yields,
-          rowidOrderSatisfiesOrderBy: rowidOrder)
+          rowidOrderSatisfiesOrderBy: rowidOrder,
+          coveredConjuncts: [inList.source])
         consider(&best, planning, score: 1)
         continue
       }
@@ -157,7 +165,8 @@ enum Planner {
           probes: [IndexProbe(equality: equality, trailing: trailing)],
           constraint: constraintText.joined(separator: " AND ")),
         yieldsOrder: orderBy.isEmpty || yields,
-        rowidOrderSatisfiesOrderBy: rowidOrder)
+        rowidOrderSatisfiesOrderBy: rowidOrder,
+        coveredConjuncts: covered)
       // Score: equality columns dominate; a trailing range and uniqueness
       // break ties.
       let score = prefixLen * 4 + (hasTrailing ? 2 : 0) + (index.unique ? 1 : 0)
@@ -243,15 +252,15 @@ enum Planner {
       switch conjunct {
       case .binary(let op, let lhs, let rhs) where op.isComparison:
         if let column = columnReference(lhs, source: source), isConstant(rhs) {
-          appendComparison(op, column: column, value: rhs, flipped: false, to: &constraints)
+          appendComparison(op, column: column, value: rhs, flipped: false, source: conjunct, to: &constraints)
         } else if let column = columnReference(rhs, source: source), isConstant(lhs) {
-          appendComparison(op, column: column, value: lhs, flipped: true, to: &constraints)
+          appendComparison(op, column: column, value: lhs, flipped: true, source: conjunct, to: &constraints)
         }
       case .inList(let subject, let items, let negated):
         if !negated, let column = columnReference(subject, source: source),
           !items.isEmpty, items.allSatisfy(isConstant)
         {
-          constraints.append(.inList(column: column, values: items))
+          constraints.append(.inList(column: column, values: items, source: conjunct))
         }
       default:
         break
@@ -261,7 +270,8 @@ enum Planner {
   }
 
   private static func appendComparison(
-    _ op: SQLBinaryOp, column: Int, value: SQLExpr, flipped: Bool, to constraints: inout [Constraint]
+    _ op: SQLBinaryOp, column: Int, value: SQLExpr, flipped: Bool, source: SQLExpr,
+    to constraints: inout [Constraint]
   ) {
     // When the column is on the right, the comparison direction flips.
     let effective: SQLBinaryOp
@@ -273,7 +283,7 @@ enum Planner {
     default: effective = op
     }
     switch effective {
-    case .eq: constraints.append(.eq(column: column, value: value))
+    case .eq: constraints.append(.eq(column: column, value: value, source: source))
     case .lt: constraints.append(.upper(column: column, value: value, inclusive: false))
     case .le: constraints.append(.upper(column: column, value: value, inclusive: true))
     case .gt: constraints.append(.lower(column: column, value: value, inclusive: false))
@@ -314,12 +324,20 @@ enum Planner {
     }
   }
 
-  private static func firstEquality(_ constraints: [Constraint], column: Int) -> SQLExpr? {
-    for case .eq(let c, let value) in constraints where c == column { return value }
+  private static func firstEquality(
+    _ constraints: [Constraint], column: Int
+  ) -> (value: SQLExpr, source: SQLExpr)? {
+    for case .eq(let c, let value, let source) in constraints where c == column {
+      return (value, source)
+    }
     return nil
   }
-  private static func firstInList(_ constraints: [Constraint], column: Int) -> [SQLExpr]? {
-    for case .inList(let c, let values) in constraints where c == column { return values }
+  private static func firstInList(
+    _ constraints: [Constraint], column: Int
+  ) -> (values: [SQLExpr], source: SQLExpr)? {
+    for case .inList(let c, let values, let source) in constraints where c == column {
+      return (values, source)
+    }
     return nil
   }
   private static func firstLower(_ constraints: [Constraint], column: Int) -> BoundExpr? {
