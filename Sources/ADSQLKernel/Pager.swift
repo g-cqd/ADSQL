@@ -5,10 +5,15 @@
 public final class Pager: PageSource, @unchecked Sendable {
   public let channel: any StorageChannel
   public let map: MMap
+  /// Forward-scan readahead window in pages (from `DatabaseOptions`; 0 disables).
+  public let prefetchWindow: Int
 
-  public init(channel: any StorageChannel, maxMapSize: Int) throws(DBError) {
+  public init(
+    channel: any StorageChannel, maxMapSize: Int, readaheadBytes: Int = 0
+  ) throws(DBError) {
     self.channel = channel
     self.map = try MMap(fileDescriptor: channel.fileDescriptor, capacity: maxMapSize)
+    self.prefetchWindow = max(0, readaheadBytes / Format.pageSize)
   }
 
   @inline(__always)
@@ -16,5 +21,10 @@ public final class Pager: PageSource, @unchecked Sendable {
     let end = (Int(pageNo) + 1) * Format.pageSize
     guard end <= map.capacity else { throw DBError.mapFull }
     return unsafe map.pageBytes(pageNo)
+  }
+
+  @inline(__always)
+  public func prefetch(fromPage: UInt64, count: Int) {
+    map.prefetch(fromPage: fromPage, count: count)
   }
 }

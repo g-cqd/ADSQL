@@ -40,6 +40,21 @@ import Darwin
     return unsafe UnsafeRawBufferPointer(start: base + offset, count: Format.pageSize)
   }
 
+  /// Advisory readahead for a contiguous run of `count` pages starting at
+  /// `fromPage`. `MADV_WILLNEED` only schedules a prefetch for the named range
+  /// — unlike `MADV_SEQUENTIAL` it does not change the mapping's global policy,
+  /// so a scan can prefetch ahead without disturbing concurrent point-get
+  /// readers (who keep the `MADV_RANDOM` default). Out-of-range tails are
+  /// clamped to the reserved capacity; the run beyond EOF is harmless (those
+  /// pages are simply not resident yet and never get touched in correct use).
+  @inline(__always)
+  public func prefetch(fromPage: UInt64, count: Int) {
+    let start = Int(fromPage) * Format.pageSize
+    guard start < capacity, count > 0 else { return }
+    let length = min(count * Format.pageSize, capacity - start)
+    _ = unsafe madvise(UnsafeMutableRawPointer(mutating: base + start), length, MADV_WILLNEED)
+  }
+
   @inline(__always)
   public func bytes(at offset: Int, count: Int) -> UnsafeRawBufferPointer {
     unsafe UnsafeRawBufferPointer(start: base + offset, count: count)

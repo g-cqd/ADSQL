@@ -17,6 +17,19 @@ public struct Cursor<R: PageResolver>: ~Copyable {
   @usableFromInline var stack: [(pageNo: UInt64, index: Int)] = []
   public private(set) var isValid = false
 
+  /// Forward-scan readahead: `prefetchHorizon` is the highest page we've asked
+  /// the kernel to prefetch. Iteration keeps a full `prefetchWindow` of pages in
+  /// flight ahead of the cursor, re-arming at the half-way mark so the next
+  /// pages are already arriving by the time the cursor reaches them
+  /// (double-buffering, no stall at window edges). `prefetchHorizon` stays 0
+  /// until the first leaf-crossing, so point seeks (which never iterate) issue
+  /// no readahead. Leaves of a bulk-loaded / build-once tree are laid out in
+  /// ascending page order, so a contiguous run just past the cursor is exactly
+  /// the upcoming leaves. `prefetchWindow` is the resolver's configured window
+  /// (in pages); 0 disables readahead.
+  @usableFromInline var prefetchHorizon: UInt64 = 0
+  @usableFromInline let prefetchWindow: Int
+
   public init(resolver: R, meta: Meta) {
     self.init(resolver: resolver, tree: meta.mainTree)
   }
@@ -24,6 +37,7 @@ public struct Cursor<R: PageResolver>: ~Copyable {
   public init(resolver: R, tree: TreeHandle) {
     self.resolver = resolver
     self.tree = tree
+    self.prefetchWindow = resolver.prefetchWindow
     self.stack.reserveCapacity(Int(tree.depth) + 1)
   }
 
@@ -100,6 +114,7 @@ public struct Cursor<R: PageResolver>: ~Copyable {
     let (leafNo, index) = stack[stack.count - 1]
     let leaf = unsafe try resolver.resolvePage(leafNo)
     isValid = unsafe index >= 0 && index < PageHeader.cellCount(leaf)
+    if isValid, edge == .first { maybePrefetchAhead() }
     return isValid
   }
 
@@ -113,6 +128,7 @@ public struct Cursor<R: PageResolver>: ~Copyable {
       return true
     }
     isValid = try stepLeaf(direction: +1)
+    if isValid { maybePrefetchAhead() }
     return isValid
   }
 
@@ -161,6 +177,26 @@ public struct Cursor<R: PageResolver>: ~Copyable {
   }
 
   // MARK: - Internals
+
+  /// Issues advisory readahead for the window of pages just past the current
+  /// leaf, throttled by `prefetchHorizon` so it fires roughly once per window
+  /// rather than per row. Only reached from forward iteration (`next`) and the
+  /// `.first` scan start, so point seeks never prefetch.
+  @inline(__always)
+  private mutating func maybePrefetchAhead() {
+    guard prefetchWindow > 0 else { return }
+    let leafNo = stack[stack.count - 1].pageNo
+    let window = UInt64(prefetchWindow)
+    if prefetchHorizon == 0 {
+      // First leaf-crossing: prime a full window just past the cursor.
+      resolver.prefetch(fromPage: leafNo + 1, count: prefetchWindow)
+      prefetchHorizon = leafNo + window
+    } else if leafNo + window / 2 >= prefetchHorizon {
+      // Within half a window of the frontier: extend it by another full window.
+      resolver.prefetch(fromPage: prefetchHorizon + 1, count: prefetchWindow)
+      prefetchHorizon += window
+    }
+  }
 
   /// Descends from `pageNo` (at `level`) to a leaf, appending frames along
   /// the chosen edge.

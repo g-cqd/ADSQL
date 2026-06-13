@@ -7,17 +7,27 @@ public struct DatabaseOptions: Sendable {
   public var maxMapSize: Int
   public var readOnly: Bool
   public var createIfMissing: Bool
+  /// Readahead a forward scan keeps in flight ahead of its cursor, in bytes
+  /// (rounded down to whole 16 KiB pages; 0 disables). The mapping stays
+  /// `MADV_RANDOM` for point gets — this only issues additive `MADV_WILLNEED`
+  /// prefetch as a cursor iterates, so a cold full scan isn't bottlenecked on a
+  /// synchronous fault per leaf. The window is resident per active scan cursor;
+  /// the 16 MiB default suits memory-comfortable deployments. Lower it on tight
+  /// hosts; raise it for scan-heavy workloads on fast storage.
+  public var scanReadaheadBytes: Int
 
   public init(
     durability: DurabilityProfile = .barrier,
     maxMapSize: Int = 64 << 30,
     readOnly: Bool = false,
-    createIfMissing: Bool = true
+    createIfMissing: Bool = true,
+    scanReadaheadBytes: Int = 16 << 20
   ) {
     self.durability = durability
     self.maxMapSize = maxMapSize
     self.readOnly = readOnly
     self.createIfMissing = createIfMissing
+    self.scanReadaheadBytes = scanReadaheadBytes
   }
 }
 
@@ -89,7 +99,9 @@ public final class Database: Sendable {
     }
     let pager: Pager
     do {
-      pager = try Pager(channel: channel, maxMapSize: options.maxMapSize)
+      pager = try Pager(
+        channel: channel, maxMapSize: options.maxMapSize,
+        readaheadBytes: options.scanReadaheadBytes)
     } catch {
       channel.close()
       throw error

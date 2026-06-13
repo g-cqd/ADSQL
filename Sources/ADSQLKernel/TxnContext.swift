@@ -2,11 +2,34 @@
 /// from committed storage; write transactions overlay their dirty table.
 public protocol PageResolver {
   func resolvePage(_ pageNo: UInt64) throws(DBError) -> UnsafeRawBufferPointer
+  /// Advisory readahead for an upcoming contiguous page run (forward scans).
+  func prefetch(fromPage: UInt64, count: Int)
+  /// Configured scan readahead window in pages a cursor should keep in flight
+  /// (0 disables). Forward scans read this once at creation.
+  var prefetchWindow: Int { get }
+}
+
+extension PageResolver {
+  /// Default: prefetch is a no-op (write contexts and test resolvers don't
+  /// scan-prefetch; only the mapped committed reader forwards it).
+  @inline(__always)
+  public func prefetch(fromPage: UInt64, count: Int) {}
+  @inline(__always)
+  public var prefetchWindow: Int { 0 }
 }
 
 /// Committed-page reader (mmap in production, dictionaries in tests).
 public protocol PageSource: AnyObject {
   func page(_ pageNo: UInt64) throws(DBError) -> UnsafeRawBufferPointer
+  func prefetch(fromPage: UInt64, count: Int)
+  var prefetchWindow: Int { get }
+}
+
+extension PageSource {
+  @inline(__always)
+  public func prefetch(fromPage: UInt64, count: Int) {}
+  @inline(__always)
+  public var prefetchWindow: Int { 0 }
 }
 
 /// Page allocation state for one write transaction. Fresh pages (allocated
@@ -173,4 +196,10 @@ public struct CommittedResolver: PageResolver {
   public func resolvePage(_ pageNo: UInt64) throws(DBError) -> UnsafeRawBufferPointer {
     unsafe try source.page(pageNo)
   }
+  @inline(__always)
+  public func prefetch(fromPage: UInt64, count: Int) {
+    source.prefetch(fromPage: fromPage, count: count)
+  }
+  @inline(__always)
+  public var prefetchWindow: Int { source.prefetchWindow }
 }
