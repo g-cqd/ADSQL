@@ -5,9 +5,12 @@ B+tree over mmap, single-writer / wait-free-reader MVCC, crash-safe by
 construction (committed pages are immutable; recovery is picking the newest
 checksum-valid meta page).
 
-Status: storage kernel and relational layer (typed tables, catalog,
-secondary indexes, FK cascades) complete. SQL front end (M4) and
-first-class FTS/vector indexes (M5) are next, on the same on-disk format.
+Status: storage kernel, relational layer, and the SQL front end (M4/M4.5)
+complete; a scan-engine performance pass (M4.6) is active, with first-class
+FTS/vector indexes (M5) next, on the same on-disk format. See
+[`ROADMAP.md`](ROADMAP.md) for the full milestone suite, performance headroom,
+and the deferred-SQL registry, and [`docs/rfcs/`](docs/rfcs/) for design
+records.
 
 - Platform: macOS 26+, Apple Silicon first (16 KiB native pages)
 - Toolchain: pinned via `.swift-version`; Swift 6 language mode, strict concurrency
