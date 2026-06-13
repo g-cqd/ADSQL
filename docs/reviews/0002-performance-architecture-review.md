@@ -164,6 +164,36 @@ selectivity [28][29].
 - **mmap residual risks** [21]: handle `SIGBUS`, accept synchronous page-fault stalls for >RAM DBs; mitigate with `madvise`. Document as known limitations.
 - **FTS5 (M5)** forward pointer: the inverted-index/`bm25` work is the next milestone; its algorithmic choices (postings layout, tokenizer cost, position lists) deserve their own design note — out of scope here.
 
+## Measurement update (post-INLJ, M4.8) — gap (b) re-attributed
+
+P0.2 (DISTINCT O(n)), P2.5 (write-path allocs), and P0.3 (index-nested-loop
+join) shipped. Profiling the join probe (the IRON LAW gate on P0.1/P1.2) **moved
+the diagnosis**: the index→rowid→table *descent is not the bottleneck*.
+
+- `sql join` 100k self-join: **rowid** probe (single descent) p50 **101 ms** vs
+  **secondary-index** probe (double descent + TEXT key) **223 ms**; SQLite
+  in-loop **21.7 ms**. So the second descent costs ~120 ms — but even the
+  *single*-descent rowid join is ~4.6× SQLite, and ADSQL's standalone rowid get
+  *beats* SQLite (0.8 vs 2.2 µs). The fetch is competitive.
+- The gap is the **per-row interpreter**, not the descent: `SQLEval` walks the
+  expression tree per row, and the row env re-resolves every column access via
+  `QueryBinding.resolve(qualifier,name)` — a `name.lowercased()` **string
+  allocation + dict lookup on every access, every row** (`Plan.swift:65`;
+  `.column`'s parsed `offset` is the source position, ignored by the evaluator,
+  `Eval.swift:188`). SQLite's VDBE is a flat register loop with no per-row
+  dispatch or name resolution. This refines this review's gap-(b) attribution
+  ("ARC/retain, interior re-decode, root re-walk") — the dominant cost is column
+  re-resolution + tree-walk dispatch.
+
+**Revised lever (supersedes P1.2 cursor-reuse / zone maps for gap b):** bind
+column references to precomputed `(table, column)` slots at bind time so the
+evaluator skips per-row string resolution — a focused evaluator/AST change that
+benefits the **filtered scan (gap a, the consumer's search path)**, index scans,
+and joins alike. Cursor-reuse across probes was considered and rejected: probes
+are unordered (warm `seekForward` won't hit), `RowCursor` is `~Copyable` (no
+array of per-depth cursors), and the alloc is not the dominant cost. The
+VDBE-style flat scan loop (review §SOTA [26]) is the same lever taken further.
+
 ## Risks & non-goals
 
 - **Measurement-first**: every perf item ships behind an `ADSQLBench` number that moves; P0 profiling gates the P1 descent work. Do not repeat RFC 0002's "optimize the wrong thing".
