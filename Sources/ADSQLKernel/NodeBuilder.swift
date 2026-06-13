@@ -41,6 +41,14 @@ public enum Node {
 
   // MARK: - Cell decoding
 
+  // SAFETY (Review 0001 F2): `@safe` over borrowed page pointers, asserted not
+  // enforced. A LeafCell is a transient projection produced by `leafCell(page:)`
+  // and consumed within the same function (read its fields, compare, copy); it
+  // is never stored or returned past the page access. Making it `~Escapable`
+  // would need a lifetime-bearing owner at construction, but `leafCell` takes a
+  // bare `UnsafeRawBufferPointer page` (the resolver/snapshot is not in scope
+  // there), so there is nothing to bind to without threading the resolver
+  // through every node primitive. Owner: the page buffer of the enclosing read.
   @safe public struct LeafCell {
     public var key: UnsafeRawBufferPointer
     /// Inline payload, or nil when the value lives in an overflow chain.
@@ -153,6 +161,13 @@ public enum Node {
 
   // MARK: - Cell encoding
 
+  // SAFETY (Review 0001 F2): `@safe` over a borrowed pointer, asserted not
+  // enforced. A LeafValue is constructed at a write site and consumed
+  // synchronously by `encodeLeafCell`, which copies the inline bytes into the
+  // page immediately; it is never stored. The `.inline` payload is the caller's
+  // value buffer (no lifetime-bearing owner at this boundary), so binding it
+  // would mean threading that owner through the encoder. Bounds: the single
+  // encode call that consumes it.
   @safe public enum LeafValue {
     case inline(UnsafeRawBufferPointer)
     case overflow(head: UInt64, length: UInt32)

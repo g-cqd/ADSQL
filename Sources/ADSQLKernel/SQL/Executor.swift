@@ -13,6 +13,18 @@
 /// and never copies the whole record. The rowid-alias column reads back from
 /// the rowid, and columns beyond the stored count fall to their schema default
 /// (mirroring `Relation.materializeRow`).
+// SAFETY (Review 0001 F1): unlike RowView/ValueRef (now `~Escapable`, lifetime-
+// checked), this stays `@safe` over a stored raw pointer because the invariant
+// is not compiler-enforceable here. `span` is re-pointed by `load` each row and
+// read only within that row's scan body; the slot caches decoded `Value`s, not
+// the bytes. Column reads are *decoupled* from the scan body — they arrive
+// through the per-row `SQLEvalEnv.column` closure (whose `scalarSubquery` field
+// is `@escaping`, which a `~Escapable` `RawSpan` cannot be captured into) — so
+// the span must be stored, not threaded as a parameter. Enforcing this would
+// require routing a `RawSpan` through the whole evaluator. The slot is query-
+// internal (`RowContext.slots`) and never escapes the scan loop; its lifetime
+// is bounded by the owning `forEach*` call. Owner: the scan driver. Bounds: one
+// scan body. Invariant asserted, not enforced.
 @safe final class RowSlot {
   private let columns: [ColumnDefinition]
   private let aliasIndex: Int?
