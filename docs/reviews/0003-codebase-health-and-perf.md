@@ -1,7 +1,7 @@
 # Review 0003 — Codebase Health & Performance: Consolidated Findings, Status & Program
 
 **Date:** 2026-06-14 · **Repo:** `/Users/gc/Developer/ongoing/swift/ADSQL` · **Branch:** `main`
-**HEAD at consolidation:** `f0e0e5b` (FTS F6k) · **Reports' baseline:** `1c3bccf` · **Perf commit:** `8ddcc9a`
+**HEAD at consolidation:** `2d5f347` (FTS F6n; the F6 line is under **active concurrent iteration** — RFC 0008 is the live FTS tracker) · **Reports' baseline:** `1c3bccf` · **Perf commit:** `8ddcc9a`
 **Toolchain:** Swift 6.2 language mode / 6.4 toolchain · `.strictMemorySafety()` (SE-0458) + experimental
 `Lifetimes` (SE-0446/0456) on `ADSQLKernel` · `platforms: [.macOS(.v26)]` · **zero runtime dependencies.**
 **Build/test status (reports' baseline):** `swift build` clean (0 warnings); `swift test` green — 330 tests / 76 suites.
@@ -44,10 +44,13 @@ closes all three.
 
 ### 1.1 What changed since the reports' baseline (`1c3bccf` → `f0e0e5b`)
 
-The reports were written at `1c3bccf`. HEAD is **five FTS "F6" commits ahead** (`f827ba7` F6g,
-`5bcdcc6` docs, `40a85df` F6i, `5075a14` F6j, `f0e0e5b` F6k). The delta is **entirely FTS** (6 files,
-+429/−175) plus 22 lines in `Executor.swift`; the SQL JOIN/INSERT hot paths are **unchanged**, so the
-perf report's SQL scorecard still stands pending the Phase-0 re-baseline. The material changes:
+The reports were written at `1c3bccf`. The FTS "F6" line is under **active concurrent iteration** by a
+peer worker — `f827ba7` F6g → `f0e0e5b` F6k → `e2522d3` F6l → `ad09d31` F6m → `2d5f347` F6n landed
+during this consolidation (HEAD = `2d5f347`). The delta vs baseline is **almost entirely FTS** (the
+`FTS/` files + the `docs/rfcs/0008` live status table) plus small `Executor.swift`/`Cursor.swift` seams;
+the SQL JOIN/INSERT hot paths are **unchanged**, so the perf report's SQL scorecard still stands pending
+the Phase-0 re-baseline. **For the live FTS micro-status, `docs/rfcs/0008-execution-schedule.md` is the
+source of truth** (bumped every FTS slice). The material changes:
 
 - **FTS ranked top-k went from ~3.7× *slower* to ~2.3× *faster* than SQLite FTS5** (p50 187µs vs 426µs)
   across F6i/F6j/F6k. The perf report predates and omits this; §4.4 adds the FTS scorecard.
@@ -271,7 +274,9 @@ JOIN and INSERT still lose.**
 
 ### 4.4 FTS scorecard (NEW — absent from the perf report; from RFC 0008 F6 trail, 2k docs vs SQLite FTS5)
 
-The FTS work (M5, RFC 0007) transformed FTS perf across F6c→F6k. Standing at HEAD `f0e0e5b`:
+The FTS work (M5, RFC 0007) transformed FTS perf across F6c→F6n (F6l/F6m/F6n landed concurrently during
+this consolidation, further widening the ranked lead). The figures below are the F6k baseline; **RFC 0008
+has the live per-slice numbers**. Standing at consolidation:
 
 | FTS axis | ADSQL | SQLite FTS5 | standing | how |
 |---|---|---|---|---|
@@ -668,7 +673,11 @@ Read guards (R1/R2): `TxnContext.swift` (`resolvePage`, `CommittedResolver`), `D
 | `5bcdcc6` | docs: F6g + the query-bottleneck finding |
 | `40a85df` | FTS F6i — query-scoped score-all scorer |
 | `5075a14` | FTS F6j — incremental WAND payload scan (O(block²)→O(block)) |
-| `f0e0e5b` | FTS F6k — zero-copy sum-only docLength (**ADSQL beats FTS5 on ranked**) — current HEAD |
+| `f0e0e5b` | FTS F6k — zero-copy sum-only docLength (**ADSQL beats FTS5 on ranked**) |
+| `e2522d3` | FTS F6l — MATCH prefix-union merge + zero-copy key read *(peer, concurrent)* |
+| `ad09d31` | FTS F6m — reuse single-term WAND field-TF buffer — widen ranked lead *(peer, concurrent)* |
+| `e63b7a4` | **this review (0003) + RFC 0009** — Deliverable 0 of the health+perf program |
+| `2d5f347` | FTS F6n — persistent stats cursor (`seekForward`) for docLength *(peer, concurrent)* — current HEAD |
 
 ## Appendix B — Source reports (archived verbatim)
 
