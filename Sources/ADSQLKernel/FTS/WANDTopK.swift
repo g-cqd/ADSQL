@@ -250,8 +250,7 @@ struct DocScorer<R: PageResolver> {
   /// weighted frequency is 0. Returns 0 when the doc has no stats (degenerate;
   /// matches `FTSScorer`).
   func score(docid: Int64, contributors: [(idf: Double, fieldTFs: [UInt32])]) throws(DBError) -> Double {
-    guard let docStats = try FTSIndex.docStats(resolver, record, docid: docid) else { return 0 }
-    let docLength = docStats.fieldLengths.reduce(0.0) { $0 + Double($1) }
+    guard let docLength = try FTSIndex.docLength(resolver, record, docid: docid) else { return 0 }
     let lengthNorm = FTSScorer.lengthNorm(docLength: docLength, avgdl: avgdl)
     var total = 0.0
     for contributor in contributors {

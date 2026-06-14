@@ -153,8 +153,7 @@ enum FTSScorer {
     /// same zero-frequency skip, same `contribution`, same negation.
     func score(docid: Int64) throws(DBError) -> Double {
       guard !degenerate else { return 0 }
-      guard let docStats = try FTSIndex.docStats(resolver, record, docid: docid) else { return 0 }
-      let docLength = docStats.fieldLengths.reduce(0.0) { $0 + Double($1) }
+      guard let docLength = try FTSIndex.docLength(resolver, record, docid: docid) else { return 0 }
       let lengthNorm = FTSScorer.lengthNorm(docLength: docLength, avgdl: avgdl)
       var total = 0.0
       for leaf in leaves {

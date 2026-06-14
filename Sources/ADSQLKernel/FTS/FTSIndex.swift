@@ -308,6 +308,35 @@ enum FTSIndex {
     return FTSDocStats(fieldLengths: try decodeForward(bytes).fieldLengths)
   }
 
+  /// The document's total length `D = Σ_c fieldLengths` — the only forward-record
+  /// datum bm25 scoring needs — read ZERO-COPY and decoding ONLY the leading
+  /// field-length varints. It never copies the record nor decodes the doc's term
+  /// list (the bulk of the record, and a `[[UInt8]]` the scorer would discard), so
+  /// the per-scored-document length read costs a tree descent plus a few varints.
+  /// nil when the doc has no stats row (an absent/removed doc), mirroring
+  /// `docStats`. Hot path: one call per scored document.
+  static func docLength(
+    _ resolver: some PageResolver, _ record: Catalog.FTSRecord, docid: Int64
+  ) throws(DBError) -> Double? {
+    try Relation.withRowValue(resolver, record.stats, key: KeyCodec.rowKey(docid)) {
+      (ref) throws(DBError) in
+      try unsafe BTree.withValueBytes(ref, resolver: resolver) { (raw) throws(DBError) -> Double in
+        var offset = 0
+        guard let fieldCount = unsafe Varint.read(raw, &offset) else {
+          throw DBError.integrityFailure("fts forward: missing field count")
+        }
+        var total = 0.0
+        for _ in 0..<fieldCount {
+          guard let length = unsafe Varint.read(raw, &offset) else {
+            throw DBError.integrityFailure("fts forward: truncated field length")
+          }
+          total += Double(length)
+        }
+        return total
+      }
+    }
+  }
+
   /// Every dictionary term that starts with `prefix` (for `foo*` queries). The
   /// dict tree is keyed by raw term bytes, so a seek + ascending walk while the
   /// key still carries the prefix enumerates the range.
