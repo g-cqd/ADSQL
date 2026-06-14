@@ -164,7 +164,8 @@ extension Database {
     let meta = try beginRead()
     defer { endRead(generation: meta.generation) }
     return try Integrity.check(
-      resolver: CommittedResolver(source: pager), meta: meta, deep: deep)
+      resolver: CommittedResolver(source: pager, pageCount: meta.pageCount),
+      meta: meta, deep: deep)
   }
 
   /// O(1) atomic snapshot via APFS clonefile(2). Quiesces the writer for

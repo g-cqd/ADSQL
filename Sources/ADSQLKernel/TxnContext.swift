@@ -115,6 +115,11 @@ public final class TxnContext: PageResolver, OverflowPager {
 
   public func resolvePage(_ pageNo: UInt64) throws(DBError) -> UnsafeRawBufferPointer {
     if let buf = dirty[pageNo] { return unsafe buf.readOnly }
+    // Committed pages live in [0, meta.pageCount); a higher number is a corrupt
+    // in-page pointer that would otherwise read mapped-but-uncommitted (zeroed)
+    // space without faulting (integrity R2). Pages allocated this transaction
+    // are in `dirty` above, so they bypass this bound.
+    guard pageNo < meta.pageCount else { throw DBError.corruptPage(pageNo: pageNo) }
     return unsafe try source.page(pageNo)
   }
 
@@ -206,10 +211,29 @@ public final class TxnContext: PageResolver, OverflowPager {
 /// Read-side resolver over committed pages only.
 public struct CommittedResolver: PageResolver {
   public let source: PageSource
-  public init(source: PageSource) { self.source = source }
+  /// Snapshot's committed high-water: a committed tree never references a page
+  /// number ≥ pageCount, so anything beyond it is a corrupt in-page pointer
+  /// (which would read mapped-but-uncommitted space without faulting). `.max`
+  /// leaves the bound off for low-level resolvers built without a meta.
+  public let pageCount: UInt64
+  /// Verify each resolved page's checksum before use (opt-in; off on the hot
+  /// path). Catches the full corruption class — a tampered cellCount/keyLen
+  /// changes the page bytes, so the stored XXH64 no longer matches.
+  public let verifyChecksums: Bool
+
+  public init(source: PageSource, pageCount: UInt64 = .max, verifyChecksums: Bool = false) {
+    self.source = source
+    self.pageCount = pageCount
+    self.verifyChecksums = verifyChecksums
+  }
   @inline(__always)
   public func resolvePage(_ pageNo: UInt64) throws(DBError) -> UnsafeRawBufferPointer {
-    unsafe try source.page(pageNo)
+    guard pageNo < pageCount else { throw DBError.corruptPage(pageNo: pageNo) }
+    let page = unsafe try source.page(pageNo)
+    if verifyChecksums, unsafe !PageHeader.verifyChecksum(page, pageNo: pageNo) {
+      throw DBError.corruptPage(pageNo: pageNo)
+    }
+    return unsafe page
   }
   @inline(__always)
   public func prefetch(fromPage: UInt64, count: Int) {

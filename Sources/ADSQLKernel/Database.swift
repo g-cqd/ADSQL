@@ -19,6 +19,12 @@ public struct DatabaseOptions: Sendable {
   /// to the reference behavior; alternatives are opt-in and benchmarked before
   /// becoming a default. Per-statement overrides via `Statement.setExecutionOptions`.
   public var execution: ExecutionOptions
+  /// When true, every committed page is checksum-verified as it is faulted in
+  /// on the read path — continuous corruption detection for untrusted database
+  /// files, at the cost of an XXH64 over each page touched. Off by default: the
+  /// format is crash-safe by construction and reads are the hot path;
+  /// `verifyIntegrity()` remains the on-demand whole-file check.
+  public var verifyChecksumsOnRead: Bool
 
   public init(
     durability: DurabilityProfile = .barrier,
@@ -26,7 +32,8 @@ public struct DatabaseOptions: Sendable {
     readOnly: Bool = false,
     createIfMissing: Bool = true,
     scanReadaheadBytes: Int = 16 << 20,
-    execution: ExecutionOptions = .default
+    execution: ExecutionOptions = .default,
+    verifyChecksumsOnRead: Bool = false
   ) {
     self.durability = durability
     self.maxMapSize = maxMapSize
@@ -34,6 +41,7 @@ public struct DatabaseOptions: Sendable {
     self.createIfMissing = createIfMissing
     self.scanReadaheadBytes = scanReadaheadBytes
     self.execution = execution
+    self.verifyChecksumsOnRead = verifyChecksumsOnRead
   }
 }
 
@@ -174,8 +182,10 @@ public final class Database: Sendable {
     let meta = try beginRead()
     defer { endRead(generation: meta.generation) }
     let txn = ReadTxn(
-      resolver: CommittedResolver(source: pager), meta: meta,
-      schemaCache: relationSchemaCache)
+      resolver: CommittedResolver(
+        source: pager, pageCount: meta.pageCount,
+        verifyChecksums: options.verifyChecksumsOnRead),
+      meta: meta, schemaCache: relationSchemaCache)
     return try body(txn)
   }
 
