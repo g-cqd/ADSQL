@@ -329,6 +329,7 @@ extension WriteTxn {
   }
 
   private func ftsRecord(_ name: String) throws(DBError) -> Catalog.FTSRecord {
+    try Relation.flushFTS(ctx, name: name)  // F6f read-your-writes: flush buffered docs first.
     guard let record = try Relation.ensureState(ctx).ftsRecords[name] else {
       throw DBError.noSuchTable(name)
     }

@@ -25,86 +25,146 @@ enum FTSIndex {
 
   // MARK: - Build
 
-  static func add(
-    _ ctx: TxnContext, record: inout Catalog.FTSRecord, docid: Int64, columnTexts: [String]
+  /// One document buffered in the transaction-scoped FTS memtable (F6f). `ftsAdd`
+  /// appends these; the flush (`addBatch`) writes them coalesced.
+  struct PendingDoc: Sendable {
+    let docid: Int64
+    let columnTexts: [String]
+  }
+
+  /// Indexes a BATCH of documents in one coalesced pass (the F6f memtable flush).
+  /// Tokenizes every doc, accumulates `term → [posting]` across the whole batch,
+  /// then merges each term's postings into the tree ONCE — O(distinct terms)
+  /// block writes instead of O(docs × terms/doc), the build-throughput win.
+  /// `docs` need not be docid-sorted; a docid already on disk or repeated within
+  /// the batch is rejected (mirrors the per-doc invariant) — but the error now
+  /// surfaces at flush (the next same-table read or commit) and so aborts the
+  /// whole transaction rather than the individual INSERT statement.
+  static func addBatch(
+    _ ctx: TxnContext, record: inout Catalog.FTSRecord, docs: [PendingDoc]
   ) throws(DBError) {
+    guard !docs.isEmpty else { return }
     let columns = record.definition.columns.count
     let storePositions = record.definition.detail != .none
-    let docKey = KeyCodec.rowKey(docid)
-    if try Relation.getBytes(ctx, record.stats, key: docKey) != nil {
-      throw DBError.invalidDefinition("fts \(record.definition.name): docid \(docid) already indexed")
-    }
     let tokenizer = try FTSTokenizerFactory.make(record.definition.tokenize)
 
-    var fieldLengths = [UInt32](repeating: 0, count: columns)
-    var termInfo: [[UInt8]: (fieldTFs: [UInt32], positions: [[UInt32]])] = [:]
-    for column in 0..<min(columns, columnTexts.count) {
-      try tokenizer.tokenize(Array(columnTexts[column].utf8)) { (token) throws(DBError) in
-        fieldLengths[column] += 1
-        guard !token.term.isEmpty, token.term.count <= maxTermBytes else { return }
-        if termInfo[token.term] == nil {
-          termInfo[token.term] = (
-            fieldTFs: [UInt32](repeating: 0, count: columns),
-            positions: Array(repeating: [UInt32](), count: columns))
-        }
-        termInfo[token.term]!.fieldTFs[column] += 1
-        if storePositions { termInfo[token.term]!.positions[column].append(UInt32(token.position)) }
+    var stats = record.stats
+    var termPostings: [[UInt8]: [FTSPosting]] = [:]
+    var forwards: [(docid: Int64, fieldLengths: [UInt32], terms: [[UInt8]])] = []
+    var seen = Set<Int64>()
+    for doc in docs {
+      guard seen.insert(doc.docid).inserted,
+        try Relation.getBytes(ctx, stats, key: KeyCodec.rowKey(doc.docid)) == nil
+      else {
+        throw DBError.invalidDefinition(
+          "fts \(record.definition.name): docid \(doc.docid) already indexed")
       }
+      var fieldLengths = [UInt32](repeating: 0, count: columns)
+      var termInfo: [[UInt8]: (fieldTFs: [UInt32], positions: [[UInt32]])] = [:]
+      for column in 0..<min(columns, doc.columnTexts.count) {
+        try tokenizer.tokenize(Array(doc.columnTexts[column].utf8)) { (token) throws(DBError) in
+          fieldLengths[column] += 1
+          guard !token.term.isEmpty, token.term.count <= maxTermBytes else { return }
+          if termInfo[token.term] == nil {
+            termInfo[token.term] = (
+              fieldTFs: [UInt32](repeating: 0, count: columns),
+              positions: Array(repeating: [UInt32](), count: columns))
+          }
+          termInfo[token.term]!.fieldTFs[column] += 1
+          if storePositions { termInfo[token.term]!.positions[column].append(UInt32(token.position)) }
+        }
+      }
+      for (term, info) in termInfo {
+        termPostings[term, default: []].append(
+          FTSPosting(
+            docid: doc.docid, fieldTFs: info.fieldTFs,
+            positions: storePositions ? info.positions : []))
+      }
+      forwards.append((doc.docid, fieldLengths, Array(termInfo.keys)))
     }
 
     var dict = record.dict
     var postings = record.postings
-    var stats = record.stats
-    for (term, info) in termInfo {
-      let posting = FTSPosting(
-        docid: docid, fieldTFs: info.fieldTFs, positions: storePositions ? info.positions : [])
+    for (term, additions) in termPostings {
+      let sorted = additions.sorted { $0.docid < $1.docid }
       let oldDF = try documentFrequency(ctx, dict, term: term)
+      let finalCount: Int
       if oldDF == 0 {
-        try writeBlock(ctx, &postings, term: term, blockNo: 0, [posting], columns: columns, positions: storePositions)
-        try Relation.putBytes(ctx, &dict, key: term, value: encodeDF(1))
-        continue
-      }
-      let lastNo = blockNo(forDF: oldDF)
-      var lastBlock = try readBlock(
-        ctx, postings, term: term, blockNo: lastNo, columns: columns, positions: storePositions)
-      if let lastDocid = lastBlock.last?.docid, posting.docid > lastDocid {
-        // Ascending fast path: rewrite only the last (partial) block, or open a
-        // fresh one when it is full. O(blockSize), the bulk-build common case.
-        if lastBlock.count < FTSPostings.blockSize {
-          lastBlock.append(posting)
-          try writeBlock(
-            ctx, &postings, term: term, blockNo: lastNo, lastBlock, columns: columns,
-            positions: storePositions)
-        } else {
-          try writeBlock(
-            ctx, &postings, term: term, blockNo: lastNo + 1, [posting], columns: columns,
-            positions: storePositions)
-        }
-        try Relation.putBytes(ctx, &dict, key: term, value: encodeDF(oldDF + 1))
+        try writePacked(ctx, &postings, term: term, sorted, columns: columns, positions: storePositions)
+        finalCount = sorted.count
       } else {
-        // Out-of-order docid: fall back to read-all, insert, re-pack. O(list),
-        // no worse than the pre-F6d whole-list rewrite (and not the hot path).
-        var list = try fullList(
-          ctx, postings, term: term, columns: columns, positions: storePositions)
-        insertInDocidOrder(&list, posting)
-        try rewritePacked(
-          ctx, &postings, term: term, oldLastNo: lastNo, list, columns: columns,
-          positions: storePositions)
-        try Relation.putBytes(ctx, &dict, key: term, value: encodeDF(UInt64(list.count)))
+        let lastNo = blockNo(forDF: oldDF)
+        let lastBlock = try readBlock(
+          ctx, postings, term: term, blockNo: lastNo, columns: columns, positions: storePositions)
+        if let lastDocid = lastBlock.last?.docid, let firstNew = sorted.first?.docid,
+          firstNew > lastDocid {
+          // Ascending append (the bulk-build common case): re-pack only the last
+          // block plus the appended postings into blocks from `lastNo` — O(batch),
+          // never re-reading earlier blocks, so a multi-batch build stays linear.
+          let combined = lastBlock + sorted
+          var no = lastNo
+          var start = 0
+          while start < combined.count {
+            let end = min(start + FTSPostings.blockSize, combined.count)
+            try writeBlock(
+              ctx, &postings, term: term, blockNo: no, Array(combined[start..<end]),
+              columns: columns, positions: storePositions)
+            no += 1
+            start = end
+          }
+          finalCount = Int(oldDF) + sorted.count
+        } else {
+          // Out-of-order: read the whole list, merge, re-pack.
+          let merged = mergePostings(
+            try fullList(ctx, postings, term: term, columns: columns, positions: storePositions),
+            sorted)
+          try rewritePacked(
+            ctx, &postings, term: term, oldLastNo: lastNo, merged, columns: columns,
+            positions: storePositions)
+          finalCount = merged.count
+        }
       }
+      try Relation.putBytes(ctx, &dict, key: term, value: encodeDF(UInt64(finalCount)))
     }
 
-    try Relation.putBytes(
-      ctx, &stats, key: docKey,
-      value: encodeForward(fieldLengths: fieldLengths, terms: Array(termInfo.keys)))
     var global = try readGlobal(ctx, stats, columns: columns)
-    global.docCount += 1
-    for column in 0..<columns { global.totalFieldLengths[column] += UInt64(fieldLengths[column]) }
+    for fwd in forwards {
+      try Relation.putBytes(
+        ctx, &stats, key: KeyCodec.rowKey(fwd.docid),
+        value: encodeForward(fieldLengths: fwd.fieldLengths, terms: fwd.terms))
+      global.docCount += 1
+      for column in 0..<min(columns, fwd.fieldLengths.count) {
+        global.totalFieldLengths[column] += UInt64(fwd.fieldLengths[column])
+      }
+    }
     try Relation.putBytes(ctx, &stats, key: globalKey, value: global.encode())
 
     record.dict = dict
     record.postings = postings
     record.stats = stats
+  }
+
+  /// Merges two docid-ascending posting lists into one (stable on equal docids,
+  /// which the batch's dup-check rules out anyway).
+  private static func mergePostings(_ a: [FTSPosting], _ b: [FTSPosting]) -> [FTSPosting] {
+    if a.isEmpty { return b }
+    if b.isEmpty { return a }
+    var out: [FTSPosting] = []
+    out.reserveCapacity(a.count + b.count)
+    var i = 0
+    var j = 0
+    while i < a.count, j < b.count {
+      if a[i].docid <= b[j].docid {
+        out.append(a[i])
+        i += 1
+      } else {
+        out.append(b[j])
+        j += 1
+      }
+    }
+    if i < a.count { out.append(contentsOf: a[i...]) }
+    if j < b.count { out.append(contentsOf: b[j...]) }
+    return out
   }
 
   @discardableResult
@@ -355,7 +415,9 @@ enum FTSIndex {
     _ resolver: some PageResolver, _ handle: TreeHandle, term: [UInt8], blockNo no: UInt32,
     columns: Int, positions: Bool
   ) throws(DBError) -> [FTSPosting] {
-    guard let value = try Relation.getBytes(resolver, handle, key: blockKey(term, no)) else { return [] }
+    guard let value = try Relation.getBytes(resolver, handle, key: blockKey(term, no)) else {
+      return []
+    }
     return try FTSPostings.decode(value, columns: columns, storePositions: positions)
   }
 
@@ -411,15 +473,6 @@ enum FTSIndex {
     return decodeDF(bytes)
   }
 
-  private static func insertInDocidOrder(_ list: inout [FTSPosting], _ posting: FTSPosting) {
-    var low = 0
-    var high = list.count
-    while low < high {
-      let mid = (low + high) / 2
-      if list[mid].docid < posting.docid { low = mid + 1 } else { high = mid }
-    }
-    list.insert(posting, at: low)
-  }
 
   private static func readGlobal(
     _ resolver: some PageResolver, _ handle: TreeHandle, columns: Int

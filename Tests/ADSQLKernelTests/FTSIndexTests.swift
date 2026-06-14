@@ -42,6 +42,66 @@ struct FTSIndexTests {
     }
   }
 
+  /// F6f memtable read-your-writes: docs added in a transaction are buffered, but
+  /// a MATCH in the SAME transaction flushes the buffer first and sees them; a
+  /// further add after a read re-buffers and is visible to the next read; and the
+  /// whole batch is durable after commit.
+  @Test func memtableFlushesBeforeSameTransactionRead() throws {
+    let dir = TempDir()
+    defer { dir.cleanup() }
+    let path = dir.file("ftsryw.adsql")
+    do {
+      let db = try Database.open(at: path)
+      defer { db.close() }
+      try run(db, "CREATE VIRTUAL TABLE fts USING fts5(body, tokenize='porter unicode61')")
+      try db.writeSync { (txn) throws(DBError) in
+        try txn.ftsAdd("fts", docid: 1, columnTexts: ["swift structured concurrency"])
+        try txn.ftsAdd("fts", docid: 2, columnTexts: ["python static typing"])
+        // Same-transaction MATCH must flush the buffer first and see the docs.
+        #expect(try txn.ftsMatch("fts", "swift") == [1])
+        #expect(try txn.ftsMatch("fts", "python") == [2])
+        // A further add after a read re-buffers and is seen by the next read.
+        try txn.ftsAdd("fts", docid: 3, columnTexts: ["swift on the server"])
+        #expect(try txn.ftsMatch("fts", "swift") == [1, 3])
+      }
+    }
+    // Reopen: the batch is durable.
+    let db = try Database.open(at: path)
+    defer { db.close() }
+    let hits = try db.prepare("SELECT rowid FROM fts WHERE fts MATCH 'swift' ORDER BY rowid")
+      .all().map { row -> Int64 in
+        guard case .integer(let id) = row[0] else { return -1 }
+        return id
+      }
+    #expect(hits == [1, 3])
+  }
+
+  /// F6f: batches that span the 128-doc block boundary stay complete and packed —
+  /// `writePacked` for a new term across two blocks, then the ascending-append
+  /// path re-packing the last partial block plus new blocks for a follow-on batch.
+  @Test func memtableBatchSpansBlockBoundaries() throws {
+    let dir = TempDir()
+    defer { dir.cleanup() }
+    let db = try Database.open(at: dir.file("ftsbatch.adsql"))
+    defer { db.close() }
+    try run(db, "CREATE VIRTUAL TABLE fts USING fts5(body, tokenize='porter unicode61')")
+    // Phase 1: 200 docs of one term in one transaction → new term, two 128 blocks.
+    try db.writeSync { (txn) throws(DBError) in
+      for id in 1...200 { try txn.ftsAdd("fts", docid: Int64(id), columnTexts: ["common"]) }
+    }
+    // Phase 2: 100 more in another transaction → ascending-append path across the
+    // partial last block and into new blocks.
+    try db.writeSync { (txn) throws(DBError) in
+      for id in 201...300 { try txn.ftsAdd("fts", docid: Int64(id), columnTexts: ["common"]) }
+    }
+    try db.writeSync { (txn) throws(DBError) in
+      let postings = try txn.ftsPostings("fts", term: term("common"))
+      #expect(postings?.count == 300)
+      #expect(postings?.map(\.docid) == (1...300).map(Int64.init))
+      #expect(try txn.ftsDocumentFrequency("fts", term: term("common")) == 300)
+    }
+  }
+
   @Test func deleteUpdatesIndexAndPersists() throws {
     let dir = TempDir()
     defer { dir.cleanup() }

@@ -124,6 +124,62 @@ struct GroupCommitTests {
     _ = try KernelOps.checkLiveness(CommittedResolver(source: pager), meta)
   }
 
+  /// F6f: one request buffers FTS docs; a SECOND request in the same batch forces
+  /// a flush of the shared buffer (via a MATCH) and then fails. The failing
+  /// request's rollback must undo its flush yet leave the first request's docs to
+  /// be re-flushed at commit — the most intricate memtable/group-commit
+  /// interaction (the buffer lives in value-typed RelationState; the flush's pages
+  /// are request-epoch-undoable).
+  @Test func ftsBufferSurvivesAnotherRequestsRollback() async throws {
+    let dir = TempDir()
+    defer { dir.cleanup() }
+    let db = try Database.open(at: dir.file("ftsgc.adsql"))
+    defer { db.close() }
+    try db.prepare("CREATE VIRTUAL TABLE fts USING fts5(body, tokenize='porter unicode61')").run()
+
+    // Stall the queue so both async writes land in one batch.
+    let blocker = DispatchSemaphore(value: 0)
+    let blockerTask = Task.detached {
+      try? db.writeSync { (txn) throws(DBError) in
+        try txn.put(Array("warm".utf8), [0])
+        blocker.wait()
+      }
+    }
+    // A: buffers FTS docs (no tree write yet).
+    async let good: Void = db.write { (txn) throws(DBError) in
+      try txn.ftsAdd("fts", docid: 1, columnTexts: ["alpha"])
+      try txn.ftsAdd("fts", docid: 2, columnTexts: ["beta"])
+    }
+    // B (same batch): adds its own doc, forces a flush of the shared buffer via a
+    // MATCH (writing 1,2,3 under B's request epoch), then throws — rolling back
+    // ONLY its own doc.
+    async let poisoned: Void = db.write { (txn) throws(DBError) in
+      try txn.ftsAdd("fts", docid: 3, columnTexts: ["gamma"])
+      _ = try txn.ftsMatch("fts", "alpha")
+      try txn.put([], [0])  // keyEmpty → this request rolls back
+    }
+    blocker.signal()
+    try await good
+    do {
+      try await poisoned
+      Issue.record("poisoned write must throw")
+    } catch {
+      #expect(error as? DBError == DBError.keyEmpty)
+    }
+    _ = await blockerTask.value
+
+    func match(_ query: String) throws -> [Int64] {
+      try db.prepare("SELECT rowid FROM fts WHERE fts MATCH ? ORDER BY rowid").all(.text(query))
+        .map { row in
+          guard case .integer(let id) = row[0] else { return Int64(-1) }
+          return id
+        }
+    }
+    #expect(try match("alpha") == [1])
+    #expect(try match("beta") == [2])
+    #expect(try match("gamma") == [], "rolled-back request leaked an FTS doc")
+  }
+
   @Test func closedDatabaseFailsQueuedWrites() async throws {
     let dir = TempDir()
     defer { dir.cleanup() }
