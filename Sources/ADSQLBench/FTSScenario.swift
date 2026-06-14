@@ -43,6 +43,21 @@ enum FTSScenario {
   /// `FTSParityTests`; this arm measures its latency on both engines.
   static let bm25fWeighted = "bm25(documents_fts, 1.0, 8.0, 6.0, 1.0, 1.0)"
 
+  /// R6 — a second FTS shape: the **trigram** tokenizer indexes 3-grams, so MATCH
+  /// finds arbitrary substrings (LIKE-style), not whole tokens. Same columns/corpus
+  /// as `documents_fts`; the bench measures its build + substring-MATCH latency
+  /// against SQLite FTS5's trigram on both engines.
+  static let trigramDDL = """
+    CREATE VIRTUAL TABLE documents_trigram USING fts5(
+      title, abstract, declaration, headings, key, tokenize='trigram')
+    """
+  /// Substring probes (≥3 chars — trigram's minimum gram) hitting mid-token spans
+  /// a token tokenizer could not: e.g. "igur" inside "configures", " flow".
+  static let trigramQueries = ["view", "render", "igur", "swiftu", "eleg", " data"]
+  /// Churn arm: 1/`churnDivisor` of the built corpus is deleted and re-inserted
+  /// after the initial build, measuring the FTS edit/re-index path (rows/s).
+  static let churnDivisor = 8
+
   /// Representative MATCH battery, drawn from the generator vocabulary so each
   /// hits a meaningful, varied subset: single anchor term, stemmed prose term,
   /// AND, OR, prefix, and one column-filtered query.
@@ -171,6 +186,60 @@ enum FTSScenario {
       }
     }
     print("  [adsql] fts bm25f@\(limit)    \(rankedFHist.summary())")
+
+    // 4. R6 — trigram tokenizer (substring search). Same corpus under a trigram
+    // tokenizer; MATCH finds arbitrary substrings, so the probes hit mid-token
+    // spans a token tokenizer cannot.
+    try db.prepare(trigramDDL).run()
+    var trigramGen = FTSCorpus.Generator()
+    var tgBuilt = 0
+    while tgBuilt < rows {
+      let batchEnd = min(tgBuilt + 256, rows)
+      let lower = tgBuilt
+      try db.transaction { (tx) throws(DBError) in
+        for id in (lower + 1)...batchEnd {
+          let doc = trigramGen.next(id: Int64(id))
+          try tx.run(
+            "INSERT INTO documents_trigram(rowid, title, abstract, declaration, headings, key) VALUES(?, ?, ?, ?, ?, ?)",
+            .integer(doc.id), .text(doc.title), .text(doc.abstract),
+            .text(doc.declaration), .text(doc.headings), .text(doc.key))
+        }
+      }
+      tgBuilt = batchEnd
+    }
+    let trigramMatch = try db.prepare(
+      "SELECT rowid FROM documents_trigram WHERE documents_trigram MATCH ?")
+    var trigramHist = LatencyHistogram()
+    trigramHist.reserve(trigramQueries.count * iterationsPerQuery)
+    for _ in 0..<iterationsPerQuery {
+      for q in trigramQueries {
+        let start = nowNanos()
+        let result = try trigramMatch.all(.text(q))
+        trigramHist.record(nowNanos() - start)
+        precondition(result.count <= rows)
+      }
+    }
+    print("  [adsql] fts trigram     \(trigramHist.summary())")
+
+    // 5. R6 — update/delete churn: delete 1/churnDivisor of the corpus, then
+    // re-insert the same docs (the FTS edit/re-index path), measured as rows/s.
+    let churn = max(1, rows / churnDivisor)
+    let churnStart = nowNanos()
+    try db.transaction { (tx) throws(DBError) in
+      for id in 1...churn { try tx.run("DELETE FROM documents_fts WHERE rowid = ?", .integer(Int64(id))) }
+    }
+    var churnGen = FTSCorpus.Generator()
+    try db.transaction { (tx) throws(DBError) in
+      for id in 1...churn {
+        let doc = churnGen.next(id: Int64(id))
+        try tx.run(
+          "INSERT INTO documents_fts(rowid, title, abstract, declaration, headings, key) VALUES(?, ?, ?, ?, ?, ?)",
+          .integer(doc.id), .text(doc.title), .text(doc.abstract),
+          .text(doc.declaration), .text(doc.headings), .text(doc.key))
+      }
+    }
+    let churnElapsed = nowNanos() - churnStart
+    print("  [adsql] fts churn       \(churn) del+ins in \(churnElapsed / 1_000_000) ms (\(formatRate(churn * 2, churnElapsed)))")
   }
 
   // MARK: - SQLite FTS5 baseline
@@ -301,6 +370,88 @@ enum FTSScenario {
       }
     }
     print("  [sqlite] fts bm25f@\(limit)    \(rankedFHist.summary())")
+
+    // 4. R6 — trigram tokenizer (mirrors the ADSQL arm).
+    try exec(trigramDDL)
+    var tgInsert: OpaquePointer?
+    sqlite3_prepare_v3(
+      db, "INSERT INTO documents_trigram(rowid, title, abstract, declaration, headings, key) VALUES(?1, ?2, ?3, ?4, ?5, ?6)",
+      -1, UInt32(SQLITE_PREPARE_PERSISTENT), &tgInsert, nil)
+    defer { sqlite3_finalize(tgInsert) }
+    var trigramGen = FTSCorpus.Generator()
+    var tgBuilt = 0
+    while tgBuilt < rows {
+      let batchEnd = min(tgBuilt + 256, rows)
+      try exec("BEGIN IMMEDIATE")
+      for id in (tgBuilt + 1)...batchEnd {
+        let doc = trigramGen.next(id: Int64(id))
+        sqlite3_reset(tgInsert)
+        sqlite3_bind_int64(tgInsert, 1, doc.id)
+        sqlite3_bind_text(tgInsert, 2, doc.title, -1, transient)
+        sqlite3_bind_text(tgInsert, 3, doc.abstract, -1, transient)
+        sqlite3_bind_text(tgInsert, 4, doc.declaration, -1, transient)
+        sqlite3_bind_text(tgInsert, 5, doc.headings, -1, transient)
+        sqlite3_bind_text(tgInsert, 6, doc.key, -1, transient)
+        guard sqlite3_step(tgInsert) == SQLITE_DONE else {
+          throw SQLiteError.code(sqlite3_errcode(db), "trigram insert")
+        }
+      }
+      try exec("COMMIT")
+      tgBuilt = batchEnd
+    }
+    var tgMatch: OpaquePointer?
+    sqlite3_prepare_v3(
+      db, "SELECT rowid FROM documents_trigram WHERE documents_trigram MATCH ?1",
+      -1, UInt32(SQLITE_PREPARE_PERSISTENT), &tgMatch, nil)
+    defer { sqlite3_finalize(tgMatch) }
+    var trigramHist = LatencyHistogram()
+    trigramHist.reserve(trigramQueries.count * iterationsPerQuery)
+    for _ in 0..<iterationsPerQuery {
+      for q in trigramQueries {
+        let start = nowNanos()
+        sqlite3_reset(tgMatch)
+        sqlite3_bind_text(tgMatch, 1, q, -1, transient)
+        while sqlite3_step(tgMatch) == SQLITE_ROW {}
+        trigramHist.record(nowNanos() - start)
+      }
+    }
+    print("  [sqlite] fts trigram     \(trigramHist.summary())")
+
+    // 5. R6 — update/delete churn (mirrors the ADSQL arm).
+    let churn = max(1, rows / churnDivisor)
+    let churnStart = nowNanos()
+    var del: OpaquePointer?
+    sqlite3_prepare_v3(
+      db, "DELETE FROM documents_fts WHERE rowid = ?1",
+      -1, UInt32(SQLITE_PREPARE_PERSISTENT), &del, nil)
+    defer { sqlite3_finalize(del) }
+    try exec("BEGIN IMMEDIATE")
+    for id in 1...churn {
+      sqlite3_reset(del)
+      sqlite3_bind_int64(del, 1, Int64(id))
+      guard sqlite3_step(del) == SQLITE_DONE else {
+        throw SQLiteError.code(sqlite3_errcode(db), "churn delete")
+      }
+    }
+    try exec("COMMIT")
+    var churnGen = FTSCorpus.Generator()
+    try exec("BEGIN IMMEDIATE")
+    for id in 1...churn {
+      let doc = churnGen.next(id: Int64(id))
+      sqlite3_reset(insert)
+      sqlite3_bind_int64(insert, 1, doc.id)
+      sqlite3_bind_text(insert, 2, doc.title, -1, transient)
+      sqlite3_bind_text(insert, 3, doc.abstract, -1, transient)
+      sqlite3_bind_text(insert, 4, doc.declaration, -1, transient)
+      sqlite3_bind_text(insert, 5, doc.headings, -1, transient)
+      sqlite3_bind_text(insert, 6, doc.key, -1, transient)
+      guard sqlite3_step(insert) == SQLITE_DONE else {
+        throw SQLiteError.code(sqlite3_errcode(db), "churn insert")
+      }
+    }
+    try exec("COMMIT")
+    let churnElapsed = nowNanos() - churnStart
+    print("  [sqlite] fts churn       \(churn) del+ins in \(churnElapsed / 1_000_000) ms (\(formatRate(churn * 2, churnElapsed)))")
   }
 
   /// True when the linked sqlite3 has FTS5 compiled in (create a throwaway fts5
