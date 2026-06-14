@@ -944,6 +944,41 @@ enum SelectExecutor {
       residualConjuncts.isEmpty
       ? nil : residualConjuncts.dropFirst().reduce(residualConjuncts[0]) { .binary(.and, $0, $1) }
 
+    // SEMI-JOIN: when the inner is existence-only (no inner column is read by the
+    // query) and the ON is pure equi (no residual), the inner row *values* are never
+    // needed — build per-key COUNTS instead of materializing every inner row, then
+    // emit `count` times per matching outer. Avoids the O(inner-rows) materialization
+    // that makes the plain hash the wrong tool for a large symmetric existence join
+    // (findings #1/#3); cardinality is preserved (COUNT(*) = Σ matched run lengths).
+    if join.innerExistenceOnly, onResidual == nil {
+      var counts: [GroupKey: Int] = [:]
+      unsafe try forEachRow(.table, table: tables[innerDepth], resolver: resolver) {
+        rowid, span, score throws(DBError) in
+        unsafe context.load(innerDepth, rowid: rowid, span: span, score: score)
+        var keyValues: [Value] = []
+        keyValues.reserveCapacity(equiInner.count)
+        for column in equiInner { keyValues.append(try context.slots[innerDepth].value(at: column)) }
+        counts[GroupKey(keyValues, collations: equiCollations), default: 0] += 1
+        return true
+      }
+      let emptySpan = unsafe UnsafeRawBufferPointer(start: nil, count: 0)
+      let outerSource = try resolveSource(
+        plan, table: tables[0], index: index, ftsRecords: ftsRecords, env: paramsEnv)
+      unsafe try forEachRow(outerSource, table: tables[0], resolver: resolver) {
+        rowid, span, score throws(DBError) in
+        unsafe context.load(0, rowid: rowid, span: span, score: score)
+        var probeValues: [Value] = []
+        probeValues.reserveCapacity(equiOuter.count)
+        for expr in equiOuter { probeValues.append(try SQLEval.evaluate(expr, env)) }
+        if probeValues.contains(where: { $0.isNull }) { return true }  // NULL never matches
+        guard let count = counts[GroupKey(probeValues, collations: equiCollations)] else { return true }
+        unsafe context.load(innerDepth, rowid: 0, span: emptySpan)
+        for _ in 0..<count { try emit() }
+        return true
+      }
+      return true
+    }
+
     // BUILD: full scan of the inner table → hash[inner equi key] = [(rowid, full row)].
     var hash: [GroupKey: [(rowid: Int64, values: [Value])]] = [:]
     var approxBytes = 0

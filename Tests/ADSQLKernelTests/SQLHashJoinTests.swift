@@ -40,6 +40,9 @@ private enum HashJoinFixture {
       at: dir.file("hashjoin-\(join).adsql"),
       options: DatabaseOptions(execution: ExecutionOptions(join: join)))
     try db.writeSync { (txn) throws(DBError) in try txn.createTable(definition) }
+    // A UNIQUE index on the join key so `ON b.key = a.key` binds to an exact index
+    // probe → innerExistenceOnly → exercises the hash SEMI-join (per-key count) path.
+    try db.prepare("CREATE UNIQUE INDEX ux_docs_key ON docs(key)").run()
     for row in rows() {
       let dict = Dictionary(uniqueKeysWithValues: zip(columns, row))
       try db.writeSync { (txn) throws(DBError) in try txn.insert(into: "docs", dict) }
@@ -50,6 +53,7 @@ private enum HashJoinFixture {
   static func mirror() throws -> SQLiteMirror {
     let m = SQLiteMirror()
     try m.exec(sqliteDDL)
+    try m.exec("CREATE UNIQUE INDEX ux_docs_key ON docs(key)")
     for row in rows() { try m.insertRow("docs", columns, row) }
     return m
   }
