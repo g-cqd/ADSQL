@@ -34,6 +34,34 @@ enum FTSScorer {
   /// the ranking).
   static let minIDF = 1e-6
 
+  // MARK: - Scoring primitives (shared by score-all and the F6c WAND path)
+
+  /// bm25 length-normalization term `L = k1·(1 − b + b·D/avgdl)` for a document of
+  /// total length `docLength` against corpus average `avgdl`. Factored out so the
+  /// WAND path computes it with the IDENTICAL arithmetic as `score`.
+  @inline(__always)
+  static func lengthNorm(docLength: Double, avgdl: Double) -> Double {
+    k1 * (1 - b + b * docLength / avgdl)
+  }
+
+  /// Okapi IDF for a leaf with document frequency `df` over a corpus of `n`
+  /// documents, clamped to `minIDF` when ≤ 0 (FTS5 behavior). Identical formula to
+  /// the inline computation `score` used before this was factored out.
+  @inline(__always)
+  static func idf(df: UInt64, n: Double) -> Double {
+    let raw = log((n - Double(df) + 0.5) / (Double(df) + 0.5))
+    return raw <= 0 ? minIDF : raw
+  }
+
+  /// A single positive leaf's bm25f contribution given its `idf`, weighted term
+  /// frequency `weightedFreq` (`Σ_c weight_c·tf_c`), and the document's length
+  /// norm `L`. This is the exact per-leaf term `score` accumulates; both the
+  /// score-all path and WAND call it, so their scores are bit-identical.
+  @inline(__always)
+  static func contribution(idf: Double, weightedFreq: Double, lengthNorm: Double) -> Double {
+    idf * weightedFreq * (k1 + 1) / (weightedFreq + lengthNorm)
+  }
+
   /// The (negated) bm25f score of `docid` for `query`. `weights` is per-column
   /// (length == the FTS table's column count; the caller pads with 1.0). `global`
   /// is the corpus aggregate, fetched once by the caller and reused per docid.
@@ -51,7 +79,7 @@ enum FTSScorer {
     let totalLength = global.totalFieldLengths.reduce(0.0) { $0 + Double($1) }
     let avgdl = totalLength / Double(global.docCount)
     guard avgdl > 0 else { return 0 }
-    let lengthNorm = k1 * (1 - b + b * docLength / avgdl)
+    let lengthNorm = lengthNorm(docLength: docLength, avgdl: avgdl)
 
     let scorer = try Scorer(record: record, resolver: resolver, columns: columns)
     var total = 0.0
@@ -59,16 +87,14 @@ enum FTSScorer {
     // narrows it. The intersection mirrors F3b's column restriction.
     try scorer.collectLeaves(query, columns: nil) { leaf, allowed throws(DBError) in
       let df = try scorer.documentFrequency(leaf)
-      let n = Double(global.docCount)
-      let rawIDF = log((n - Double(df) + 0.5) / (Double(df) + 0.5))
-      let idf = rawIDF <= 0 ? minIDF : rawIDF
+      let idf = idf(df: df, n: Double(global.docCount))
       var weightedFreq = 0.0
       let perColumn = try scorer.frequencies(leaf, docid: docid)
       for column in 0..<columns where allowed?.contains(column) ?? true {
         weightedFreq += weights[column] * Double(perColumn[column])
       }
       guard weightedFreq > 0 else { return }
-      total += idf * weightedFreq * (k1 + 1) / (weightedFreq + lengthNorm)
+      total += contribution(idf: idf, weightedFreq: weightedFreq, lengthNorm: lengthNorm)
     }
     return -total
   }

@@ -221,6 +221,17 @@ enum SelectExecutor {
       if case .index(_, let list) = source { return list.count > 1 }
       return false
     }()
+    // F6c — block-max WAND ranked top-k: when the leading FTS source is ordered by
+    // its bm25 `rank` slot ascending (best first) under a LIMIT, retrieve the
+    // top-(offset+limit) by dynamic pruning instead of scoring the whole match set.
+    // `k` is offset+limit (the slice drops the offset afterward). Enabled only for
+    // `ORDER BY rank[, rowid]` ascending — exactly the heap's score-then-smallest-
+    // rowid tiebreak — so the result is identical to score-all; any other shape (or
+    // an ineligible query, decided inside) keeps the score-all path. nil = off.
+    let ftsRankedTopK: Int? = {
+      guard case .fts = source, let topN, isFTSRankAscendingOrder(plan.orderBy) else { return nil }
+      return topN
+    }()
     // Bounded top-N over a single TEXT ORDER BY column: lets `consume` drop a
     // non-qualifying row by comparing its column bytes in place (no sort-key
     // String) against the worst kept entry. nil = the general `[Value]` path.
@@ -263,7 +274,7 @@ enum SelectExecutor {
       orderCollations: plan.orderCollations, collectKeys: collectKeys,
       sliceEnd: sliceEnd, topN: topN, dedupRowids: dedupRowids,
       distinct: plan.distinct, distinctCollations: plan.outputCollations, fastSort: fastSort)
-    unsafe try forEachRow(source, table: table, resolver: resolver) {
+    unsafe try forEachRow(source, table: table, resolver: resolver, ftsRankedTopK: ftsRankedTopK) {
       rowid, span, score throws(DBError) in
       unsafe try accumulator.consume(rowid: rowid, span: span, score: score)
     }
@@ -521,6 +532,7 @@ enum SelectExecutor {
   /// `body` returns false to stop early.
   private static func forEachRow<R: PageResolver>(
     _ source: RowSource, table: Catalog.TableRecord, resolver: R, existenceOnly: Bool = false,
+    ftsRankedTopK: Int? = nil,
     _ body: (Int64, UnsafeRawBufferPointer, Double) throws(DBError) -> Bool
   ) throws(DBError) {
     switch source {
@@ -564,7 +576,6 @@ enum SelectExecutor {
       // for `rank`, and never reads the span. The join then descends on
       // `base.id = fts.rowid` exactly as for an ordinary rowid source.
       let query = try FTSQuery.parse(String(decoding: queryBytes, as: UTF8.self))
-      let docids = try FTSMatch.evaluate(query, record: record, resolver: resolver)
       // Fetch the corpus aggregate once; pad weights to the FTS column count.
       let global = try FTSIndex.globalStats(resolver, record)
       let columns = record.definition.columns.count
@@ -573,6 +584,26 @@ enum SelectExecutor {
         resolvedWeights += Array(repeating: 1.0, count: columns - resolvedWeights.count)
       }
       let empty = unsafe UnsafeRawBufferPointer(start: nil, count: 0)
+      // F6c — block-max WAND: a ranked top-k (ORDER BY rank ASC + LIMIT k) over an
+      // eligible query shape retrieves the top-k by dynamic pruning, scoring only
+      // survivors (identical scores via FTSScorer). nil ⇒ fall back to score-all.
+      if let k = ftsRankedTopK,
+        let top = try FTSWAND.topK(
+          query: query, record: record, resolver: resolver, weights: resolvedWeights,
+          global: global, k: k)
+      {
+        for entry in top {
+          if try unsafe !body(entry.docid, empty, entry.score) { return }
+        }
+        return
+      }
+      // Score-all: evaluate the MATCH query to its docid set (F3b), score each by
+      // bm25f (F4a), then hand each docid to `body` with an EMPTY span and the
+      // score: the FTS table's `RowSlot` is built from the synthetic rowid-alias
+      // definition, so `compute` returns `.integer(docid)` for `rowid`, `.real`
+      // for `rank`, and never reads the span. The join then descends on
+      // `base.id = fts.rowid` exactly as for an ordinary rowid source.
+      let docids = try FTSMatch.evaluate(query, record: record, resolver: resolver)
       for docid in docids {
         let score = try FTSScorer.score(
           query, record: record, resolver: resolver, docid: docid,
@@ -1376,6 +1407,32 @@ enum SelectExecutor {
       if ordered { keptKeys.append(sortKeys[index]) }
     }
     return (keptRows, keptKeys)
+  }
+
+  /// True when `orderBy` ranks the leading FTS table's bm25 `rank` slot ascending
+  /// (best/most-negative first), optionally followed by the FTS rowid ascending —
+  /// i.e. `ORDER BY rank` or `ORDER BY bm25(…), rowid`. This is the only shape
+  /// routed to the F6c WAND path: its score-then-smallest-rowid tiebreak matches
+  /// the heap's, so WAND returns the identical top-k. Any other ordering (DESC, a
+  /// non-rank leading key, a different trailing tiebreak) returns false and keeps
+  /// score-all.
+  private static func isFTSRankAscendingOrder(_ orderBy: [SQLOrderingTerm]) -> Bool {
+    guard let first = orderBy.first, !first.descending,
+      case .boundColumn(let table, let column) = first.expr,
+      table == 0, column == ftsRankSlot
+    else { return false }
+    switch orderBy.count {
+    case 1:
+      return true
+    case 2:
+      // A trailing rowid-ascending tiebreak (FTS rowid alias is slot 0).
+      guard !orderBy[1].descending, case .boundColumn(let t, let c) = orderBy[1].expr else {
+        return false
+      }
+      return t == 0 && c == 0
+    default:
+      return false
+    }
   }
 
   // MARK: - ORDER BY
