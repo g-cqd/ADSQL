@@ -719,6 +719,17 @@ enum SelectExecutor {
       return
     }
 
+    // Merge join (existence/COUNT fast path): a 2-table INNER existence
+    // self-equi-join on a UNIQUE NOT-NULL single-column index needs no per-outer
+    // inner probe. Returns false when ineligible, falling through below.
+    if execution.join == .merge,
+      try runMergeJoin(
+        plan, tables: tables, joinIndexes: joinIndexes, resolver: resolver, context: context,
+        emit: { () throws(DBError) in if try passesWhere() { try body() } })
+    {
+      return
+    }
+
     // Hash join (selected, eligible 2-table INNER equi-join): build the inner,
     // probe the outer — O(M+N), no per-outer index descent. Returns false when
     // ineligible, falling through to the nested-loop driver below.
@@ -1015,6 +1026,48 @@ enum SelectExecutor {
         try emit()
       }
       return true
+    }
+    return true
+  }
+
+  /// Merge-join existence/COUNT fast path (RFC 0009 H4). A 2-table INNER
+  /// existence self-equi-join on a **UNIQUE, NOT-NULL, single-column** index needs
+  /// no per-outer inner probe: each outer row matches exactly the one inner row
+  /// with the same key (itself), so a single ordered pass over the shared index
+  /// emits once per entry — O(N) byte walk, no descent, no materialization
+  /// (`COUNT(*)` = the row count). UNIQUE + NOT-NULL rules out dup-run cross-products
+  /// and NULL non-matches, so the result is provably identical to the nested loop.
+  /// Returns false (→ the proven nested-loop driver) for any shape outside this
+  /// subset; the general 2-table / dup-run / nullable merge is a later slice.
+  private static func runMergeJoin<R: PageResolver>(
+    _ plan: BoundSelect, tables: [Catalog.TableRecord], joinIndexes: [Catalog.IndexRecord?],
+    resolver: R, context: RowContext, emit: () throws(DBError) -> Void
+  ) throws(DBError) -> Bool {
+    guard plan.joins.count == 1, plan.joins[0].kind == .inner else { return false }
+    let join = plan.joins[0]
+    guard join.innerExistenceOnly, plan.isAggregated, plan.whereExpr == nil,
+      !plan.finalizationReferencedTables.contains(0), join.table == 1,
+      tables.count == 2, tables[0].tableId == tables[1].tableId,  // self-join (shared index)
+      let idx = joinIndexes.first ?? nil,
+      idx.definition.unique, idx.definition.columns.count == 1,
+      let idxCol = tables[0].definition.columnIndex(of: idx.definition.columns[0]),
+      tables[0].definition.columns[idxCol].notNull,
+      let key = hashEquiKey(join.on, innerDepth: 1, binding: plan.binding),
+      key.innerColumn == idxCol,
+      case .boundColumn(let outerTable, let outerColumn) = key.outerColumn,
+      outerTable == 0, outerColumn == idxCol
+    else { return false }
+
+    // Neither table's columns are read (existence inner + COUNT(*)-style outer), so
+    // load defensive empty spans and emit once per index entry in key order.
+    let emptySpan = unsafe UnsafeRawBufferPointer(start: nil, count: 0)
+    unsafe context.load(0, rowid: 0, span: emptySpan)
+    unsafe context.load(1, rowid: 0, span: emptySpan)
+    var cursor = Cursor(resolver: resolver, tree: idx.handle)
+    var positioned = try cursor.move(to: .first)
+    while positioned {
+      try emit()
+      positioned = try cursor.next()
     }
     return true
   }

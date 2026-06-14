@@ -61,7 +61,7 @@ private enum HashJoinFixture {
 
 @Suite("SQL hash join differential")
 struct SQLHashJoinTests {
-  static let joins: [ExecutionOptions.Join] = [.nestedLoop, .hash]
+  static let joins: [ExecutionOptions.Join] = [.nestedLoop, .hash, .merge]
 
   static let queries: [String] = [
     "SELECT COUNT(*) FROM docs a JOIN docs b ON b.key = a.key",                       // unique self-join
