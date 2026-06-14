@@ -1,0 +1,382 @@
+import ADSQL
+import CSQLite
+import Darwin
+import Foundation
+
+/// F6b — the FTS *measurement* slice. FTS is already correctness-complete and
+/// SQLite-FTS5-parity-verified (F6a); this benchmarks the apple-docs
+/// ranked-search shape against real SQLite FTS5 on three axes:
+///
+///   1. index-build throughput (rows/s) — INSERT N docs into `documents_fts`,
+///   2. MATCH p50 — membership queries (single term / AND / OR / prefix),
+///   3. ranked top-k p50 — `ORDER BY bm25(documents_fts,10,5,3,2,1) LIMIT 20`.
+///
+/// This baseline DATA-DRIVES the later perf slices (F6c block-max WAND, F6d
+/// segments/merge). No engine tuning happens here — bench only.
+///
+/// CRITICAL: ADSQL's `FTSIndex.add` re-decodes/re-encodes the whole posting list
+/// per term per doc (worse-than-O(n²) once common terms accumulate), so large
+/// builds are infeasible today. The corpus size is therefore clamped (see
+/// `rowCap`) and `--rows` tunes it; the build rows/s is reported HONESTLY even
+/// though it trails FTS5 by a wide margin (F6b measured ~400 rows/s at 2k vs
+/// FTS5's ~100k) — that gap is the expected signal motivating the F6d
+/// segments/merge slice. MATCH and ranked top-k latency are *also* far behind at
+/// the modest size (the F6c WAND signal — ranked top-k is tens of ms because the
+/// whole candidate set is scored). See `rowCap` for the measured build curve.
+enum FTSScenario {
+  /// Corpus-size clamp. `--rows` is clamped to this; a bare run (BenchConfig
+  /// defaults rows to 200k) and `--full` both land here. Kept at 2k — the
+  /// F6a-comparable size — so a bare run finishes in well under a minute on
+  /// ADSQL (build ≈5s + the latency phases) and is repeatable.
+  ///
+  /// This is BELOW the write-amp ceiling on purpose. ADSQL build scales
+  /// worse-than-O(n²) because `FTSIndex.add` re-encodes the whole posting list
+  /// per term per doc, and very common terms (e.g. "view", in nearly every
+  /// abstract) grow without bound (F6b measured, this machine, durability=none):
+  ///   500→0.30s · 1k→1.1s · 2k→4.7s · 4k→16.7s (each doubling ≈ 3.6–4.2× time),
+  /// and 5k already exceeds ~60s while 8k blows past 3 min (super-quadratic once
+  /// hot lists dominate). So the ≲60s *build* ceiling is ≈4–5k; ranked top-k
+  /// scoring grows with the corpus on top of that. SQLite FTS5 builds linearly
+  /// (~100k rows/s) — that gap is the F6d segments/merge signal, and the ranked
+  /// top-k cost is the F6c WAND signal. Raise this to probe nearer the ceiling
+  /// (expect a minute-plus build); lower `--rows` for a quicker run.
+  static let rowCap = 2_000
+
+  /// The apple-docs headline shape — identical DDL/tokenizer/weights on both
+  /// engines. `bm25(documents_fts, 10, 5, 3, 2, 1)` weights title heaviest.
+  static let ddl = """
+    CREATE VIRTUAL TABLE documents_fts USING fts5(
+      title, abstract, declaration, headings, key, tokenize='porter unicode61')
+    """
+  static let bm25 = "bm25(documents_fts, 10.0, 5.0, 3.0, 2.0, 1.0)"
+
+  /// Representative MATCH battery, drawn from the generator vocabulary so each
+  /// hits a meaningful, varied subset: single anchor term, stemmed prose term,
+  /// AND, OR, prefix, and one column-filtered query.
+  static let matchQueries = [
+    "swiftui",                  // single high-frequency anchor term
+    "rendering",                // porter-stemmed prose term
+    "view AND model",           // AND (intersection)
+    "swiftui OR uikit",         // OR (union)
+    "render*",                  // prefix expansion
+    "title:swiftui",            // column-filtered
+  ]
+
+  /// Ranked top-k probes (the headline `ORDER BY bm25 LIMIT 20` shape). A mix of
+  /// single-term, OR, and prefix so the ranker sees differently-sized candidate
+  /// sets.
+  static let rankedQueries = ["view", "swiftui OR uikit", "render*", "metal"]
+
+  static let limit = 20
+  /// Per-query latency iterations (each query run this many times round-robin).
+  /// Kept modest: ADSQL ranked top-k for a near-universal term (e.g. "view")
+  /// scores most of the corpus today, so it is tens-of-ms at the default 2k size
+  /// — 100 reps per query gives a stable p50 without a multi-minute bench. (The
+  /// expense itself is the F6c WAND signal; this is a latency bench, not a stress
+  /// loop.)
+  static let iterationsPerQuery = 100
+
+  static func run(_ engine: String, dir: String, config: BenchConfig) throws {
+    let rows = min(config.rows, rowCap)
+    let path = "\(dir)/fts-\(engine).db"
+    for suffix in ["", "-wal", "-shm", "-lock"] { unlink(path + suffix) }
+    if engine == "adsql" {
+      try runADSQL(path: path, rows: rows, config: config)
+    } else {
+      try runSQLite(path: path, rows: rows, config: config)
+    }
+  }
+
+  // MARK: - ADSQL (FTS5 SQL surface)
+
+  static func runADSQL(path: String, rows: Int, config: BenchConfig) throws {
+    let db = try Database.open(
+      at: path,
+      options: DatabaseOptions(
+        durability: .none, maxMapSize: 32 << 30,
+        execution: ExecutionOptions(evaluator: config.evaluator, join: config.joinStrategy)))
+    defer { db.close() }
+    try db.prepare(ddl).run()
+
+    // 1. Index build — direct multi-column INSERT into the FTS table, one
+    // transaction per batch (the apple-docs write path; the trigger path adds
+    // base-table DML overhead we do not want to charge the index build with).
+    let buildStart = nowNanos()
+    var built = 0
+    var gen = FTSCorpus.Generator()
+    while built < rows {
+      let batchEnd = min(built + 256, rows)
+      let lower = built
+      try db.transaction { (tx) throws(DBError) in
+        for id in (lower + 1)...batchEnd {
+          let doc = gen.next(id: Int64(id))
+          try tx.run(
+            "INSERT INTO documents_fts(rowid, title, abstract, declaration, headings, key) VALUES(?, ?, ?, ?, ?, ?)",
+            .integer(doc.id), .text(doc.title), .text(doc.abstract),
+            .text(doc.declaration), .text(doc.headings), .text(doc.key))
+        }
+      }
+      built = batchEnd
+    }
+    let buildElapsed = nowNanos() - buildStart
+    print("  [adsql] fts build       \(rows) docs in \(buildElapsed / 1_000_000) ms (\(formatRate(rows, buildElapsed)))")
+
+    // Count-sanity: an anchor term must hit a non-empty, bounded set (parity is
+    // already proven by F6a; this only guards against an empty/degenerate index).
+    let anchorCount = try db.prepare(
+      "SELECT count(*) FROM documents_fts WHERE documents_fts MATCH ?").all(.text("swiftui"))
+    if case .integer(let n) = anchorCount[0][0] {
+      precondition(n > 0 && n <= Int64(rows), "anchor MATCH count out of range: \(n)")
+    }
+
+    // 2. MATCH p50 — membership only (project rowid, drain the result).
+    let matchStmt = try db.prepare(
+      "SELECT rowid FROM documents_fts WHERE documents_fts MATCH ?")
+    var matchHist = LatencyHistogram()
+    matchHist.reserve(matchQueries.count * iterationsPerQuery)
+    for _ in 0..<iterationsPerQuery {
+      for q in matchQueries {
+        let start = nowNanos()
+        let result = try matchStmt.all(.text(q))
+        matchHist.record(nowNanos() - start)
+        precondition(result.count <= rows)
+      }
+    }
+    print("  [adsql] fts MATCH       \(matchHist.summary())")
+
+    // 3. Ranked top-k p50 — the headline ranked-search shape.
+    let rankedStmt = try db.prepare("""
+      SELECT rowid FROM documents_fts WHERE documents_fts MATCH ?
+      ORDER BY \(bm25) LIMIT \(limit)
+      """)
+    var rankedHist = LatencyHistogram()
+    rankedHist.reserve(rankedQueries.count * iterationsPerQuery)
+    for _ in 0..<iterationsPerQuery {
+      for q in rankedQueries {
+        let start = nowNanos()
+        let result = try rankedStmt.all(.text(q))
+        rankedHist.record(nowNanos() - start)
+        precondition(result.count <= limit)
+      }
+    }
+    print("  [adsql] fts ranked@\(limit)   \(rankedHist.summary())")
+  }
+
+  // MARK: - SQLite FTS5 baseline
+
+  static func runSQLite(path: String, rows: Int, config: BenchConfig) throws {
+    guard sqliteHasFTS5() else {
+      print("  [sqlite] fts SKIPPED — linked sqlite3 has no FTS5 module")
+      return
+    }
+
+    var handle: OpaquePointer?
+    guard sqlite3_open_v2(
+      path, &handle, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_NOMUTEX, nil)
+      == SQLITE_OK
+    else { throw SQLiteError.code(1, "open") }
+    let db = handle
+    defer { sqlite3_close_v2(db) }
+    func exec(_ sql: String) throws {
+      guard sqlite3_exec(db, sql, nil, nil, nil) == SQLITE_OK else {
+        throw SQLiteError.code(sqlite3_errcode(db), sql)
+      }
+    }
+    let transient = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
+    try exec("PRAGMA journal_mode=WAL")
+    try exec("PRAGMA synchronous=OFF")
+    try exec("PRAGMA cache_size=-64000")
+    try exec("PRAGMA mmap_size=10737418240")
+    try exec(ddl)
+
+    // 1. Index build.
+    var insert: OpaquePointer?
+    sqlite3_prepare_v3(
+      db, "INSERT INTO documents_fts(rowid, title, abstract, declaration, headings, key) VALUES(?1, ?2, ?3, ?4, ?5, ?6)",
+      -1, UInt32(SQLITE_PREPARE_PERSISTENT), &insert, nil)
+    defer { sqlite3_finalize(insert) }
+
+    let buildStart = nowNanos()
+    var built = 0
+    var gen = FTSCorpus.Generator()
+    while built < rows {
+      let batchEnd = min(built + 256, rows)
+      try exec("BEGIN IMMEDIATE")
+      for id in (built + 1)...batchEnd {
+        let doc = gen.next(id: Int64(id))
+        sqlite3_reset(insert)
+        sqlite3_bind_int64(insert, 1, doc.id)
+        sqlite3_bind_text(insert, 2, doc.title, -1, transient)
+        sqlite3_bind_text(insert, 3, doc.abstract, -1, transient)
+        sqlite3_bind_text(insert, 4, doc.declaration, -1, transient)
+        sqlite3_bind_text(insert, 5, doc.headings, -1, transient)
+        sqlite3_bind_text(insert, 6, doc.key, -1, transient)
+        guard sqlite3_step(insert) == SQLITE_DONE else {
+          throw SQLiteError.code(sqlite3_errcode(db), "insert")
+        }
+      }
+      try exec("COMMIT")
+      built = batchEnd
+    }
+    let buildElapsed = nowNanos() - buildStart
+    print("  [sqlite] fts build       \(rows) docs in \(buildElapsed / 1_000_000) ms (\(formatRate(rows, buildElapsed)))")
+
+    // Count-sanity.
+    var countStmt: OpaquePointer?
+    sqlite3_prepare_v3(
+      db, "SELECT count(*) FROM documents_fts WHERE documents_fts MATCH ?1",
+      -1, UInt32(SQLITE_PREPARE_PERSISTENT), &countStmt, nil)
+    sqlite3_bind_text(countStmt, 1, "swiftui", -1, transient)
+    precondition(sqlite3_step(countStmt) == SQLITE_ROW)
+    let anchorCount = sqlite3_column_int64(countStmt, 0)
+    precondition(anchorCount > 0 && anchorCount <= Int64(rows), "anchor MATCH count out of range")
+    sqlite3_finalize(countStmt)
+
+    // 2. MATCH p50.
+    var matchStmt: OpaquePointer?
+    sqlite3_prepare_v3(
+      db, "SELECT rowid FROM documents_fts WHERE documents_fts MATCH ?1",
+      -1, UInt32(SQLITE_PREPARE_PERSISTENT), &matchStmt, nil)
+    defer { sqlite3_finalize(matchStmt) }
+    var matchHist = LatencyHistogram()
+    matchHist.reserve(matchQueries.count * iterationsPerQuery)
+    for _ in 0..<iterationsPerQuery {
+      for q in matchQueries {
+        let start = nowNanos()
+        sqlite3_reset(matchStmt)
+        sqlite3_bind_text(matchStmt, 1, q, -1, transient)
+        while sqlite3_step(matchStmt) == SQLITE_ROW {}
+        matchHist.record(nowNanos() - start)
+      }
+    }
+    print("  [sqlite] fts MATCH       \(matchHist.summary())")
+
+    // 3. Ranked top-k p50.
+    var rankedStmt: OpaquePointer?
+    sqlite3_prepare_v3(
+      db,
+      "SELECT rowid FROM documents_fts WHERE documents_fts MATCH ?1 ORDER BY \(bm25) LIMIT \(limit)",
+      -1, UInt32(SQLITE_PREPARE_PERSISTENT), &rankedStmt, nil)
+    defer { sqlite3_finalize(rankedStmt) }
+    var rankedHist = LatencyHistogram()
+    rankedHist.reserve(rankedQueries.count * iterationsPerQuery)
+    for _ in 0..<iterationsPerQuery {
+      for q in rankedQueries {
+        let start = nowNanos()
+        sqlite3_reset(rankedStmt)
+        sqlite3_bind_text(rankedStmt, 1, q, -1, transient)
+        while sqlite3_step(rankedStmt) == SQLITE_ROW {}
+        rankedHist.record(nowNanos() - start)
+      }
+    }
+    print("  [sqlite] fts ranked@\(limit)   \(rankedHist.summary())")
+  }
+
+  /// True when the linked sqlite3 has FTS5 compiled in (create a throwaway fts5
+  /// table in memory; on failure the SQLite side is skipped, ADSQL-only output).
+  static func sqliteHasFTS5() -> Bool {
+    var db: OpaquePointer?
+    guard sqlite3_open(":memory:", &db) == SQLITE_OK else { return false }
+    defer { sqlite3_close_v2(db) }
+    return sqlite3_exec(db, "CREATE VIRTUAL TABLE t USING fts5(a)", nil, nil, nil) == SQLITE_OK
+  }
+}
+
+/// Self-contained, deterministic apple-docs-SHAPED corpus generator — lives IN
+/// ADSQLBench because the bench target depends only on `["ADSQL", "CSQLite"]`
+/// and cannot import `AppleDocsCorpus` (that's in the test-support target). This
+/// is a faithful, independent reimplementation of the F6a generator's shape:
+/// tech-documentation vocabulary across title/abstract/declaration/headings/key,
+/// driven by a seeded SplitMix64 stream (no Foundation `random`/clock), so the
+/// same `id`/seed produces byte-identical rows on every run and machine. The two
+/// engines build from the SAME stream (a fresh `Generator()` each), so they
+/// index identical text. (Mirrors `Tests/ADSQLTestSupport/AppleDocsCorpus.swift`;
+/// not imported — see the brief's dependency constraint.)
+enum FTSCorpus {
+  struct Document {
+    let id: Int64
+    let title: String
+    let abstract: String
+    let declaration: String
+    let headings: String
+    let key: String
+  }
+
+  // Fixed vocabulary, indexed by the seeded stream (same shape as the F6a corpus
+  // so single terms hit a meaningful fraction and bm25 ranking discriminates).
+  static let frameworks = [
+    "SwiftUI", "UIKit", "AppKit", "Foundation", "Combine", "CoreData",
+    "Metal", "CoreML", "CloudKit", "AVFoundation", "MapKit", "StoreKit",
+    "WidgetKit", "SwiftData", "Observation", "CoreGraphics", "Vision",
+    "ARKit", "RealityKit", "CoreLocation",
+  ]
+  static let typeStems = [
+    "Async", "Navigation", "Scroll", "Stack", "Grid", "List", "Text",
+    "Image", "Button", "Toggle", "Picker", "Gesture", "Animation",
+    "Layout", "Render", "Query", "Model", "Store", "Session", "Stream",
+    "Buffer", "Texture", "Pipeline", "Descriptor", "Coordinate",
+  ]
+  static let typeRoles = [
+    "View", "Controller", "Manager", "Provider", "Builder", "Context",
+    "Configuration", "Delegate", "Coordinator", "Renderer", "Reader",
+    "Writer", "Cache", "Registry", "Resolver",
+  ]
+  static let proseVerbs = [
+    "renders", "configures", "manages", "observes", "encodes", "decodes",
+    "schedules", "animates", "loads", "caches", "fetches", "presents",
+    "computes", "transforms", "synchronizes", "validates", "resolves",
+  ]
+  static let proseNouns = [
+    "view", "value", "model", "context", "buffer", "texture", "request",
+    "response", "gesture", "layout", "pipeline", "snapshot", "transaction",
+    "subscription", "coordinate", "descriptor", "hierarchy",
+  ]
+  static let proseAdjectives = [
+    "structured", "concurrent", "declarative", "immutable", "lazy", "shared",
+    "observable", "asynchronous", "composable", "reusable", "deterministic",
+  ]
+  static let headingWords = [
+    "Overview", "Topics", "Declaration", "Discussion", "Parameters",
+    "Return Value", "See Also", "Mentioned in", "Availability", "Conforms To",
+  ]
+
+  /// Deterministic apple-docs row stream. A fresh `Generator()` replays the same
+  /// rows; both engines use one each so they index byte-identical text. Uses the
+  /// same SplitMix64 constants as the test-support `SplitMix64` (no Foundation).
+  struct Generator {
+    private var state: UInt64 = 0xF6B_C0FFEE
+
+    private mutating func next() -> UInt64 {
+      state &+= 0x9E37_79B9_7F4A_7C15
+      var z = state
+      z = (z ^ (z >> 30)) &* 0xBF58_476D_1CE4_E5B9
+      z = (z ^ (z >> 27)) &* 0x94D0_49BB_1331_11EB
+      return z ^ (z >> 31)
+    }
+
+    private mutating func pick(_ array: [String]) -> String {
+      array[Int(next() % UInt64(array.count))]
+    }
+
+    private mutating func sentence() -> String {
+      "\(pick(FTSCorpus.proseAdjectives)) \(pick(FTSCorpus.proseNouns)) \(pick(FTSCorpus.proseVerbs)) the \(pick(FTSCorpus.proseNouns))"
+    }
+
+    mutating func next(id: Int64) -> Document {
+      let framework = pick(FTSCorpus.frameworks)
+      let typeName = pick(FTSCorpus.typeStems) + pick(FTSCorpus.typeRoles)
+      let title = "\(framework) \(typeName)"
+      let abstract = sentence() + " " + sentence()
+      let kind = ["struct", "final class", "enum", "actor"][Int(next() % 4)]
+      let role = pick(FTSCorpus.typeRoles)
+      let declaration = "\(kind) \(typeName) conforms to \(role) in \(framework)"
+      let headingCount = 2 + Int(next() % 2)
+      let headings = (0..<headingCount).map { _ in pick(FTSCorpus.headingWords) }
+        .joined(separator: " ")
+      let key = "doc/\(framework.lowercased())/\(typeName.lowercased())/\(id)"
+      return Document(
+        id: id, title: title, abstract: abstract, declaration: declaration,
+        headings: headings, key: key)
+    }
+  }
+}
