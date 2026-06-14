@@ -4,7 +4,11 @@ A pure-Swift, SQLite-compatible embedded database engine for macOS. This file
 is the single source of truth for milestone status, performance headroom, the
 deferred-SQL registry, and the consumer (apple-docs) dependency. Design
 rationale lives in `docs/rfcs/`; active multi-milestone execution (M5 → M7) is
-scheduled in `docs/rfcs/0008-execution-schedule.md` — the live program tracker.
+scheduled in `docs/rfcs/0008-execution-schedule.md` — the live program tracker. The
+cross-cutting **codebase health check + performance-maturity program** is consolidated in
+`docs/reviews/0003-codebase-health-and-perf.md` (findings, designs, unified SQL+FTS scorecard,
+waste catalog) and scheduled in `docs/rfcs/0009-health-and-perf-execution-program.md` (the live
+health+perf tracker).
 
 ## Milestone suite
 
@@ -25,7 +29,10 @@ scheduled in `docs/rfcs/0008-execution-schedule.md` — the live program tracker
 
 Benchmarks (`swift run -c release ADSQLBench`, 100k rows, M-series, vs system
 SQLite in WAL with apple-docs pragmas). ADSQL **leads** on the read-mostly
-paths and trails on filtered scans and inserts:
+paths and trails on filtered scans and inserts. The **unified SQL + FTS scorecard**
+(incl. FTS5/bm25 vs SQLite FTS5) and the prioritized **waste catalog** live in
+`docs/reviews/0003-codebase-health-and-perf.md` §4–§5; the optimization program is
+`docs/rfcs/0009`:
 
 | Scenario | ADSQL | SQLite | Δ | Status |
 |---|---|---|---|---|
