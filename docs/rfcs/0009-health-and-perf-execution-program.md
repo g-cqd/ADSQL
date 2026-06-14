@@ -73,7 +73,7 @@ Designs for every phase are in **review 0003 §6**; this table is the schedule +
 
 | Phase | State | Commit / note |
 |---|---|---|
-| H0 · docs-first | 🚧 in progress | archive ✅ (`docs/reviews/archive/*` verbatim); review 0003 ✅; RFC 0009 ✅; ROADMAP + supersede ⏭; re-baseline ⏭ |
+| H0 · docs-first | ✅ done | archive ✅; review 0003 ✅; RFC 0009 ✅; ROADMAP + `/Public/` supersede ✅ (`e63b7a4`); SQL re-baseline ✅ (`e147bde` — release build clean 0-warn; JOIN 0.26× / INSERT 0.74× confirmed, DISTINCT 2.0× / SEARCH≈parity; FTS arm deferred to RFC 0008 under active F6 iteration) |
 | H1 · measurement substrate | ⏳ planned (H0) | FTS bench expansion + `StrategyBench` `--strategy-matrix` |
 | H2 · structure + safe-type fixes | ⏳ planned (H0) | split 6 god-files; 2 micro-fixes |
 | H3 · INSERT hoisted + codec waste | 🔒 blocked (H1) | `Insert.hoisted` + W1/W3/W4/W7 |

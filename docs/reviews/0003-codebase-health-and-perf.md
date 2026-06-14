@@ -254,7 +254,7 @@ fixed): DISTINCT materialized-then-deduped 200k rows (now index-ordered adjacent
 zero-copy top-N); JOIN per outer row did an index→table descent + `b.key` decode + redundant ON re-check
 (now existence probe; residual = per-probe `KeyCodec.encode` + `a.key` String decode + the inherent seek).
 
-### 4.3 SQL scorecard (vs system SQLite, 200k rows; reports' numbers — re-baseline pending Phase 0)
+### 4.3 SQL scorecard (vs system SQLite, 200k rows; reports' numbers + Phase-0 re-baseline)
 
 | scenario | ADSQL | SQLite | ratio | notes |
 |---|---|---|---|---|
@@ -271,6 +271,14 @@ zero-copy top-N); JOIN per outer row did an index→table descent + `b.key` deco
 trust ratios over absolutes. SEARCH **p50 is bimodal** (only 12 of 24 `(framework,kind)` combos
 populated; a random query hits an empty combo ~50% of the time → ~20µs vs ~5ms) — use **p99**. **Only
 JOIN and INSERT still lose.**
+
+**Phase-0 re-baseline** (HEAD `2d5f347`/`e147bde`, 200k rows, `--point-gets 1000`, this machine,
+2026-06-14, ADSQL vs system SQLite): insert **131.9k/s vs 178.3k/s (0.74×)** ⚠️ · key-select p50 5.0µs vs
+5.1µs (≈) · search p99 **5.89 ms vs 5.72 ms (≈ parity)** ✅ · distinct p50 **5.42 ms vs 11.0 ms (2.0×
+faster)** ✅ · join p50 **183 ms vs 48 ms (0.26×)** ⚠️. **Confirms the scorecard:** JOIN (0.26×, exact match)
+and INSERT (0.74×) are the two losing paths; DISTINCT wins, SEARCH ≈ parity. The SQL JOIN/INSERT hot paths
+are unchanged since baseline, so these are directly comparable. *(The FTS arm is not re-measured here — it
+is a moving target under active F6 iteration; RFC 0008 carries the live FTS numbers.)*
 
 ### 4.4 FTS scorecard (NEW — absent from the perf report; from RFC 0008 F6 trail, 2k docs vs SQLite FTS5)
 
