@@ -270,6 +270,7 @@ public final class Database: Sendable {
 
     let ctx = TxnContext(source: pager, meta: meta)
     ctx.appendCursorEnabled = options.execution.insert == .appendCursor
+    ctx.insertHoistEnabled = options.execution.insert == .hoisted
     try FreeList.harvest(ctx: ctx, upTo: reclaimLimit)
     let baselineMain = ctx.meta.mainTree
 

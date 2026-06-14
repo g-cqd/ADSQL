@@ -94,6 +94,19 @@ public final class TxnContext: PageResolver, OverflowPager {
   /// at ctx creation. Default off → the proven descent path.
   var appendCursorEnabled = false
 
+  /// Per-transaction cache of a table's owned secondary-index names, sorted,
+  /// keyed by tableId — used by the opt-in `hoisted` insert path so the per-row
+  /// filter+sort+allocation of the index roster is paid once. The index-name set
+  /// is invariant within a single INSERT statement (triggers cannot run DDL), so
+  /// this is filled lazily on first insert and invalidated only by index-set DDL
+  /// (`createIndex`/`dropIndex`/`dropTable`) and request-scope rollback (a
+  /// rolled-back CREATE/DROP INDEX would otherwise leave a stale roster).
+  var hoistedRoster: [UInt32: [String]] = [:]
+  /// Whether the opt-in `hoisted` insert fast path is active for this transaction
+  /// (`DatabaseOptions.execution.insert == .hoisted`); set once at ctx creation.
+  /// Default off → the per-row reference path.
+  var insertHoistEnabled = false
+
   /// Relational state (catalog, handles, sequences), loaded lazily on first
   /// relational use. Value-typed: TxnRestorePoint snapshots it by copy.
   public internal(set) var relation: RelationState?
@@ -202,6 +215,9 @@ public final class TxnContext: PageResolver, OverflowPager {
     // The append cache may point at a leaf whose appends this scope just undid;
     // drop it so the next append re-establishes it from the restored tree.
     appendCache.removeAll(keepingCapacity: true)
+    // A rolled-back CREATE/DROP INDEX in this scope may have changed a table's
+    // index roster; drop the hoisted cache so it re-derives from the restored set.
+    hoistedRoster.removeAll(keepingCapacity: true)
   }
 
   // MARK: - OverflowPager

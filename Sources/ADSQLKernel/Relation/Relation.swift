@@ -426,6 +426,7 @@ enum Relation {
       state.triggerWrites[triggerName] = nil as String?
     }
     state.schemaDirty = true
+    ctx.hoistedRoster.removeAll(keepingCapacity: true)
 
     ctx.meta.mainTree = main
     ctx.relation = state
@@ -541,6 +542,7 @@ enum Relation {
     state.indexRecords[definition.name] = record
     state.handleBaselines[.index(id)] = nil as TreeHandle?
     state.schemaDirty = true
+    ctx.hoistedRoster.removeAll(keepingCapacity: true)
     ctx.relation = state
   }
 
@@ -553,6 +555,7 @@ enum Relation {
     state.indexRecords.removeValue(forKey: name)
     state.handleBaselines.removeValue(forKey: .index(record.indexId))
     state.schemaDirty = true
+    ctx.hoistedRoster.removeAll(keepingCapacity: true)
     ctx.meta.mainTree = main
     ctx.relation = state
   }

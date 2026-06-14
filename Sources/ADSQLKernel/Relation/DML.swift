@@ -374,13 +374,21 @@ extension Relation {
       try getBytes(ctx, table.handle, key: KeyCodec.rowKey(rowid)) != nil {
       conflicts.append((rowid: rowid, index: "rowid"))
     }
-    // Owned secondary indexes in name order — computed once and reused by both the
-    // unique-conflict scan and the write loop below (the index roster is stable
-    // across an OR REPLACE delete, which changes handles, not the set of indexes),
-    // dropping one per-row filter+sort+allocation.
-    let ownIndexNames = state.indexRecords.keys
-      .filter { state.indexRecords[$0]!.tableId == table.tableId }
-      .sorted()
+    // Owned secondary indexes in name order — reused by both the unique-conflict
+    // scan and the write loop below (the roster is stable across an OR REPLACE
+    // delete, which changes handles, not the set of indexes). Under the hoisted
+    // path the roster is cached per (transaction, tableId): the index-name set is
+    // invariant within an INSERT statement, so the filter+sort+allocation is paid
+    // once instead of every row. The reference path recomputes it per row.
+    let ownIndexNames: [String]
+    if ctx.insertHoistEnabled, let cached = ctx.hoistedRoster[table.tableId] {
+      ownIndexNames = cached
+    } else {
+      ownIndexNames = state.indexRecords.keys
+        .filter { state.indexRecords[$0]!.tableId == table.tableId }
+        .sorted()
+      if ctx.insertHoistEnabled { ctx.hoistedRoster[table.tableId] = ownIndexNames }
+    }
     for indexName in ownIndexNames where state.indexRecords[indexName]!.definition.unique {
       let index = state.indexRecords[indexName]!
       if let conflicting = try uniqueConflict(ctx, index: index, table: table, row: row) {
@@ -411,6 +419,16 @@ extension Relation {
         table = state.tableRecords[tableName]!
       }
     }
+
+    // hoisted: conflict resolution is done and this row is committed to be written,
+    // so drop ctx's alias to `state` — the table/index handle updates in the write
+    // loop below then mutate the dictionaries in place instead of COW-copying each
+    // on first touch per row. The single write-back (`ctx.relation = state`) below
+    // restores it; an error in the write loop aborts the transaction, which restores
+    // ctx.relation from the request restore point. Placed *after* the OR IGNORE/
+    // ABORT discard paths so their "leave the prior ctx.relation intact" semantics
+    // are preserved (those return/throw without writing back).
+    if ctx.insertHoistEnabled { ctx.relation = nil }
 
     // Write the record + all index entries, reusing the transaction's scratch
     // encode buffers (putBytes copies into the page, so the buffers are free to
