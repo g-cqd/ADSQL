@@ -280,4 +280,26 @@ struct SQLEvalSemanticsTests {
       }
     }
   }
+
+  /// The raw-byte `compareUTF8`/`compareUTF8NoCase` overloads (zero-copy top-N)
+  /// produce the same sign as the `String` versions on the same UTF-8 bytes,
+  /// including prefixes, embedded NULs, and ASCII case under NOCASE.
+  @Test func rawByteComparatorsMatchString() {
+    let samples = ["", "a", "ab", "abc", "A", "AB", "Abc", "b", "a\u{0}", "a\u{0}b", "Z", "z", "Zoo", "zoo"]
+    func sign(_ x: Int) -> Int { x < 0 ? -1 : (x > 0 ? 1 : 0) }
+    for a in samples {
+      for b in samples {
+        let ab = Array(a.utf8)
+        let bb = Array(b.utf8)
+        ab.withUnsafeBytes { ap in
+          bb.withUnsafeBytes { bp in
+            #expect(sign(SQLCompare.compareUTF8(ap, bp)) == sign(SQLCompare.compareUTF8(a, b)),
+              "BINARY mismatch \(a) vs \(b)")
+            #expect(sign(SQLCompare.compareUTF8NoCase(ap, bp)) == sign(SQLCompare.compareUTF8NoCase(a, b)),
+              "NOCASE mismatch \(a) vs \(b)")
+          }
+        }
+      }
+    }
+  }
 }

@@ -94,6 +94,15 @@ struct BoundJoin: Sendable {
   /// it never changes results, only how many inner rows are touched.
   /// `.tableScan` = full inner scan (no usable equality on an indexed column).
   let access: AccessPlan
+  /// The inner table can be visited as a pure index/rowid *existence* probe — no
+  /// table descent, no ON re-evaluation, no materialization — because (1) the
+  /// access is an exact-equality probe whose covered conjuncts are the *entire*
+  /// ON predicate, and (2) no column of this inner table is read anywhere else
+  /// (projection / WHERE / HAVING / ORDER BY / GROUP BY / another join). The
+  /// executor still null-extends LEFT non-matches via the `matched` flag. When
+  /// false, the normal descend+re-eval path runs (and is the safe fallback at
+  /// runtime if the probe degrades to a scan).
+  let innerExistenceOnly: Bool
 }
 
 /// All tables in a query's FROM/JOIN list, with column resolution across them.
@@ -155,6 +164,18 @@ struct BoundSelect: Sendable {
   let accessYieldsOrder: Bool
   /// Table (rowid) order satisfies ORDER BY — used on index→scan fallback.
   let rowidOrderSatisfiesOrderBy: Bool
+  /// Tables whose column values a GROUP BY group's *representative* row must
+  /// supply (referenced by outputs / HAVING / ORDER BY / GROUP BY). A table not
+  /// in this set is never read during aggregate finalization, so `runAggregated`
+  /// can skip materializing its representative — required for an existence-only
+  /// join inner (whose slot holds an empty span), and a COUNT(*) win otherwise.
+  let finalizationReferencedTables: Set<Int>
+  /// An index to satisfy `SELECT DISTINCT <cols>` directly: its key columns are
+  /// exactly the distinct outputs (all losslessly key-decodable, i.e. not NOCASE
+  /// text), there is no WHERE/ORDER BY/join/aggregate. The executor scans it in
+  /// key order, emitting one row per distinct key prefix decoded from the key —
+  /// no table descent, no per-row dedup set. nil ⇒ the row-at-a-time path.
+  let distinctIndexName: String?
 
   /// The leading (outer) table — the one the access plan optimizes.
   var source: TableBinding { binding.tables[0] }
@@ -287,6 +308,10 @@ enum Binder {
     // so probing it is a valid superset (ON is re-applied at the leaf). Falls
     // back to a full inner scan when no such equality hits an indexed column.
     var joins: [BoundJoin] = []
+    // Whether each join's access is an exact-equality probe that covers its
+    // *entire* ON predicate — the bind-time half of the existence-only test
+    // (completed in the final pass once column references are known).
+    var joinProbeCoversON: [Bool] = []
     for raw in rawJoins {
       let inner = tables[raw.depth]
       // An FTS inner table has no schema table/indexes; its access comes from a
@@ -296,7 +321,7 @@ enum Binder {
         inner.isFTS ? syntheticFTSDefinition(inner.table) : schema.tables[inner.table]!
       let innerIndexes = inner.isFTS ? [] : schema.indexes(on: inner.table)
       let equalities = joinEqualities(raw.on, binding: binding, innerDepth: raw.depth)
-      let access = Planner.planJoin(
+      let (access, covered) = Planner.planJoin(
         equalities: equalities, inner: inner, on: raw.on, binding: binding, innerDepth: raw.depth,
         indexes: innerIndexes, definition: innerDefinition)
       // A MATCH conjunct the `.fts` access consumes is an access path, never a
@@ -306,7 +331,13 @@ enum Binder {
       if case .fts = access, let (_, conjunct) = Planner.ftsMatchConjunct(raw.on, source: inner) {
         on = removeCovered(raw.on, [conjunct]) ?? .literal(.integer(1))
       }
-      joins.append(BoundJoin(kind: raw.kind, table: raw.depth, on: on, access: access))
+      // An exact-equality probe (`.rowid`, or `.index` with no trailing range)
+      // whose covered conjuncts are the whole ON means the probe alone enforces
+      // the join — the executor can skip the ON re-check (and, if the inner is
+      // otherwise unreferenced, the table descent entirely).
+      joinProbeCoversON.append(isExactEquality(access) && removeCovered(raw.on, covered) == nil)
+      joins.append(
+        BoundJoin(kind: raw.kind, table: raw.depth, on: on, access: access, innerExistenceOnly: false))
     }
 
     // Aggregate calls in outputs/HAVING/ORDER BY are rewritten to slot
@@ -393,25 +424,111 @@ enum Binder {
     // threaded into the `.fts` access plan below (one ranking per FTS table).
     var ftsWeights: [Int: [Double]] = [:]
     func bind(_ expr: SQLExpr) -> SQLExpr { bindColumns(expr, binding, &ftsWeights) }
-    let boundJoins = joins.map {
-      BoundJoin(kind: $0.kind, table: $0.table, on: bind($0.on), access: $0.access)
-    }
     let boundOutputs = outputs.map { BoundOutput(name: $0.name, expr: bind($0.expr)) }
     let boundWhere = whereExpr.map(bind)
     let boundResidual = residualWithoutCovered.map(bind)
     let boundOrderBy = orderBy.map { SQLOrderingTerm(expr: bind($0.expr), descending: $0.descending) }
     let boundGroupBy = select.groupBy.map(bind)
     let boundHaving = having.map(bind)
+    let boundAggregates = aggregates.map { bindAggregate($0, binding) }
+    let boundJoinsOn = joins.map { bind($0.on) }
     // Apply the captured weights now that every expression has been bound (so a
     // bm25() anywhere in the projection/ORDER BY is seen). Default to all-ones
     // for a plain `rank` reference (the table index is the leading table or the
     // join depth).
+    let leadingAccess = bindAccess(applyWeights(planning.plan, ftsWeights, depth: 0), binding)
+    let boundJoinAccess = joins.map {
+      bindAccess(applyWeights($0.access, ftsWeights, depth: $0.table), binding)
+    }
+
+    // Column-reference analysis (drives the existence-only join inner and the
+    // aggregate materialization guard). `alwaysRefs` are tables whose real row
+    // bytes are read during the scan (projection / WHERE / HAVING / ORDER BY /
+    // GROUP BY / aggregates / any access-path probe value). An unresolved
+    // `.column` (correlated) or a scalar subquery sets `unknownRefs`, which
+    // conservatively disables every elision.
+    var alwaysRefs: Set<Int> = []
+    var unknownRefs = false
+    for o in boundOutputs { collectTableRefs(o.expr, into: &alwaysRefs, unknown: &unknownRefs) }
+    if let w = boundWhere { collectTableRefs(w, into: &alwaysRefs, unknown: &unknownRefs) }
+    if let h = boundHaving { collectTableRefs(h, into: &alwaysRefs, unknown: &unknownRefs) }
+    for t in boundOrderBy { collectTableRefs(t.expr, into: &alwaysRefs, unknown: &unknownRefs) }
+    for g in boundGroupBy { collectTableRefs(g, into: &alwaysRefs, unknown: &unknownRefs) }
+    for spec in boundAggregates {
+      switch spec.kind {
+      case .countStar: break
+      case .count(let e): collectTableRefs(e, into: &alwaysRefs, unknown: &unknownRefs)
+      case .sum(let e): collectTableRefs(e, into: &alwaysRefs, unknown: &unknownRefs)
+      }
+    }
+    collectAccessRefs(leadingAccess, into: &alwaysRefs, unknown: &unknownRefs)
+    for acc in boundJoinAccess { collectAccessRefs(acc, into: &alwaysRefs, unknown: &unknownRefs) }
+    // Per-join ON references; a join other than d may read d's columns.
+    var onRefs: [Set<Int>] = []
+    for on in boundJoinsOn {
+      var refs: Set<Int> = []
+      collectTableRefs(on, into: &refs, unknown: &unknownRefs)
+      onRefs.append(refs)
+    }
+    // Existence-only iff the probe covers the whole ON (bind-time) AND no other
+    // expression — including any *other* join's ON — reads this inner table.
+    let existenceOnly: [Bool] = joins.indices.map { d in
+      guard !unknownRefs, joinProbeCoversON[d] else { return false }
+      let table = joins[d].table
+      if alwaysRefs.contains(table) { return false }
+      for e in joins.indices where e != d && onRefs[e].contains(table) { return false }
+      return true
+    }
+    // Tables whose group representative is read at finalization (outputs /
+    // HAVING / ORDER BY). Existence-only tables are guaranteed absent.
+    var finalRefs: Set<Int> = []
+    var finalUnknown = false
+    for o in boundOutputs { collectTableRefs(o.expr, into: &finalRefs, unknown: &finalUnknown) }
+    if let h = boundHaving { collectTableRefs(h, into: &finalRefs, unknown: &finalUnknown) }
+    for t in boundOrderBy { collectTableRefs(t.expr, into: &finalRefs, unknown: &finalUnknown) }
+    let finalizationReferenced: Set<Int> =
+      finalUnknown ? Set(tables.indices) : finalRefs
+
+    // Index-ordered DISTINCT: a single-table `SELECT DISTINCT <plain cols>` with
+    // no WHERE/ORDER BY/aggregate can scan an index whose key columns are exactly
+    // those outputs, decoding each distinct key prefix — no table descent, no
+    // dedup set. Excludes NOCASE-text columns (case is folded into the key, so it
+    // can't reconstruct the original value); those fall back to streaming dedup.
+    var distinctIndexName: String?
+    if select.distinct, !isAggregated, joins.isEmpty, !source.isFTS,
+      select.whereExpr == nil, select.orderBy.isEmpty
+    {
+      var columnNames: [String] = []
+      var eligible = true
+      for out in outputs {
+        guard case .column(let qualifier, let name, _) = out.expr,
+          let column = source.columnIndex(qualifier: qualifier, name: name)
+        else { eligible = false; break }
+        if source.columnTypes[column] == .text, source.columnCollations[column] == .nocase {
+          eligible = false  // NOCASE text decodes to folded bytes, not the original
+          break
+        }
+        columnNames.append(name)
+      }
+      if eligible, !columnNames.isEmpty {
+        for candidate in sourceIndexes
+        where candidate.columns.count == columnNames.count
+          && zip(candidate.columns, columnNames).allSatisfy({
+            $0.lowercased() == $1.lowercased()
+          })
+        {
+          distinctIndexName = candidate.name
+          break
+        }
+      }
+    }
+
     return BoundSelect(
       binding: binding,
-      joins: boundJoins.map {
+      joins: joins.indices.map { d in
         BoundJoin(
-          kind: $0.kind, table: $0.table, on: $0.on,
-          access: bindAccess(applyWeights($0.access, ftsWeights, depth: $0.table), binding))
+          kind: joins[d].kind, table: joins[d].table, on: boundJoinsOn[d],
+          access: boundJoinAccess[d], innerExistenceOnly: existenceOnly[d])
       },
       outputs: boundOutputs,
       outputCollations: outputCollations,
@@ -422,15 +539,96 @@ enum Binder {
       groupBy: boundGroupBy,
       groupCollations: groupCollations,
       having: boundHaving,
-      aggregates: aggregates.map { bindAggregate($0, binding) },
+      aggregates: boundAggregates,
       isAggregated: isAggregated,
       distinct: select.distinct,
       limit: select.limit,
       offset: select.offset,
       header: header,
-      access: bindAccess(applyWeights(planning.plan, ftsWeights, depth: 0), binding),
+      access: leadingAccess,
       accessYieldsOrder: yieldsOrder && planning.yieldsOrder,
-      rowidOrderSatisfiesOrderBy: yieldsOrder && planning.rowidOrderSatisfiesOrderBy)
+      rowidOrderSatisfiesOrderBy: yieldsOrder && planning.rowidOrderSatisfiesOrderBy,
+      finalizationReferencedTables: finalizationReferenced,
+      distinctIndexName: distinctIndexName)
+  }
+
+  /// Adds the `(table)` of every `.boundColumn` in `expr` to `refs`. Sets
+  /// `unknown` for an unresolved/correlated `.column` or a scalar subquery, whose
+  /// reachable columns can't be determined here (callers then disable the
+  /// reference-driven elisions). Covers every `SQLExpr` case.
+  private static func collectTableRefs(
+    _ expr: SQLExpr, into refs: inout Set<Int>, unknown: inout Bool
+  ) {
+    switch expr {
+    case .boundColumn(let table, _):
+      refs.insert(table)
+    case .column, .scalarSubquery:
+      unknown = true
+    case .literal, .parameter, .aggregateResult:
+      break
+    case .binary(_, let l, let r):
+      collectTableRefs(l, into: &refs, unknown: &unknown)
+      collectTableRefs(r, into: &refs, unknown: &unknown)
+    case .unary(_, let i), .cast(let i, _), .collate(let i, _):
+      collectTableRefs(i, into: &refs, unknown: &unknown)
+    case .isNull(let i, _):
+      collectTableRefs(i, into: &refs, unknown: &unknown)
+    case .like(let s, let p, _):
+      collectTableRefs(s, into: &refs, unknown: &unknown)
+      collectTableRefs(p, into: &refs, unknown: &unknown)
+    case .inList(let s, let items, _):
+      collectTableRefs(s, into: &refs, unknown: &unknown)
+      for item in items { collectTableRefs(item, into: &refs, unknown: &unknown) }
+    case .inJSONEach(let s, let src, _):
+      collectTableRefs(s, into: &refs, unknown: &unknown)
+      collectTableRefs(src, into: &refs, unknown: &unknown)
+    case .caseWhen(let operand, let whens, let elseExpr):
+      if let operand { collectTableRefs(operand, into: &refs, unknown: &unknown) }
+      for when in whens {
+        collectTableRefs(when.condition, into: &refs, unknown: &unknown)
+        collectTableRefs(when.result, into: &refs, unknown: &unknown)
+      }
+      if let elseExpr { collectTableRefs(elseExpr, into: &refs, unknown: &unknown) }
+    case .function(_, let args, _, _):
+      for arg in args { collectTableRefs(arg, into: &refs, unknown: &unknown) }
+    }
+  }
+
+  /// Adds the tables referenced by an access path's probe/rowid/MATCH value
+  /// expressions (evaluated per outer row for a join inner).
+  private static func collectAccessRefs(
+    _ access: AccessPlan, into refs: inout Set<Int>, unknown: inout Bool
+  ) {
+    switch access {
+    case .tableScan:
+      break
+    case .rowid(let exprs):
+      for e in exprs { collectTableRefs(e, into: &refs, unknown: &unknown) }
+    case .index(_, let probes, _):
+      for probe in probes {
+        for e in probe.equality { collectTableRefs(e, into: &refs, unknown: &unknown) }
+        if case .range(let lower, let upper)? = probe.trailing {
+          if let lower { collectTableRefs(lower.expr, into: &refs, unknown: &unknown) }
+          if let upper { collectTableRefs(upper.expr, into: &refs, unknown: &unknown) }
+        }
+      }
+    case .fts(_, let query, _):
+      collectTableRefs(query, into: &refs, unknown: &unknown)
+    }
+  }
+
+  /// An exact-equality probe — every matching row satisfies the covered ON
+  /// equality exactly (no trailing range to re-check). `.tableScan`/`.fts` are
+  /// supersets, so never exact.
+  private static func isExactEquality(_ access: AccessPlan) -> Bool {
+    switch access {
+    case .rowid:
+      return true
+    case .index(_, let probes, _):
+      return !probes.isEmpty && probes.allSatisfy { $0.trailing == nil }
+    case .tableScan, .fts:
+      return false
+    }
   }
 
   /// Overlays captured bm25() weights onto an `.fts` access plan for the table at
@@ -599,22 +797,22 @@ enum Binder {
   /// tables (evaluable per outer row). Each is a necessary match condition.
   private static func joinEqualities(
     _ on: SQLExpr, binding: QueryBinding, innerDepth: Int
-  ) -> [(column: Int, value: SQLExpr)] {
+  ) -> [(column: Int, value: SQLExpr, source: SQLExpr)] {
     func conj(_ e: SQLExpr) -> [SQLExpr] {
       if case .binary(.and, let l, let r) = e { return conj(l) + conj(r) }
       return [e]
     }
-    var out: [(column: Int, value: SQLExpr)] = []
+    var out: [(column: Int, value: SQLExpr, source: SQLExpr)] = []
     for clause in conj(on) {
       guard case .binary(.eq, let lhs, let rhs) = clause else { continue }
       if let column = innerColumn(lhs, binding: binding, depth: innerDepth),
         referencesOnlyBelow(rhs, depth: innerDepth, binding: binding)
       {
-        out.append((column, rhs))
+        out.append((column, rhs, clause))
       } else if let column = innerColumn(rhs, binding: binding, depth: innerDepth),
         referencesOnlyBelow(lhs, depth: innerDepth, binding: binding)
       {
-        out.append((column, lhs))
+        out.append((column, lhs, clause))
       }
     }
     return out

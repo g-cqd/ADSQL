@@ -15,19 +15,25 @@ public struct DatabaseOptions: Sendable {
   /// the 16 MiB default suits memory-comfortable deployments. Lower it on tight
   /// hosts; raise it for scan-heavy workloads on fast storage.
   public var scanReadaheadBytes: Int
+  /// Selects/tunes the execution strategies (evaluator, join, insert). Defaults
+  /// to the reference behavior; alternatives are opt-in and benchmarked before
+  /// becoming a default. Per-statement overrides via `Statement.setExecutionOptions`.
+  public var execution: ExecutionOptions
 
   public init(
     durability: DurabilityProfile = .barrier,
     maxMapSize: Int = 64 << 30,
     readOnly: Bool = false,
     createIfMissing: Bool = true,
-    scanReadaheadBytes: Int = 16 << 20
+    scanReadaheadBytes: Int = 16 << 20,
+    execution: ExecutionOptions = .default
   ) {
     self.durability = durability
     self.maxMapSize = maxMapSize
     self.readOnly = readOnly
     self.createIfMissing = createIfMissing
     self.scanReadaheadBytes = scanReadaheadBytes
+    self.execution = execution
   }
 }
 

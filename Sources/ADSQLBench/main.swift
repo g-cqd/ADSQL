@@ -14,6 +14,21 @@ while let argument = iterator.next() {
   switch argument {
   case "--rows":
     config.rows = Int(iterator.next() ?? "") ?? config.rows
+  case "--point-gets":
+    config.pointGets = Int(iterator.next() ?? "") ?? config.pointGets
+  case "--eval":
+    switch iterator.next() {
+    case "compiled", "compiledClosures": config.evaluator = .compiledClosures
+    case "vdbe": config.evaluator = .vdbe
+    default: config.evaluator = .treeWalk
+    }
+  case "--join":
+    switch iterator.next() {
+    case "hash": config.joinStrategy = .hash
+    case "merge": config.joinStrategy = .merge
+    case "auto": config.joinStrategy = .auto
+    default: config.joinStrategy = .nestedLoop
+    }
   case "--seconds":
     config.concurrentSeconds = Double(iterator.next() ?? "") ?? config.concurrentSeconds
   case "--engine":

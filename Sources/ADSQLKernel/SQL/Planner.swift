@@ -126,27 +126,29 @@ enum Planner {
   /// the leading-table equality-prefix logic; order is irrelevant for a probe.
   /// Returns `.tableScan` when no equality hits the rowid alias or an index.
   static func planJoin(
-    equalities: [(column: Int, value: SQLExpr)],
+    equalities: [(column: Int, value: SQLExpr, source: SQLExpr)],
     inner: TableBinding, on: SQLExpr, binding: QueryBinding, innerDepth: Int,
     indexes: [IndexDefinition], definition: TableDefinition
-  ) -> AccessPlan {
+  ) -> (plan: AccessPlan, coveredConjuncts: [SQLExpr]) {
     // An FTS inner table is driven by a MATCH conjunct in its ON clause. MATCH
     // re-evaluates per outer row here (acceptable for F3c; FTS-first avoids it).
     if inner.isFTS, let (query, _) = ftsMatchConjunct(on, source: inner) {
-      return .fts(table: inner.table, query: query, weights: [])
+      return (.fts(table: inner.table, query: query, weights: []), [])
     }
-    guard !equalities.isEmpty else { return .tableScan }
-    let constraints = equalities.map { Constraint.eq(column: $0.column, value: $0.value, source: $0.value) }
+    guard !equalities.isEmpty else { return (.tableScan, []) }
+    // `source` is the originating ON conjunct (so the binder can test whether the
+    // probe covers the *entire* ON for an existence-only inner — see BoundJoin).
+    let constraints = equalities.map { Constraint.eq(column: $0.column, value: $0.value, source: $0.source) }
     if let aliasIndex = inner.rowidAliasIndex, let eq = firstEquality(constraints, column: aliasIndex) {
-      return .rowid([eq.value])
+      return (.rowid([eq.value]), [eq.source])
     }
     if let chosen = chooseIndex(
       constraints, orderBy: [], source: inner, indexes: indexes,
       definition: definition, rowidOrder: false)
     {
-      return chosen.plan
+      return (chosen.plan, chosen.coveredConjuncts)
     }
-    return .tableScan
+    return (.tableScan, [])
   }
 
   // MARK: - Index selection
@@ -228,7 +230,7 @@ enum Planner {
   private static func consider(
     _ best: inout (planning: AccessPlanning, score: Int)?, _ planning: AccessPlanning, score: Int
   ) {
-    if best == nil || score > best!.score {
+    if best.map({ score > $0.score }) ?? true {
       best = (planning, score)
     }
   }

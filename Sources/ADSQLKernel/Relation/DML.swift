@@ -173,14 +173,28 @@ extension Relation {
   static func indexEntryKey(
     index: Catalog.IndexRecord, table: Catalog.TableRecord, row: [Value], rowid: Int64
   ) throws(DBError) -> [UInt8] {
-    let values = indexColumnValues(index.definition, table: table.definition, row: row)
-    var key = try KeyCodec.encode(
-      values, collations: indexCollations(index.definition, table: table.definition))
+    var key: [UInt8] = []
+    try indexEntryKey(index: index, table: table, row: row, rowid: rowid, into: &key)
+    return key
+  }
+
+  /// Encodes the index entry key into a caller-owned buffer (cleared first,
+  /// capacity kept) directly from the row — no intermediate `values`/`collations`
+  /// arrays — so the insert path reuses one scratch key across rows.
+  static func indexEntryKey(
+    index: Catalog.IndexRecord, table: Catalog.TableRecord, row: [Value], rowid: Int64,
+    into key: inout [UInt8]
+  ) throws(DBError) {
+    key.removeAll(keepingCapacity: true)
+    for name in index.definition.columns {
+      let column = table.definition.columnIndex(of: name)!
+      try KeyCodec.append(
+        row[column], collation: table.definition.columns[column].collation, to: &key)
+    }
     KeyCodec.appendRowidSuffix(rowid, to: &key)
     guard key.count <= Format.maxKeySize else {
       throw DBError.indexKeyTooLarge(index: index.definition.name, size: key.count)
     }
-    return key
   }
 
   /// Rowid of a row whose values collide in a unique index (NULLs never
@@ -379,18 +393,23 @@ extension Relation {
       }
     }
 
-    // Write the record + all index entries.
+    // Write the record + all index entries, reusing the transaction's scratch
+    // encode buffers (putBytes copies into the page, so the buffers are free to
+    // reuse on the next row).
     var handle = table.handle
-    try putBytes(ctx, &handle, key: KeyCodec.rowKey(rowid), value: RecordCodec.encode(row))
+    RecordCodec.encode(row, into: &ctx.recordScratch)
+    try putBytes(ctx, &handle, key: KeyCodec.rowKey(rowid), value: ctx.recordScratch)
     table.handle = handle
     state.tableRecords[tableName] = table
 
     for indexName in state.indexRecords.keys.sorted() {
       guard state.indexRecords[indexName]!.tableId == table.tableId else { continue }
       var index = state.indexRecords[indexName]!
-      let key = try indexEntryKey(index: index, table: table, row: row, rowid: rowid)
+      try indexEntryKey(index: index, table: table, row: row, rowid: rowid, into: &ctx.indexKeyScratch)
       var indexHandle = index.handle
-      try putBytes(ctx, &indexHandle, key: key, value: indexEntryValue(index: index, table: table, row: row))
+      try putBytes(
+        ctx, &indexHandle, key: ctx.indexKeyScratch,
+        value: indexEntryValue(index: index, table: table, row: row))
       index.handle = indexHandle
       state.indexRecords[indexName] = index
     }

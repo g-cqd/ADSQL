@@ -20,6 +20,15 @@ public enum RecordCodec {
 
   public static func encode(_ values: [Value]) -> [UInt8] {
     var out: [UInt8] = []
+    encode(values, into: &out)
+    return out
+  }
+
+  /// Encodes into a caller-owned buffer (cleared first, capacity kept) — lets the
+  /// insert path reuse one scratch buffer across rows instead of allocating a
+  /// fresh record per row.
+  public static func encode(_ values: [Value], into out: inout [UInt8]) {
+    out.removeAll(keepingCapacity: true)
     out.reserveCapacity(16 + values.count * 8)
     Varint.append(UInt64(values.count), to: &out)
     for value in values {
@@ -42,7 +51,6 @@ public enum RecordCodec {
         out.append(contentsOf: b)
       }
     }
-    return out
   }
 
   public static func decode(_ bytes: UnsafeRawBufferPointer) throws(DBError) -> [Value] {
@@ -131,23 +139,49 @@ public enum RecordCodec {
     _ body: (UnsafeRawBufferPointer?) throws(DBError) -> R
   ) throws(DBError) -> R {
     try span.withUnsafeBytes { (bytes: UnsafeRawBufferPointer) throws(DBError) -> R in
-      var offset = 0
-      let stored = unsafe try readHeader(bytes, &offset)
-      guard index < stored else { return try body(nil) }
-      for _ in 0..<index { unsafe try skipCell(bytes, &offset) }
-      guard offset < bytes.count else {
-        throw DBError.integrityFailure("row record: truncated cell")
-      }
-      guard unsafe bytes[offset] == tag else { return try body(nil) }
-      offset += 1
-      guard let length = unsafe Varint.read(bytes, &offset),
-        length <= UInt64(bytes.count - offset)
-      else {
-        throw DBError.integrityFailure("row record: truncated cell payload")
-      }
-      let payload = unsafe UnsafeRawBufferPointer(rebasing: bytes[offset..<offset + Int(length)])
-      return unsafe try body(payload)
+      unsafe try withPayload(at: index, in: bytes, expecting: tag, body)
     }
+  }
+
+  /// Pointer-based payload access — like the `RawSpan` overload but over an
+  /// already-materialized byte buffer (the scan slot's stored span), skipping the
+  /// `RawSpan` bridge. `body` gets the payload bytes in place, or nil when the
+  /// column is NULL, a different storage class, or not stored by a short row.
+  static func withPayload<R>(
+    at index: Int, in bytes: UnsafeRawBufferPointer, expecting tag: UInt8,
+    _ body: (UnsafeRawBufferPointer?) throws(DBError) -> R
+  ) throws(DBError) -> R {
+    var offset = 0
+    let stored = unsafe try readHeader(bytes, &offset)
+    guard index < stored else { return try body(nil) }
+    for _ in 0..<index { unsafe try skipCell(bytes, &offset) }
+    guard offset < bytes.count else {
+      throw DBError.integrityFailure("row record: truncated cell")
+    }
+    guard unsafe bytes[offset] == tag else { return try body(nil) }
+    offset += 1
+    guard let length = unsafe Varint.read(bytes, &offset),
+      length <= UInt64(bytes.count - offset)
+    else {
+      throw DBError.integrityFailure("row record: truncated cell payload")
+    }
+    let payload = unsafe UnsafeRawBufferPointer(rebasing: bytes[offset..<offset + Int(length)])
+    return unsafe try body(payload)
+  }
+
+  /// Zero-copy TEXT/BLOB access over a raw record buffer (the scan-slot span).
+  static func withText<R>(
+    at index: Int, in bytes: UnsafeRawBufferPointer,
+    _ body: (UnsafeRawBufferPointer?) throws(DBError) -> R
+  ) throws(DBError) -> R {
+    unsafe try withPayload(at: index, in: bytes, expecting: CellTag.text, body)
+  }
+
+  static func withBlob<R>(
+    at index: Int, in bytes: UnsafeRawBufferPointer,
+    _ body: (UnsafeRawBufferPointer?) throws(DBError) -> R
+  ) throws(DBError) -> R {
+    unsafe try withPayload(at: index, in: bytes, expecting: CellTag.blob, body)
   }
 
   /// Reads the leading varint column count and advances `offset` to the first

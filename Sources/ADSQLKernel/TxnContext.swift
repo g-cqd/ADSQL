@@ -78,6 +78,13 @@ public final class TxnContext: PageResolver, OverflowPager {
   /// once concurrent readers move past this generation.
   public var pendingFree: [UInt64] = []
 
+  /// Reusable encode buffers for the insert path: one for the row record, one for
+  /// each index entry key (used sequentially). `putBytes` copies the bytes into
+  /// the page, so reusing the buffer across rows in a transaction avoids a fresh
+  /// allocation per row. Query/read paths never touch these.
+  var recordScratch: [UInt8] = []
+  var indexKeyScratch: [UInt8] = []
+
   /// Relational state (catalog, handles, sequences), loaded lazily on first
   /// relational use. Value-typed: TxnRestorePoint snapshots it by copy.
   public internal(set) var relation: RelationState?

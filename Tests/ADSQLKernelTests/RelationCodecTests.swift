@@ -165,6 +165,61 @@ struct KeyCodecTests {
     #expect(KeyCodec.prefixSuccessor([0xFF, 0xFF]) == nil)
     #expect(KeyCodec.prefixSuccessor([]) == nil)
   }
+
+  /// `decode` is the lossless inverse of `encode` for BINARY collations across
+  /// every storage class — the property the index-ordered DISTINCT path relies on
+  /// (it decodes the key's column prefix, with the rowid suffix already stripped).
+  @Test(arguments: [UInt64(5), 123, 90210])
+  func decodeRoundTrips(seed: UInt64) throws {
+    var rng = SplitMix64(seed: seed)
+    for _ in 0..<400 {
+      let columnCount = 1 + Int(rng.next() % 4)
+      let types = (0..<columnCount).map { _ in RandomValues.anyType(&rng) }
+      let collations = [Collation](repeating: .binary, count: columnCount)
+      let values = types.map { RandomValues.value(&rng, type: $0, nullRatio: 15) }
+      let key = try KeyCodec.encode(values, collations: collations)
+      var decoded: [Value] = []
+      try key.withUnsafeBytes { (bytes: UnsafeRawBufferPointer) in
+        decoded = try KeyCodec.decode(bytes, columns: columnCount)
+      }
+      #expect(decoded == values, "round-trip mismatch: \(values) -> \(decoded)")
+    }
+  }
+
+  /// NOCASE text is folded into the key, so decode yields the folded bytes — the
+  /// reason the binder excludes NOCASE columns from index-ordered DISTINCT.
+  @Test func decodeNocaseIsFolded() throws {
+    let key = try KeyCodec.encode([.text("MixedCase")], collations: [.nocase])
+    var decoded: [Value] = []
+    try key.withUnsafeBytes { (bytes: UnsafeRawBufferPointer) in
+      decoded = try KeyCodec.decode(bytes, columns: 1)
+    }
+    #expect(decoded == [.text("mixedcase")])
+  }
+
+  /// The per-field byte encoders (used by the zero-copy index-probe path) emit
+  /// exactly what `encode`/`append` produce for the same value, across every
+  /// storage class and both collations — feeding raw bytes for text/blob like the
+  /// join probe does from a column's page bytes.
+  @Test(arguments: [UInt64(7), 555, 80486])
+  func byteAppendMatchesValueEncode(seed: UInt64) throws {
+    var rng = SplitMix64(seed: seed)
+    for _ in 0..<400 {
+      let type = RandomValues.anyType(&rng)
+      let collation: Collation = type == .text && rng.next() % 2 == 0 ? .nocase : .binary
+      let value = RandomValues.value(&rng, type: type, nullRatio: 15)
+      let canonical = try KeyCodec.encode([value], collations: [collation])
+      var viaBytes: [UInt8] = []
+      switch value {
+      case .null: KeyCodec.appendNull(to: &viaBytes)
+      case .integer(let i): KeyCodec.appendInteger(i, to: &viaBytes)
+      case .real(let d): try KeyCodec.appendReal(d, to: &viaBytes)
+      case .text(let s): KeyCodec.appendTextBytes(Array(s.utf8), collation: collation, to: &viaBytes)
+      case .blob(let b): KeyCodec.appendBlobBytes(b, to: &viaBytes)
+      }
+      #expect(viaBytes == canonical, "byte-encode mismatch for \(value) [\(collation)]")
+    }
+  }
 }
 
 @Suite("RecordCodec")
@@ -223,6 +278,26 @@ struct RecordCodecTests {
         }
       }
       #expect(failed, "cut at \(cut) neither threw nor shrank")
+    }
+  }
+
+  /// Pointer-based `withText`/`withBlob` over a raw record buffer return the
+  /// payload in place, and nil for a different storage class / NULL / a column the
+  /// row didn't store — the contract the join probe and top-N fast paths rely on.
+  @Test func pointerPayloadAccessors() throws {
+    let record = RecordCodec.encode([.text("hello"), .integer(42), .blob([1, 2, 3]), .null])
+    try record.withUnsafeBytes { (bytes: UnsafeRawBufferPointer) throws in
+      func text(_ i: Int) throws -> [UInt8]? {
+        try RecordCodec.withText(at: i, in: bytes) { $0.map(Array.init) }
+      }
+      func blob(_ i: Int) throws -> [UInt8]? {
+        try RecordCodec.withBlob(at: i, in: bytes) { $0.map(Array.init) }
+      }
+      #expect(try text(0) == Array("hello".utf8))
+      #expect(try text(1) == nil)  // INTEGER, not TEXT
+      #expect(try blob(2) == [1, 2, 3])
+      #expect(try text(3) == nil)  // NULL
+      #expect(try text(9) == nil)  // beyond the stored column count
     }
   }
 }

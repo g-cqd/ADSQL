@@ -71,11 +71,41 @@
     for index in cache.indices { cache[index] = nil }
   }
 
+  /// Loads a fully materialized row (no span). The hash-join build side decodes
+  /// its rows once into `[Value]` (via `materialize`) and re-serves them during
+  /// the probe; every column is pre-cached so `value(at:)` never reads the (nil)
+  /// span. `values` must cover all columns (i.e. come from `materialize`).
+  func loadMaterialized(rowid: Int64, values: [Value]) {
+    self.rowid = rowid
+    self.score = 0
+    for index in cache.indices { cache[index] = index < values.count ? values[index] : nil }
+  }
+
   func value(at index: Int) throws(DBError) -> Value {
     if let cached = cache[index] { return cached }
     let value = try compute(at: index)
     cache[index] = value
     return value
+  }
+
+  /// Zero-copy access to a stored TEXT (resp. BLOB) column's payload bytes in
+  /// place — no `String`/`[UInt8]`. `body` gets nil when the column is NULL, a
+  /// different storage class, the rowid-alias/score slot, or not stored by a short
+  /// row (the caller then falls back to the `Value` path). Valid only within the
+  /// call; the span is the same one `compute` reads, so the usual per-row scope
+  /// applies. Used by the join's zero-copy probe-key build.
+  func withTextBytes<R>(
+    at index: Int, _ body: (UnsafeRawBufferPointer?) throws(DBError) -> R
+  ) throws(DBError) -> R {
+    if index == aliasIndex || index == scoreIndex { return try body(nil) }
+    return unsafe try RecordCodec.withText(at: index, in: span, body)
+  }
+
+  func withBlobBytes<R>(
+    at index: Int, _ body: (UnsafeRawBufferPointer?) throws(DBError) -> R
+  ) throws(DBError) -> R {
+    if index == aliasIndex || index == scoreIndex { return try body(nil) }
+    return unsafe try RecordCodec.withBlob(at: index, in: span, body)
   }
 
   /// All columns as a materialized row — the eager fallback (projection of
@@ -126,17 +156,24 @@ enum SelectExecutor {
     ftsRecords: [String: Catalog.FTSRecord] = [:],
     resolver: R, params: SQLParameters,
     outer: (context: RowContext, binding: QueryBinding)? = nil,
-    subquery: @escaping SubqueryRunner = rejectSubquery
+    subquery: @escaping SubqueryRunner = rejectSubquery,
+    execution: ExecutionOptions = .default
   ) throws(DBError) -> [SQLRow] {
+    let evaluator = execution.evaluator
     if plan.isAggregated {
       return try runAggregated(
         plan, tables: tables, index: index, joinIndexes: joinIndexes, ftsRecords: ftsRecords,
-        resolver: resolver, params: params, outer: outer, subquery: subquery)
+        resolver: resolver, params: params, outer: outer, subquery: subquery, execution: execution)
     }
     if plan.isJoin {
       return try runJoin(
         plan, tables: tables, index: index, joinIndexes: joinIndexes, ftsRecords: ftsRecords,
-        resolver: resolver, params: params, outer: outer, subquery: subquery)
+        resolver: resolver, params: params, outer: outer, subquery: subquery, execution: execution)
+    }
+    // Index-ordered DISTINCT: emit one row per distinct index-key prefix, decoded
+    // straight from the key (no table descent, no dedup set).
+    if let name = plan.distinctIndexName, let index, index.definition.name == name {
+      return try runDistinctIndex(plan, index: index, resolver: resolver, params: params)
     }
     let table = tables[0]
     let context = RowContext(definitions: tables.map(\.definition))
@@ -168,19 +205,33 @@ enum SelectExecutor {
     // no later DISTINCT can drop earlier rows.
     let collectKeys = !ordered && !plan.orderBy.isEmpty
     let sliceEnd: Int? =
-      (ordered && !plan.distinct && bounds?.limit != nil)
-      ? (bounds!.offset + bounds!.limit!) : nil
+      (ordered && !plan.distinct)
+      ? bounds.flatMap { b in b.limit.map { b.offset + $0 } } : nil
     // Bounded top-N: an unordered ORDER BY + (small) LIMIT without DISTINCT
     // keeps only offset+limit rows instead of materializing and sorting every
     // match. Larger limits fall back to collect-and-sort.
     let topN: Int? = {
-      guard collectKeys, !plan.distinct, let limit = bounds?.limit, limit >= 1 else { return nil }
-      let bound = bounds!.offset + limit
+      guard collectKeys, !plan.distinct, let bounds, let limit = bounds.limit, limit >= 1 else {
+        return nil
+      }
+      let bound = bounds.offset + limit
       return bound >= 1 && bound <= 4096 ? bound : nil
     }()
     let dedupRowids: Bool = {
       if case .index(_, let list) = source { return list.count > 1 }
       return false
+    }()
+    // Bounded top-N over a single TEXT ORDER BY column: lets `consume` drop a
+    // non-qualifying row by comparing its column bytes in place (no sort-key
+    // String) against the worst kept entry. nil = the general `[Value]` path.
+    let fastSort: (column: Int, descending: Bool, nocase: Bool)? = {
+      guard topN != nil, !plan.distinct, plan.orderBy.count == 1,
+        case .boundColumn(let table, let column) = plan.orderBy[0].expr, table == 0,
+        plan.binding.tables[0].columnTypes[column] == .text
+      else { return nil }
+      let collation = plan.orderCollations[0]
+      guard collation == .binary || collation == .nocase else { return nil }
+      return (column, plan.orderBy[0].descending, collation == .nocase)
     }()
 
     // A taken rowid/index probe exactly covers its equality conjuncts, so the
@@ -192,10 +243,26 @@ enum SelectExecutor {
     case .table: residual = plan.whereExpr
     case .rowids, .index, .fts: residual = plan.residualWithoutCovered
     }
+    // Per-row evaluation: compile each expression once (compiled-closures path)
+    // or wrap the tree-walk evaluator; an unsupported sub-expression falls back to
+    // tree-walk so results are identical regardless of strategy.
+    let makeThunk: (SQLExpr) -> CompiledEval.Thunk = { expr in
+      if evaluator == .compiledClosures,
+        let compiled = CompiledEval.compile(expr, context: context, params: params, env: env)
+      {
+        return compiled
+      }
+      return { () throws(DBError) -> Value in try SQLEval.evaluate(expr, env) }
+    }
     let accumulator = Accumulator(
-      context: context, env: env, residual: residual, outputs: plan.outputs,
-      orderBy: plan.orderBy, orderCollations: plan.orderCollations, collectKeys: collectKeys,
-      sliceEnd: sliceEnd, topN: topN, dedupRowids: dedupRowids)
+      context: context,
+      residualThunk: residual.map(makeThunk),
+      outputThunks: plan.outputs.map { makeThunk($0.expr) },
+      orderBy: plan.orderBy,
+      orderThunks: plan.orderBy.map { makeThunk($0.expr) },
+      orderCollations: plan.orderCollations, collectKeys: collectKeys,
+      sliceEnd: sliceEnd, topN: topN, dedupRowids: dedupRowids,
+      distinct: plan.distinct, distinctCollations: plan.outputCollations, fastSort: fastSort)
     unsafe try forEachRow(source, table: table, resolver: resolver) {
       rowid, span, score throws(DBError) in
       unsafe try accumulator.consume(rowid: rowid, span: span, score: score)
@@ -203,7 +270,7 @@ enum SelectExecutor {
 
     var rows = accumulator.rows
     var sortKeys = accumulator.sortKeys
-    if plan.distinct {
+    if plan.distinct && !accumulator.streamedDistinct {
       (rows, sortKeys) = deduplicate(
         rows, sortKeys: sortKeys, ordered: collectKeys, collations: plan.outputCollations)
     }
@@ -213,6 +280,49 @@ enum SelectExecutor {
       rows = order.map { rows[$0] }
     }
     if let bounds {
+      let lower = min(bounds.offset, rows.count)
+      let upper = bounds.limit.map { min(lower + $0, rows.count) } ?? rows.count
+      rows = Array(rows[lower..<upper])
+    }
+    return rows.map { SQLRow(header: plan.header, values: $0) }
+  }
+
+  /// Index-ordered DISTINCT: scans `index` in key order and emits one row per
+  /// distinct key prefix (the bytes before the 8-byte rowid suffix), decoding the
+  /// values straight from the key — no table descent, no dedup set. Since the
+  /// index is sorted, equal prefixes are adjacent, so a byte compare against the
+  /// previous emitted prefix is enough. The binder selects this path only when
+  /// the index's key columns are exactly the (losslessly decodable) DISTINCT
+  /// outputs with no WHERE/ORDER BY; LIMIT/OFFSET apply to the emitted rows.
+  private static func runDistinctIndex<R: PageResolver>(
+    _ plan: BoundSelect, index: Catalog.IndexRecord, resolver: R, params: SQLParameters
+  ) throws(DBError) -> [SQLRow] {
+    let columnCount = index.definition.columns.count
+    var cursor = Cursor(resolver: resolver, tree: index.handle)
+    guard try cursor.move(to: .first) else { return [] }
+    var rows: [[Value]] = []
+    var previous: [UInt8]?
+    var hasRow = true
+    while hasRow {
+      let decoded: [Value]? = unsafe try cursor.withCurrent {
+        (key, _) throws(DBError) -> [Value]? in
+        guard key.count >= 8 else {
+          throw DBError.integrityFailure("index key missing rowid suffix")
+        }
+        let prefix = unsafe UnsafeRawBufferPointer(rebasing: key[0..<(key.count - 8)])
+        if let previous {
+          let same = previous.withUnsafeBytes { (bytes: UnsafeRawBufferPointer) in
+            unsafe Node.compare(bytes, prefix) == 0
+          }
+          if same { return nil }  // same distinct group as the previous entry
+        }
+        previous = unsafe [UInt8](prefix)
+        return unsafe try KeyCodec.decode(prefix, columns: columnCount)
+      } ?? nil
+      if let decoded { rows.append(decoded) }
+      hasRow = try cursor.next()
+    }
+    if let bounds = try sliceBounds(plan, params: params) {
       let lower = min(bounds.offset, rows.count)
       let upper = bounds.limit.map { min(lower + $0, rows.count) } ?? rows.count
       rows = Array(rows[lower..<upper])
@@ -237,10 +347,12 @@ enum SelectExecutor {
   /// termination (LIMIT reached on an already-ordered source).
   private final class Accumulator {
     let context: RowContext
-    let env: SQLEvalEnv
-    let residual: SQLExpr?
-    let outputs: [BoundOutput]
+    /// Per-row evaluation thunks (tree-walk or compiled), prepared once.
+    let residualThunk: CompiledEval.Thunk?
+    let outputThunks: [CompiledEval.Thunk]
+    /// ORDER BY terms (for the descending flags / count); evaluated via `orderThunks`.
     let orderBy: [SQLOrderingTerm]
+    let orderThunks: [CompiledEval.Thunk]
     let orderCollations: [Collation]
     let collectKeys: Bool
     let sliceEnd: Int?
@@ -249,27 +361,46 @@ enum SelectExecutor {
     /// and capped, so unkept rows are never projected and the full sort is
     /// avoided. nil = collect everything (the caller sorts).
     let topN: Int?
+    /// First-occurrence dedup performed *during* the scan (SELECT DISTINCT on the
+    /// single-table path): the projected row's `GroupKey` is inserted as it is
+    /// consumed, so only ~distinct rows are ever retained instead of materializing
+    /// every input row and deduping afterward. Equivalent to the post-scan
+    /// `deduplicate` (same first-occurrence-in-scan-order semantics, same keys), so
+    /// the executor skips that pass when `streamedDistinct` is true.
+    let distinct: Bool
+    let distinctCollations: [Collation]
+    /// Single TEXT ORDER BY column for the zero-copy top-N early-drop (nil = the
+    /// general `[Value]` sort-key path).
+    let fastSort: (column: Int, descending: Bool, nocase: Bool)?
+    var seenOutputs: Set<GroupKey> = []
     var seenRowids: Set<Int64>?
     var rows: [[Value]] = []
     var sortKeys: [[Value]] = []
 
     var presorted: Bool { topN != nil }
+    var streamedDistinct: Bool { distinct }
 
     init(
-      context: RowContext, env: SQLEvalEnv, residual: SQLExpr?, outputs: [BoundOutput],
-      orderBy: [SQLOrderingTerm], orderCollations: [Collation], collectKeys: Bool,
-      sliceEnd: Int?, topN: Int?, dedupRowids: Bool
+      context: RowContext, residualThunk: CompiledEval.Thunk?, outputThunks: [CompiledEval.Thunk],
+      orderBy: [SQLOrderingTerm], orderThunks: [CompiledEval.Thunk],
+      orderCollations: [Collation], collectKeys: Bool,
+      sliceEnd: Int?, topN: Int?, dedupRowids: Bool,
+      distinct: Bool, distinctCollations: [Collation],
+      fastSort: (column: Int, descending: Bool, nocase: Bool)?
     ) {
       self.context = context
-      self.env = env
-      self.residual = residual
-      self.outputs = outputs
+      self.residualThunk = residualThunk
+      self.outputThunks = outputThunks
       self.orderBy = orderBy
+      self.orderThunks = orderThunks
       self.orderCollations = orderCollations
       self.collectKeys = collectKeys
       self.sliceEnd = sliceEnd
       self.topN = topN
       self.seenRowids = dedupRowids ? [] : nil
+      self.distinct = distinct
+      self.distinctCollations = distinctCollations
+      self.fastSort = fastSort
     }
 
     func consume(rowid: Int64, span: UnsafeRawBufferPointer, score: Double) throws(DBError) -> Bool {
@@ -278,25 +409,40 @@ enum SelectExecutor {
         seenRowids!.insert(rowid)
       }
       unsafe context.load(0, rowid: rowid, span: span, score: score)
-      if let residual {
-        if SQLEval.truth(try SQLEval.evaluate(residual, env)) != .yes { return true }
+      if let residualThunk {
+        if SQLEval.truth(try residualThunk()) != .yes { return true }
       }
 
       if let topN {
+        // Fast early-drop: when the buffer is full and ORDER BY is a single TEXT
+        // column, compare the candidate's bytes in place against the worst kept
+        // entry — dropping a non-qualifying row without allocating a sort-key
+        // String. Equivalent to (and superseded by) the `orderBefore` check below.
+        if let fastSort, rows.count >= topN,
+          try fastDropsCandidate(fastSort, worstKey: sortKeys[topN - 1][0])
+        {
+          return true
+        }
         // Compute the sort key first; only project rows that make the cut.
         var keys: [Value] = []
-        keys.reserveCapacity(orderBy.count)
-        for term in orderBy { keys.append(try SQLEval.evaluate(term.expr, env)) }
+        keys.reserveCapacity(orderThunks.count)
+        for thunk in orderThunks { keys.append(try thunk()) }
         if rows.count >= topN, !orderBefore(keys, sortKeys[topN - 1]) { return true }
         insertSorted(keys, try project())
         return true
       }
 
-      rows.append(try project())
+      let projected = try project()
+      // Stream DISTINCT: drop a row whose projected key was already seen. First
+      // occurrence wins (scan order), matching the post-scan `deduplicate`.
+      if distinct, !seenOutputs.insert(GroupKey(projected, collations: distinctCollations)).inserted {
+        return true
+      }
+      rows.append(projected)
       if collectKeys {
         var keys: [Value] = []
-        keys.reserveCapacity(orderBy.count)
-        for term in orderBy { keys.append(try SQLEval.evaluate(term.expr, env)) }
+        keys.reserveCapacity(orderThunks.count)
+        for thunk in orderThunks { keys.append(try thunk()) }
         sortKeys.append(keys)
       }
       if let sliceEnd, rows.count >= sliceEnd { return false }
@@ -305,9 +451,41 @@ enum SelectExecutor {
 
     private func project() throws(DBError) -> [Value] {
       var projected: [Value] = []
-      projected.reserveCapacity(outputs.count)
-      for output in outputs { projected.append(try SQLEval.evaluate(output.expr, env)) }
+      projected.reserveCapacity(outputThunks.count)
+      for thunk in outputThunks { projected.append(try thunk()) }
       return projected
+    }
+
+    /// True when the bounded buffer is full and the candidate row (its `fastSort`
+    /// column read in place) does NOT qualify for the top-N — letting `consume`
+    /// drop it without materializing a sort-key `String`. Returns false (fall
+    /// through to the full `[Value]` path) whenever it can't decide in place: a
+    /// NULL or unstored candidate, or a non-contiguous/non-text worst key. The
+    /// keep/drop rule mirrors `orderBefore` for one column (NULL-first, then DESC).
+    private func fastDropsCandidate(
+      _ fastSort: (column: Int, descending: Bool, nocase: Bool), worstKey: Value
+    ) throws(DBError) -> Bool {
+      let comparison: Int? = unsafe try context.slots[0].withTextBytes(at: fastSort.column) {
+        (candidate) throws(DBError) -> Int? in
+        guard let candidate = unsafe candidate else { return nil }  // NULL/missing → full path
+        switch worstKey {
+        case .null:
+          return 1  // a non-null candidate sorts after a null worst (⇒ all kept are null)
+        case .text(let worst):
+          return worst.utf8.withContiguousStorageIfAvailable { storage -> Int in
+            let worstBytes = UnsafeRawBufferPointer(storage)
+            if fastSort.nocase {
+              return unsafe SQLCompare.compareUTF8NoCase(candidate, worstBytes)
+            }
+            return unsafe SQLCompare.compareUTF8(candidate, worstBytes)
+          }
+        default:
+          return nil  // worst not text/null (shouldn't happen for a TEXT column)
+        }
+      }
+      guard let comparison else { return false }  // couldn't decide in place → keep
+      let keep = fastSort.descending ? comparison > 0 : comparison < 0
+      return !keep
     }
 
     /// Does sort key `a` order strictly before `b` under ORDER BY?
@@ -342,7 +520,7 @@ enum SelectExecutor {
   /// of the `body` call; `score` is the bm25 relevance (0 for non-FTS sources).
   /// `body` returns false to stop early.
   private static func forEachRow<R: PageResolver>(
-    _ source: RowSource, table: Catalog.TableRecord, resolver: R,
+    _ source: RowSource, table: Catalog.TableRecord, resolver: R, existenceOnly: Bool = false,
     _ body: (Int64, UnsafeRawBufferPointer, Double) throws(DBError) -> Bool
   ) throws(DBError) {
     switch source {
@@ -364,10 +542,16 @@ enum SelectExecutor {
         if outcome == false { return }  // nil = no such row → skip
       }
     case .index(let index, let boundsList):
+      // Existence-only (an existence-only join inner): drive the index entries
+      // directly with NO table descent — `coveringIncludes: []` selects the
+      // no-descent branch, serving each entry's (here unread) value span. The
+      // rowid still comes from the key; the caller reads no inner column.
+      let covering: [String]? = existenceOnly ? [] : nil
       for bounds in boundsList {
         let (lower, upper) = try Relation.scanBounds(bounds, index: index, table: table)
         var cursor = try RowCursor(
-          resolver: resolver, table: table, mode: .index(index), lowerKey: lower, upperKey: upper)
+          resolver: resolver, table: table, mode: .index(index),
+          lowerKey: lower, upperKey: upper, coveringIncludes: covering)
         unsafe try cursor.forEachRecordSpan { rowid, span throws(DBError) in
           unsafe try body(rowid, span, 0)
         }
@@ -454,6 +638,7 @@ enum SelectExecutor {
     _ plan: BoundSelect, tables: [Catalog.TableRecord], index: Catalog.IndexRecord?,
     joinIndexes: [Catalog.IndexRecord?], ftsRecords: [String: Catalog.FTSRecord],
     resolver: R, context: RowContext, env: SQLEvalEnv, paramsEnv: SQLEvalEnv,
+    execution: ExecutionOptions = .default,
     _ body: () throws(DBError) -> Void
   ) throws(DBError) {
     func passesWhere() throws(DBError) -> Bool {
@@ -473,25 +658,77 @@ enum SelectExecutor {
       return
     }
 
+    // Hash join (selected, eligible 2-table INNER equi-join): build the inner,
+    // probe the outer — O(M+N), no per-outer index descent. Returns false when
+    // ineligible, falling through to the nested-loop driver below.
+    if execution.join == .hash,
+      try runInnerHashJoin(
+        plan, tables: tables, index: index, ftsRecords: ftsRecords, resolver: resolver,
+        context: context, env: env, paramsEnv: paramsEnv,
+        budgetBytes: execution.hashJoinMemoryBudgetBytes,
+        emit: { () throws(DBError) in if try passesWhere() { try body() } })
+    {
+      return
+    }
+
+    // Reused across outer rows (and join depths — each `fastExistence` builds and
+    // seeks before recursing, freeing it for the next depth). An empty span for
+    // the defensive existence-hit load (the inner slot is never read).
+    var probeKeyBuffer: [UInt8] = []
+    probeKeyBuffer.reserveCapacity(64)
+    let emptySpan = unsafe UnsafeRawBufferPointer(start: nil, count: 0)
+
     func descend(_ depth: Int) throws(DBError) {
       if depth == tables.count {
         if try passesWhere() { try body() }
         return
       }
       let join = plan.joins[depth - 1]
+      let joinIndex = depth - 1 < joinIndexes.count ? joinIndexes[depth - 1] : nil
+      // Fast existence: a UNIQUE-index full-key equality probe on an existence-only
+      // inner reduces to one seek with a zero-copy key — no bounds, cursor, table
+      // descent, or ON re-check. nil ⇒ ineligible → the general path below.
+      if join.innerExistenceOnly, let joinIndex,
+        let hit = try fastExistence(
+          join: join, index: joinIndex, table: tables[depth],
+          context: context, env: env, resolver: resolver, buffer: &probeKeyBuffer)
+      {
+        if hit {
+          unsafe context.load(depth, rowid: 0, span: emptySpan)
+          try descend(depth + 1)
+        } else if join.kind == .left {
+          context.setNull(depth)
+          try descend(depth + 1)
+        }
+        return
+      }
       var matched = false
       // Index-nested-loop: probe the inner table's index with the outer row's
       // value (a superset); the ON below is the residual. Falls back to a full
       // inner scan when `join.access` is `.tableScan`.
       // A missing index record (caller didn't resolve one) degrades an
       // `.index` probe to a scan; `.rowid` probes need no record.
-      let joinIndex = depth - 1 < joinIndexes.count ? joinIndexes[depth - 1] : nil
       let innerSource = try resolveAccess(
         join.access, index: joinIndex, table: tables[depth], ftsRecords: ftsRecords, env: env)
-      unsafe try forEachRow(innerSource, table: tables[depth], resolver: resolver) {
+      // Existence-only is sound only while the access stays an actual probe: an
+      // unconvertible value degrades it to a full scan (a superset), which must
+      // re-apply the ON. So gate on the *runtime* source, not just the plan flag.
+      let existence: Bool
+      switch innerSource {
+      case .index, .rowids: existence = join.innerExistenceOnly
+      case .table, .fts: existence = false
+      }
+      unsafe try forEachRow(
+        innerSource, table: tables[depth], resolver: resolver, existenceOnly: existence
+      ) {
         rowid, span, score throws(DBError) in
         unsafe context.load(depth, rowid: rowid, span: span, score: score)
-        if SQLEval.truth(try SQLEval.evaluate(join.on, env)) == .yes {
+        // Existence-only: the probe already enforces the whole ON and no inner
+        // column is read, so skip the (empty-span) re-evaluation.
+        if existence {
+          matched = true
+          try descend(depth + 1)
+        } else if SQLEval.truth(try SQLEval.evaluate(join.on, env)) == .yes {
           matched = true
           try descend(depth + 1)
         }
@@ -513,11 +750,210 @@ enum SelectExecutor {
     }
   }
 
+  /// Single-seek existence for a UNIQUE-index full-key equality probe on an
+  /// existence-only join inner. Builds the probe key (zero-copy from the outer
+  /// columns' page bytes where possible) into the reused `buffer`, then checks the
+  /// index for a matching entry — no bounds, no `RowCursor`, no table descent.
+  /// Returns nil when ineligible (caller uses the general path); `.some(hit)` when
+  /// existence was resolved. UNIQUE-only: existence (descend once) preserves join
+  /// cardinality, while non-unique fan-out keeps the enumerating existence path.
+  private static func fastExistence<R: PageResolver>(
+    join: BoundJoin, index: Catalog.IndexRecord, table: Catalog.TableRecord,
+    context: RowContext, env: SQLEvalEnv, resolver: R, buffer: inout [UInt8]
+  ) throws(DBError) -> Bool? {
+    guard index.definition.unique,
+      case .index(let name, let probes, _) = join.access,
+      name == index.definition.name, probes.count == 1,
+      probes[0].trailing == nil,
+      probes[0].equality.count == index.definition.columns.count
+    else { return nil }
+    let tableColumns = index.definition.columns.compactMap { table.definition.columnIndex(of: $0) }
+    guard tableColumns.count == index.definition.columns.count else { return nil }
+    let collations = Relation.indexCollations(index.definition, table: table.definition)
+
+    buffer.removeAll(keepingCapacity: true)
+    for (position, expr) in probes[0].equality.enumerated() {
+      let idxType = table.definition.columns[tableColumns[position]].type
+      guard try appendProbeField(
+        expr, idxType: idxType, collation: collations[position],
+        context: context, env: env, into: &buffer)
+      else { return nil }  // non-column / class mismatch / NULL / NaN → general path
+    }
+
+    var cursor = Cursor(resolver: resolver, tree: index.handle)
+    let prefixLen = buffer.count
+    // `withUnsafeBytes` is untyped-rethrows; capture into a `Result` (as
+    // `Relation.firstRowid` does) to stay in `throws(DBError)`.
+    var outcome: Result<Bool, DBError> = .success(false)
+    buffer.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in
+      do throws(DBError) {
+        _ = unsafe try cursor.seek(raw)
+        guard cursor.isValid else { return }
+        // A4: stored index keys are `columns ++ 8-byte rowid`, so `seek` never
+        // reports an exact hit on the column prefix — verify the entry's prefix
+        // equals the probe (UNIQUE ⇒ at most one such entry).
+        outcome = .success(
+          unsafe try cursor.withCurrent { (key, _) throws(DBError) -> Bool in
+            guard key.count == prefixLen + 8 else { return false }
+            return unsafe raw.elementsEqual(UnsafeRawBufferPointer(rebasing: key[0..<prefixLen]))
+          } ?? false)
+      } catch {
+        outcome = .failure(error)
+      }
+    }
+    return try outcome.get()
+  }
+
+  /// Encodes one equality-probe field into `buffer` directly from the outer
+  /// column's bytes (TEXT/BLOB zero-copy; INTEGER/REAL from the cached value),
+  /// byte-identical to `KeyCodec.append`. Returns false to fall back to the general
+  /// (Value-coercing) path: a non-`.boundColumn` expr, an outer storage class that
+  /// differs from the index column's, a null-extended outer, a NULL/absent value,
+  /// or NaN.
+  private static func appendProbeField(
+    _ expr: SQLExpr, idxType: ColumnType, collation: Collation,
+    context: RowContext, env: SQLEvalEnv, into buffer: inout [UInt8]
+  ) throws(DBError) -> Bool {
+    guard case .boundColumn(let outerTable, let outerCol) = expr,
+      env.boundColumnType(outerTable, outerCol) == idxType,
+      !context.nullExtended[outerTable]
+    else { return false }
+    let slot = context.slots[outerTable]
+    switch idxType {
+    case .text:
+      return unsafe try slot.withTextBytes(at: outerCol) { bytes in
+        guard let bytes = unsafe bytes else { return false }
+        unsafe KeyCodec.appendTextBytes(bytes, collation: collation, to: &buffer)
+        return true
+      }
+    case .blob:
+      return unsafe try slot.withBlobBytes(at: outerCol) { bytes in
+        guard let bytes = unsafe bytes else { return false }
+        unsafe KeyCodec.appendBlobBytes(bytes, to: &buffer)
+        return true
+      }
+    case .integer:
+      guard case .integer(let value) = try slot.value(at: outerCol) else { return false }
+      KeyCodec.appendInteger(value, to: &buffer)
+      return true
+    case .real:
+      guard case .real(let value) = try slot.value(at: outerCol), !value.isNaN else { return false }
+      try KeyCodec.appendReal(value, to: &buffer)
+      return true
+    }
+  }
+
+  /// Hash join for a 2-table INNER equi-join: builds a hash of the inner table
+  /// keyed by the equi-join columns, then probes with each outer row — O(M+N), no
+  /// per-outer index descent. Produces the same composite `RowContext` state as the
+  /// nested loop, so `emit` (WHERE + projection/aggregation) is unchanged. Returns
+  /// false when ineligible (not a single INNER join, no usable same-class/collation
+  /// column equi key, or the build exceeds `budgetBytes`) → caller uses nested loop.
+  ///
+  /// Equi keys are extracted from the (already-bound) ON and key a `GroupKey`,
+  /// whose equality matches SQL `=` for same-class/collation columns (no false
+  /// negatives). Non-equi ON conjuncts are re-checked per match. A NULL probe key
+  /// matches nothing (SQL `=` is unknown with NULL).
+  private static func runInnerHashJoin<R: PageResolver>(
+    _ plan: BoundSelect, tables: [Catalog.TableRecord], index: Catalog.IndexRecord?,
+    ftsRecords: [String: Catalog.FTSRecord], resolver: R,
+    context: RowContext, env: SQLEvalEnv, paramsEnv: SQLEvalEnv,
+    budgetBytes: Int, emit: () throws(DBError) -> Void
+  ) throws(DBError) -> Bool {
+    guard plan.joins.count == 1, plan.joins[0].kind == .inner else { return false }
+    let join = plan.joins[0]
+    let innerDepth = join.table
+    let binding = plan.binding
+
+    var equiInner: [Int] = []
+    var equiOuter: [SQLExpr] = []
+    var equiCollations: [Collation] = []
+    var residualConjuncts: [SQLExpr] = []
+    for conjunct in andConjuncts(join.on) {
+      if let key = hashEquiKey(conjunct, innerDepth: innerDepth, binding: binding) {
+        equiInner.append(key.innerColumn)
+        equiOuter.append(key.outerColumn)
+        equiCollations.append(key.collation)
+      } else {
+        residualConjuncts.append(conjunct)
+      }
+    }
+    guard !equiInner.isEmpty else { return false }
+    let onResidual: SQLExpr? =
+      residualConjuncts.isEmpty
+      ? nil : residualConjuncts.dropFirst().reduce(residualConjuncts[0]) { .binary(.and, $0, $1) }
+
+    // BUILD: full scan of the inner table → hash[inner equi key] = [(rowid, full row)].
+    var hash: [GroupKey: [(rowid: Int64, values: [Value])]] = [:]
+    var approxBytes = 0
+    var overBudget = false
+    let innerTable = tables[innerDepth]
+    unsafe try forEachRow(.table, table: innerTable, resolver: resolver) {
+      rowid, span, score throws(DBError) in
+      unsafe context.load(innerDepth, rowid: rowid, span: span, score: score)
+      var keyValues: [Value] = []
+      keyValues.reserveCapacity(equiInner.count)
+      for column in equiInner { keyValues.append(try context.slots[innerDepth].value(at: column)) }
+      let values = try context.slots[innerDepth].materialize()
+      hash[GroupKey(keyValues, collations: equiCollations), default: []].append((rowid, values))
+      approxBytes += 24 + values.count * 24
+      if approxBytes > budgetBytes { overBudget = true; return false }
+      return true
+    }
+    if overBudget { return false }  // build emitted nothing → caller falls back to nested loop
+
+    // PROBE: scan the outer (leading) source; look up each outer row's matches.
+    let outerSource = try resolveSource(
+      plan, table: tables[0], index: index, ftsRecords: ftsRecords, env: paramsEnv)
+    unsafe try forEachRow(outerSource, table: tables[0], resolver: resolver) {
+      rowid, span, score throws(DBError) in
+      unsafe context.load(0, rowid: rowid, span: span, score: score)
+      var probeValues: [Value] = []
+      probeValues.reserveCapacity(equiOuter.count)
+      for expr in equiOuter { probeValues.append(try SQLEval.evaluate(expr, env)) }
+      if probeValues.contains(where: { $0.isNull }) { return true }  // NULL never matches
+      guard let matches = hash[GroupKey(probeValues, collations: equiCollations)] else { return true }
+      for match in matches {
+        context.loadMaterialized(innerDepth, rowid: match.rowid, values: match.values)
+        if let onResidual, SQLEval.truth(try SQLEval.evaluate(onResidual, env)) != .yes { continue }
+        try emit()
+      }
+      return true
+    }
+    return true
+  }
+
+  private static func andConjuncts(_ expr: SQLExpr) -> [SQLExpr] {
+    if case .binary(.and, let l, let r) = expr { return andConjuncts(l) + andConjuncts(r) }
+    return [expr]
+  }
+
+  /// A hashable equi-join conjunct `inner.col = outer.col` (either operand order)
+  /// where both are bound columns of the SAME storage class and collation — so a
+  /// `GroupKey` match equals SQL `=` (no affinity coercion). nil otherwise.
+  private static func hashEquiKey(
+    _ conjunct: SQLExpr, innerDepth: Int, binding: QueryBinding
+  ) -> (innerColumn: Int, outerColumn: SQLExpr, collation: Collation)? {
+    guard case .binary(.eq, let lhs, let rhs) = conjunct else { return nil }
+    func pair(_ innerSide: SQLExpr, _ outerSide: SQLExpr)
+      -> (innerColumn: Int, outerColumn: SQLExpr, collation: Collation)?
+    {
+      guard case .boundColumn(let it, let ic) = innerSide, it == innerDepth,
+        case .boundColumn(let ot, let oc) = outerSide, ot < innerDepth,
+        binding.tables[it].columnTypes[ic] == binding.tables[ot].columnTypes[oc],
+        binding.tables[it].columnCollations[ic] == binding.tables[ot].columnCollations[oc]
+      else { return nil }
+      return (ic, outerSide, binding.tables[it].columnCollations[ic])
+    }
+    return pair(lhs, rhs) ?? pair(rhs, lhs)
+  }
+
   private static func runJoin<R: PageResolver>(
     _ plan: BoundSelect, tables: [Catalog.TableRecord], index: Catalog.IndexRecord?,
     joinIndexes: [Catalog.IndexRecord?], ftsRecords: [String: Catalog.FTSRecord],
     resolver: R, params: SQLParameters,
-    outer: (context: RowContext, binding: QueryBinding)?, subquery: @escaping SubqueryRunner
+    outer: (context: RowContext, binding: QueryBinding)?, subquery: @escaping SubqueryRunner,
+    execution: ExecutionOptions = .default
   ) throws(DBError) -> [SQLRow] {
     let context = RowContext(definitions: tables.map(\.definition))
     let env = rowEnv(plan, context: context, params: params, outer: outer, subquery: subquery)
@@ -528,7 +964,7 @@ enum SelectExecutor {
     var sortKeys: [[Value]] = []
     try forEachFilteredRow(
       plan, tables: tables, index: index, joinIndexes: joinIndexes, ftsRecords: ftsRecords,
-      resolver: resolver, context: context, env: env, paramsEnv: paramsEnv
+      resolver: resolver, context: context, env: env, paramsEnv: paramsEnv, execution: execution
     ) { () throws(DBError) in
       var projected: [Value] = []
       projected.reserveCapacity(plan.outputs.count)
@@ -563,7 +999,8 @@ enum SelectExecutor {
     _ plan: BoundSelect, tables: [Catalog.TableRecord], index: Catalog.IndexRecord?,
     joinIndexes: [Catalog.IndexRecord?], ftsRecords: [String: Catalog.FTSRecord],
     resolver: R, params: SQLParameters,
-    outer: (context: RowContext, binding: QueryBinding)?, subquery: @escaping SubqueryRunner
+    outer: (context: RowContext, binding: QueryBinding)?, subquery: @escaping SubqueryRunner,
+    execution: ExecutionOptions = .default
   ) throws(DBError) -> [SQLRow] {
     let context = RowContext(definitions: tables.map(\.definition))
     let scanEnv = rowEnv(plan, context: context, params: params, outer: outer, subquery: subquery)
@@ -585,7 +1022,7 @@ enum SelectExecutor {
 
     try forEachFilteredRow(
       plan, tables: tables, index: index, joinIndexes: joinIndexes, ftsRecords: ftsRecords,
-      resolver: resolver, context: context, env: scanEnv, paramsEnv: paramsEnv
+      resolver: resolver, context: context, env: scanEnv, paramsEnv: paramsEnv, execution: execution
     ) { () throws(DBError) in
       let key: GroupKey
       if noGroupBy {
@@ -598,10 +1035,14 @@ enum SelectExecutor {
       if groups[key] == nil {
         var representative: [[Value]] = []
         for table in tables.indices {
+          // Skip materializing a table whose representative no output/HAVING/
+          // ORDER BY reads (e.g. COUNT(*)). Required for an existence-only inner,
+          // whose slot holds an empty span — decoding it would be wrong.
+          let needed = plan.finalizationReferencedTables.contains(table)
           representative.append(
-            context.nullExtended[table]
-              ? Array(repeating: Value.null, count: columnCounts[table])
-              : try context.slots[table].materialize())
+            (needed && !context.nullExtended[table])
+              ? try context.slots[table].materialize()
+              : Array(repeating: Value.null, count: columnCounts[table]))
         }
         groups[key] = (GroupAccumulators(specs: plan.aggregates), representative)
         order.append(key)
@@ -854,6 +1295,12 @@ enum SelectExecutor {
     func load(_ table: Int, rowid: Int64, span: UnsafeRawBufferPointer, score: Double = 0) {
       nullExtended[table] = false
       unsafe slots[table].load(rowid: rowid, span: span, score: score)
+    }
+    /// Loads a materialized (span-less) row into a table slot — the hash-join
+    /// build side re-serving a decoded row during probe.
+    func loadMaterialized(_ table: Int, rowid: Int64, values: [Value]) {
+      nullExtended[table] = false
+      slots[table].loadMaterialized(rowid: rowid, values: values)
     }
     func setNull(_ table: Int) { nullExtended[table] = true }
 

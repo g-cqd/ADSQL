@@ -39,7 +39,10 @@ enum SQLScenario {
 
   static func runADSQL(path: String, rows: Int, config: BenchConfig) throws {
     let db = try Database.open(
-      at: path, options: DatabaseOptions(durability: .none, maxMapSize: 32 << 30))
+      at: path,
+      options: DatabaseOptions(
+        durability: .none, maxMapSize: 32 << 30,
+        execution: ExecutionOptions(evaluator: config.evaluator, join: config.joinStrategy)))
     defer { db.close() }
     for sql in ddl { try db.prepare(sql).run() }
 

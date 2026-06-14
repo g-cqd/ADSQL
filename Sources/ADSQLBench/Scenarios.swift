@@ -1,3 +1,4 @@
+import ADSQL
 import Darwin
 import Dispatch
 import Foundation
@@ -10,6 +11,10 @@ struct BenchConfig {
   var concurrentSeconds = 2.0
   var pointGets = 30_000
   var coldIterations = 40
+  /// Per-row evaluator strategy for the SQL scenarios (`--eval`).
+  var evaluator: ExecutionOptions.Evaluator = .treeWalk
+  /// Join strategy for the SQL scenarios (`--join`).
+  var joinStrategy: ExecutionOptions.Join = .nestedLoop
 }
 
 enum Scenarios {

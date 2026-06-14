@@ -67,6 +67,12 @@ extension UnsafeRawBufferPointer {
   func loadLE64(_ offset: Int) -> UInt64 {
     unsafe UInt64(littleEndian: loadUnaligned(fromByteOffset: offset, as: UInt64.self))
   }
+  /// Big-endian counterpart, for the order-preserving key codec (the only
+  /// BE region of the format). A single byte-swapped load, not a shift loop.
+  @inline(__always)
+  func loadBE64(_ offset: Int) -> UInt64 {
+    unsafe UInt64(bigEndian: loadUnaligned(fromByteOffset: offset, as: UInt64.self))
+  }
 }
 
 extension UnsafeMutableRawBufferPointer {

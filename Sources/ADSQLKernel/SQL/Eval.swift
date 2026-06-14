@@ -104,6 +104,37 @@ enum SQLCompare {
     }
   }
 
+  /// `compareUTF8` over raw byte buffers (the zero-copy top-N path) — identical
+  /// result to the `String` version on the same UTF-8 bytes: byte-lexicographic,
+  /// shorter sorts first when a prefix.
+  static func compareUTF8(_ a: UnsafeRawBufferPointer, _ b: UnsafeRawBufferPointer) -> Int {
+    let n = min(a.count, b.count)
+    var i = 0
+    while i < n {
+      let x = unsafe a[i]
+      let y = unsafe b[i]
+      if x != y { return x < y ? -1 : 1 }
+      i += 1
+    }
+    if a.count == b.count { return 0 }
+    return a.count < b.count ? -1 : 1
+  }
+
+  /// `compareUTF8NoCase` over raw byte buffers (ASCII A–Z folded per byte).
+  static func compareUTF8NoCase(_ a: UnsafeRawBufferPointer, _ b: UnsafeRawBufferPointer) -> Int {
+    func fold(_ c: UInt8) -> UInt8 { (c >= 0x41 && c <= 0x5A) ? c &+ 0x20 : c }
+    let n = min(a.count, b.count)
+    var i = 0
+    while i < n {
+      let fx = unsafe fold(a[i])
+      let fy = unsafe fold(b[i])
+      if fx != fy { return fx < fy ? -1 : 1 }
+      i += 1
+    }
+    if a.count == b.count { return 0 }
+    return a.count < b.count ? -1 : 1
+  }
+
   static func bytesCompare(_ a: [UInt8], _ b: [UInt8]) -> Int {
     let n = min(a.count, b.count)
     var i = 0
@@ -230,16 +261,7 @@ enum SQLEval {
       applyComparisonAffinity(l, &lv, r, &rv, env)
       let collation = resolveCollation(l, r, env)
       guard let c = SQLCompare.compare(lv, rv, collation: collation) else { return .null }
-      let result: Bool
-      switch op {
-      case .eq: result = c == 0
-      case .ne: result = c != 0
-      case .lt: result = c < 0
-      case .le: result = c <= 0
-      case .gt: result = c > 0
-      case .ge: result = c >= 0
-      default: preconditionFailure()
-      }
+      guard let result = op.comparisonResult(c) else { return .null }
       return .integer(result ? 1 : 0)
     case .binary(.concat, let l, let r):
       let lv = try evaluate(l, env)
@@ -376,8 +398,15 @@ enum SQLEval {
   static func applyComparisonAffinity(
     _ l: SQLExpr, _ lv: inout Value, _ r: SQLExpr, _ rv: inout Value, _ env: SQLEvalEnv
   ) {
-    let la = affinity(l, env)
-    let ra = affinity(r, env)
+    applyAffinities(affinity(l, env), affinity(r, env), &lv, &rv)
+  }
+
+  /// The value-conversion half of comparison affinity, with both sides' affinities
+  /// already resolved — so the compiled evaluator can bake the (schema-fixed)
+  /// affinities at compile time and apply only the runtime value coercion per row.
+  static func applyAffinities(
+    _ la: Affinity, _ ra: Affinity, _ lv: inout Value, _ rv: inout Value
+  ) {
     if la == .numeric || ra == .numeric {
       if case .text(let s) = lv, let n = SQLFunctions.fullNumeric(s) { lv = n }
       if case .text(let s) = rv, let n = SQLFunctions.fullNumeric(s) { rv = n }
@@ -422,10 +451,20 @@ enum SQLEval {
 }
 
 extension SQLBinaryOp {
-  var isComparison: Bool {
+  /// Maps a three-way comparison result (`<0`, `0`, `>0`) to this operator's
+  /// boolean outcome, or nil for non-comparison operators. Single source of
+  /// truth for `isComparison`, so the predicate and the evaluation cannot drift.
+  func comparisonResult(_ ordering: Int) -> Bool? {
     switch self {
-    case .eq, .ne, .lt, .le, .gt, .ge: return true
-    default: return false
+    case .eq: return ordering == 0
+    case .ne: return ordering != 0
+    case .lt: return ordering < 0
+    case .le: return ordering <= 0
+    case .gt: return ordering > 0
+    case .ge: return ordering >= 0
+    default: return nil
     }
   }
+
+  var isComparison: Bool { comparisonResult(0) != nil }
 }

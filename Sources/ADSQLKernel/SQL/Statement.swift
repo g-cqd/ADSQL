@@ -85,15 +85,31 @@ public final class Statement: Sendable {
 
   private struct CachedPlan: Sendable {
     let catalogVersion: UInt64
+    /// Planning-relevant execution options (join strategy) the plan was bound
+    /// under; a change invalidates the cached plan.
+    let planningTag: Int
     let query: BoundQuery
   }
   private let cachedPlan = Mutex<CachedPlan?>(nil)
+  /// Per-statement execution-option override (nil = use the database default).
+  private let executionOverride = Mutex<ExecutionOptions?>(nil)
 
   init(database: Database, sql: String, parsed: ParsedStatement) {
     self.database = database
     self.sql = sql
     self.ast = parsed.ast
     self.isReadOnly = parsed.isReadOnly
+  }
+
+  /// Overrides the execution strategies for this statement (nil reverts to the
+  /// database default). Thread-safe; takes effect on the next execution.
+  public func setExecutionOptions(_ options: ExecutionOptions?) {
+    executionOverride.withLock { $0 = options }
+  }
+
+  /// The strategies in effect: the per-statement override, else the database default.
+  var effectiveExecution: ExecutionOptions {
+    executionOverride.withLock { $0 } ?? database.options.execution
   }
 
   // MARK: - Execution
@@ -160,14 +176,18 @@ public final class Statement: Sendable {
     guard case .select(let select) = ast else {
       throw DBError.sqlUnsupported("statement does not return rows")
     }
+    let execution = effectiveExecution
     return try database.read { txn throws(DBError) in
-      switch try self.boundQuery(select, schema: try txn.schema()) {
+      switch try self.boundQuery(
+        select, schema: try txn.schema(), planningTag: execution.planningTag)
+      {
       case .select(let plan):
-        return try Self.runSelect(plan, txn: txn, params: parameters)
+        return try Self.runSelect(plan, txn: txn, params: parameters, execution: execution)
       case .compound(let compound):
         var combined: [[Value]] = []
         for (position, arm) in compound.arms.enumerated() {
-          let armRows = try Self.runSelect(arm.select, txn: txn, params: parameters).map(\.values)
+          let armRows = try Self.runSelect(
+            arm.select, txn: txn, params: parameters, execution: execution).map(\.values)
           if position == 0 {
             combined = armRows
           } else if arm.op == .unionAll {
@@ -183,7 +203,8 @@ public final class Statement: Sendable {
   }
 
   private static func runSelect(
-    _ plan: BoundSelect, txn: borrowing ReadTxn, params: SQLParameters
+    _ plan: BoundSelect, txn: borrowing ReadTxn, params: SQLParameters,
+    execution: ExecutionOptions = .default
   ) throws(DBError) -> [SQLRow] {
     // An FTS binding has no schema table; model it to the executor as a
     // rowid-keyed table whose handle is `.empty` (never scanned — its access is
@@ -203,7 +224,9 @@ public final class Statement: Sendable {
       }
     }
     var index: Catalog.IndexRecord?
-    if let name = plan.access.indexName { index = try txn.indexRecord(name) }
+    if let name = plan.access.indexName ?? plan.distinctIndexName {
+      index = try txn.indexRecord(name)
+    }
     var joinIndexes: [Catalog.IndexRecord?] = []
     for join in plan.joins {
       if let name = join.access.indexName {
@@ -225,7 +248,7 @@ public final class Statement: Sendable {
     }
     return try SelectExecutor.run(
       plan, tables: tables, index: index, joinIndexes: joinIndexes, ftsRecords: ftsRecords,
-      resolver: txn.resolver, params: params, subquery: runner)
+      resolver: txn.resolver, params: params, subquery: runner, execution: execution)
   }
 
   /// Runs one correlated scalar subquery against the current outer row,
@@ -260,7 +283,7 @@ public final class Statement: Sendable {
       }
     }
     var index: Catalog.IndexRecord?
-    if let name = plan.access.indexName {
+    if let name = plan.access.indexName ?? plan.distinctIndexName {
       index = try resolveIndex(name, resolver: resolver, meta: meta, cache: schemaCache)
     }
     var joinIndexes: [Catalog.IndexRecord?] = []
@@ -314,7 +337,9 @@ public final class Statement: Sendable {
       throw DBError.sqlUnsupported("statement does not return rows")
     }
     return try database.read { txn throws(DBError) in
-      switch try self.boundQuery(select, schema: try txn.schema()) {
+      switch try self.boundQuery(
+        select, schema: try txn.schema(), planningTag: self.effectiveExecution.planningTag)
+      {
       case .select(let plan):
         return plan.access.describe(table: plan.source.table)
       case .compound(let compound):
@@ -323,14 +348,22 @@ public final class Statement: Sendable {
     }
   }
 
-  private func boundQuery(_ select: SQLSelect, schema: Schema) throws(DBError) -> BoundQuery {
-    if let cached = cachedPlan.withLock({ $0 }), cached.catalogVersion == schema.catalogVersion {
+  private func boundQuery(
+    _ select: SQLSelect, schema: Schema, planningTag: Int
+  ) throws(DBError) -> BoundQuery {
+    if let cached = cachedPlan.withLock({ $0 }),
+      cached.catalogVersion == schema.catalogVersion, cached.planningTag == planningTag
+    {
       return cached.query
     }
     let query = try Binder.bindQuery(select, schema: schema)
     cachedPlan.withLock { existing in
-      if existing == nil || existing!.catalogVersion <= schema.catalogVersion {
-        existing = CachedPlan(catalogVersion: schema.catalogVersion, query: query)
+      // Refresh on a newer catalog version or a different planning tag.
+      if existing == nil || existing!.catalogVersion < schema.catalogVersion
+        || existing!.planningTag != planningTag
+      {
+        existing = CachedPlan(
+          catalogVersion: schema.catalogVersion, planningTag: planningTag, query: query)
       }
     }
     return query
