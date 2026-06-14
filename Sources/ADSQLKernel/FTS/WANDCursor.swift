@@ -192,7 +192,18 @@ struct FTSWANDCursor {
   /// vector when exhausted. These are the SAME bytes `FTSScorer` reads for this
   /// doc, so a score computed from them is bit-identical.
   mutating func currentFieldTFs() -> [UInt32] {
-    guard !exhausted else { return [UInt32](repeating: 0, count: columns) }
+    var tfs = [UInt32](repeating: 0, count: columns)
+    currentFieldTFs(into: &tfs)
+    return tfs
+  }
+
+  /// Fills `tfs` (length == `columns`) with the current doc's per-column term
+  /// frequencies, reusing the caller's buffer so a whole-list scan (`runSingleTerm`,
+  /// which scores every doc in an entered block) allocates no per-document field-TF
+  /// array. Identical bytes/values to `currentFieldTFs()`.
+  mutating func currentFieldTFs(into tfs: inout [UInt32]) {
+    for index in tfs.indices { tfs[index] = 0 }
+    guard !exhausted else { return }
     // Catch the scan up to the current doc (forward-only; each intervening doc's
     // payload is skipped once).
     while payloadScanDocPos < docPos {
@@ -202,12 +213,10 @@ struct FTSWANDCursor {
     // Read this doc's field-TFs without consuming them: the scan stays at this
     // doc's payload start so the next doc resumes from here.
     var offset = payloadScanOffset
-    var tfs = [UInt32](repeating: 0, count: columns)
     for column in 0..<columns {
       guard let tf = Varint.read(bytes, &offset) else { break }
       tfs[column] = UInt32(truncatingIfNeeded: tf)
     }
-    return tfs
   }
 
   /// Steps `offset` past one doc's payload: `columns` field-TF varints, then (if

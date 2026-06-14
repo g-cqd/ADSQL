@@ -121,6 +121,10 @@ enum FTSWANDTopK {
   private static func runSingleTerm<R: PageResolver>(
     _ cursor: inout FTSWANDCursor, heap: inout TopKHeap, scorer: DocScorer<R>
   ) throws(DBError) {
+    // One reused field-TF buffer for the whole list: the single-term scan scores
+    // every doc in an entered block, so a fresh per-doc `[UInt32]` (and the 1-entry
+    // contributors array) was pure churn on the hottest ranked path.
+    var fieldTFs = [UInt32](repeating: 0, count: scorer.columns)
     while let docid = cursor.current {
       let bound = cursor.currentBlockBound ?? 0
       if heap.isFull, bound < heap.threshold {
@@ -131,7 +135,8 @@ enum FTSWANDTopK {
         }
         continue
       }
-      let s = try scorer.score(docid: docid, contributors: [(cursor.idf, cursor.currentFieldTFs())])
+      cursor.currentFieldTFs(into: &fieldTFs)
+      let s = try scorer.scoreSingle(docid: docid, idf: cursor.idf, fieldTFs: fieldTFs)
       heap.offer(docid: docid, score: s)
       cursor.advancePast()
     }
@@ -265,6 +270,22 @@ struct DocScorer<R: PageResolver> {
         idf: contributor.idf, weightedFreq: weightedFreq, lengthNorm: lengthNorm)
     }
     return total
+  }
+
+  /// `S` for a SINGLE contributing term — the `runSingleTerm` hot path. Identical
+  /// arithmetic to `score` with one contributor (same `wf`, same zero-skip, same
+  /// `contribution`), but takes the field-TFs by borrow (a reused buffer) and
+  /// avoids the per-doc contributors array.
+  func scoreSingle(docid: Int64, idf: Double, fieldTFs tfs: [UInt32]) throws(DBError) -> Double {
+    guard let docLength = try FTSIndex.docLength(resolver, record, docid: docid) else { return 0 }
+    let lengthNorm = FTSScorer.lengthNorm(docLength: docLength, avgdl: avgdl)
+    var weightedFreq = 0.0
+    for column in 0..<columns {
+      let tf = column < tfs.count ? Double(tfs[column]) : 0
+      weightedFreq += weights[column] * tf
+    }
+    guard weightedFreq > 0 else { return 0 }
+    return FTSScorer.contribution(idf: idf, weightedFreq: weightedFreq, lengthNorm: lengthNorm)
   }
 }
 
