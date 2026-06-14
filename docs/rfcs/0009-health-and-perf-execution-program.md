@@ -85,6 +85,37 @@ Designs for every phase are in **review 0003 §6**; this table is the schedule +
 
 Legend: 🚧 in progress · ⏭ next · ⏳ planned · 🔒 blocked · ✅ done.
 
+### H4 merge-join — investigated implementation plan (4-file, 3 slices)
+
+Tracing the join path confirms the merge join is **not** a localized executor change. The bound plan
+varies per join strategy (`Statement` keys the plan cache on `ExecutionOptions.planningTag`); the
+`Binder` (`Plan.swift`) builds the access plans via `Planner.plan`/`Planner.planJoin` →
+`chooseIndex` over each table's `[IndexDefinition]`; `Statement` resolves the chosen access to
+`Catalog.IndexRecord`s and passes them to `SelectExecutor.run` as `index` (outer) + `joinIndexes`
+(inner). For the bench self-join (`COUNT(*) … ON b.key=a.key`, no WHERE on the outer) the planner
+picks a **table scan** for the outer, so a merge has no key-sorted outer cursor without planner help.
+
+- **Slice 1 — planner index-selection (`Plan.swift` Binder + `Planner.swift`).** When the bound join
+  strategy is `.merge` and the query is a 2-table INNER equi-join whose key columns are each covered by
+  a single-column index with the **same collation**, force the leading access to the outer key index
+  (ordered) and `joins[0].access` to the inner key index; record a `BoundJoin.mergeEligible` flag.
+  Validate by adding `.merge` to `SQLHashJoinTests.joins` — with no executor branch yet it runs
+  nested-loop over the key indexes, which must still equal `.nestedLoop`/`.hash`/SQLite (green slice).
+- **Slice 2 — executor lock-step (`Executor.swift` + new `MergeJoin.swift`).** A `.merge` branch at the
+  `.hash` dispatch seam (`forEachFilteredRow:725`) → `runMergeJoin` (returns Bool, eligible-or-fall-through):
+  open a `Cursor` on each side's key index, `move(.first)`, lock-step comparing the key **prefix**
+  (`key[0..<count-8]`, stripping the A4 rowid suffix) via `Node.compare`/`elementsEqual`; advance the
+  smaller; on equal, gather the dup-run on each side. **Existence/COUNT(\*)** (`innerExistenceOnly`):
+  emit `innerRunLen` times per outer-run entry (no descent — the bench winner). General case: descend
+  by rowid to load both slots, cross-product the runs. Landmines: index collation; NULL prefix runs
+  never match (skip); LEFT emits one null-extended row per unmatched outer run.
+- **Slice 3 — cost model `.auto` (`Planner.planJoin` + `BoundJoin.driver`).** Estimate INLJ `M·logN`
+  vs hash `M+N` (build smaller, semi-join for existence) vs merge `M+N` (both sorted) via
+  `TreeHandle.count`; pick the min; default-flip only after the seven-criteria matrix (H8).
+
+Gate each slice: `merge ≡ nestedLoop ≡ hash ≡ SQLite` differential + `StrategyBench` + TSan; the
+merge `.merge` arm must beat SQLite on the self-join before `.auto` defaults to it.
+
 ## References
 
 - **`docs/reviews/0003-codebase-health-and-perf.md`** — the consolidated findings, designs, scorecards,
