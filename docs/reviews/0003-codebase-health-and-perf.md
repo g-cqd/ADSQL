@@ -39,11 +39,15 @@ On performance: **DISTINCT and SEARCH now meet-or-beat SQLite; FTS ranked top-k 
 (the headline change since the reports — §1.1, §4.4). The JOIN — formerly the engine's worst loss
 (~0.26×) — **now beats SQLite (~2.1×)** via a merge-join existence fast path that the `.auto` cost model
 selects, and `.auto` is now the **default** join strategy (won all seven criteria; RFC 0009 H4/H8).
-**INSERT (~0.77×) is the one remaining losing SQL path**: its safe per-row waste-clears (rowid cache,
-opt-in `appendCursor`) are in and tested, but the 3-index apple-docs shape is dominated by secondary-index
-COW maintenance, so closing it needs index-maintenance work (a separate lever). A unifying finding (§5.7): the residual cost on JOIN, SEARCH **and** FTS-MATCH is the
-**same per-row `[Value]`/ARC/exclusivity row-materialization** path — one evaluator/row-path lever
-closes all three.
+**INSERT (~0.8× warm) is the one SQL path still short of parity** — and R1 now **closes it honestly**.
+Its safe per-row waste-clears are all in and tested: `maxRowidCache`, `hoisted` (owned-index roster cache
++ in-place write COW-avoid), and opt-in `appendCursor`. R1's deep profile (`/usr/bin/sample`, RFC 0009 H3)
+attributes the residual to the **diffuse Swift-runtime tax** (ARC ~25% + temporary alloc ~10% + schema-dict
+String-hash ~10% + generic-metadata ~2% ≈ 47%) over a **shared-algorithm B+tree** (`Node.search`/`memcmp`/
+`memmove` ~16% + `pwritev`/commit ~8%, inherent and matched by SQLite) — there is **no single deep lever**.
+Critically, that ARC component is the **same per-row `[Value]`/ARC/exclusivity row-materialization** that
+also taxes JOIN, SEARCH **and** FTS-MATCH (§5.7), so it is attacked with **leverage** by the unifying
+evaluator/row-path lever (H6/R3) — one change for all four paths — not INSERT-specific micro-tuning.
 
 ### 1.1 What changed since the reports' baseline (`1c3bccf` → `f0e0e5b`)
 
@@ -230,8 +234,8 @@ or per-statement via `Statement.setExecutionOptions`):
 | dimension | reference (default) | alternatives | status |
 |---|---|---|---|
 | **Evaluator** | `treeWalk` | `compiledClosures` ✅, `vdbe` (todo) | enum cases declared in `ExecutionOptions.swift` |
-| **Join** | `nestedLoop` | `hash` ✅, `merge` (todo), `auto` cost-based (todo) | `runInnerHashJoin` exists; merge/auto fall back |
-| **Insert** | `standard` | `hoisted` (todo), `appendCursor` (todo) | both fall back today |
+| **Join** | `auto` (was `nestedLoop`) | `nestedLoop`, `hash` ✅, `merge` ✅ | `auto` is now the **default** (R2/H8): merge fast path (2-table INNER existence) when eligible, else nested loop; beats SQLite ~2.1× |
+| **Insert** | `standard` | `hoisted` ✅, `appendCursor` ✅ | both landed + differential-tested (R1/H3/H5); default stays `standard` (residual is inherent — see §1) |
 
 ### 4.2 Why SQLite is faster where it is (profiling)
 
