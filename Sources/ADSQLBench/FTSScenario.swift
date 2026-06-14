@@ -36,6 +36,12 @@ enum FTSScenario {
       title, abstract, declaration, headings, key, tokenize='porter unicode61')
     """
   static let bm25 = "bm25(documents_fts, 10.0, 5.0, 3.0, 2.0, 1.0)"
+  /// A second, abstract/declaration-heavy weight vector — exercises **bm25f**
+  /// per-column weighting with a ranking distinct from `bm25` (title-heavy), so
+  /// the bench measures the weighted-rank path and not just the default profile.
+  /// Ordering parity vs SQLite FTS5 under weighted bm25() is covered by
+  /// `FTSParityTests`; this arm measures its latency on both engines.
+  static let bm25fWeighted = "bm25(documents_fts, 1.0, 8.0, 6.0, 1.0, 1.0)"
 
   /// Representative MATCH battery, drawn from the generator vocabulary so each
   /// hits a meaningful, varied subset: single anchor term, stemmed prose term,
@@ -147,6 +153,24 @@ enum FTSScenario {
       }
     }
     print("  [adsql] fts ranked@\(limit)   \(rankedHist.summary())")
+
+    // 3b. Ranked top-k under a different bm25f weight vector (abstract/declaration
+    // heavy) — measures the weighted-rank path; ordering parity is in FTSParityTests.
+    let rankedFStmt = try db.prepare("""
+      SELECT rowid FROM documents_fts WHERE documents_fts MATCH ?
+      ORDER BY \(bm25fWeighted) LIMIT \(limit)
+      """)
+    var rankedFHist = LatencyHistogram()
+    rankedFHist.reserve(rankedQueries.count * iterationsPerQuery)
+    for _ in 0..<iterationsPerQuery {
+      for q in rankedQueries {
+        let start = nowNanos()
+        let result = try rankedFStmt.all(.text(q))
+        rankedFHist.record(nowNanos() - start)
+        precondition(result.count <= limit)
+      }
+    }
+    print("  [adsql] fts bm25f@\(limit)    \(rankedFHist.summary())")
   }
 
   // MARK: - SQLite FTS5 baseline
@@ -257,6 +281,26 @@ enum FTSScenario {
       }
     }
     print("  [sqlite] fts ranked@\(limit)   \(rankedHist.summary())")
+
+    // 3b. Ranked top-k under the bm25f weight vector (mirrors the ADSQL arm).
+    var rankedFStmt: OpaquePointer?
+    sqlite3_prepare_v3(
+      db,
+      "SELECT rowid FROM documents_fts WHERE documents_fts MATCH ?1 ORDER BY \(bm25fWeighted) LIMIT \(limit)",
+      -1, UInt32(SQLITE_PREPARE_PERSISTENT), &rankedFStmt, nil)
+    defer { sqlite3_finalize(rankedFStmt) }
+    var rankedFHist = LatencyHistogram()
+    rankedFHist.reserve(rankedQueries.count * iterationsPerQuery)
+    for _ in 0..<iterationsPerQuery {
+      for q in rankedQueries {
+        let start = nowNanos()
+        sqlite3_reset(rankedFStmt)
+        sqlite3_bind_text(rankedFStmt, 1, q, -1, transient)
+        while sqlite3_step(rankedFStmt) == SQLITE_ROW {}
+        rankedFHist.record(nowNanos() - start)
+      }
+    }
+    print("  [sqlite] fts bm25f@\(limit)    \(rankedFHist.summary())")
   }
 
   /// True when the linked sqlite3 has FTS5 compiled in (create a throwaway fts5
