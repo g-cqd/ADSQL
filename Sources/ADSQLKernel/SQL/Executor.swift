@@ -254,6 +254,19 @@ enum SelectExecutor {
     case .table: residual = plan.whereExpr
     case .rowids, .index, .fts: residual = plan.residualWithoutCovered
     }
+    // F6e: for an FTS source, computing the per-doc bm25 score is dead work
+    // unless the `rank` slot is actually read — by the projection, ORDER BY, or
+    // residual — or WAND needs it. Skipping it makes a membership-only MATCH O(n)
+    // instead of O(n²) (FTSScorer.score re-decodes the term's whole list per doc).
+    let ftsScoreNeeded: Bool = {
+      guard case .fts = source else { return true }
+      if ftsRankedTopK != nil { return true }
+      func reads(_ e: SQLExpr) -> Bool { exprReferences(e, table: 0, column: ftsRankSlot) }
+      if plan.outputs.contains(where: { reads($0.expr) }) { return true }
+      if plan.orderBy.contains(where: { reads($0.expr) }) { return true }
+      if let residual, reads(residual) { return true }
+      return false
+    }()
     // Per-row evaluation: compile each expression once (compiled-closures path)
     // or wrap the tree-walk evaluator; an unsupported sub-expression falls back to
     // tree-walk so results are identical regardless of strategy.
@@ -274,7 +287,10 @@ enum SelectExecutor {
       orderCollations: plan.orderCollations, collectKeys: collectKeys,
       sliceEnd: sliceEnd, topN: topN, dedupRowids: dedupRowids,
       distinct: plan.distinct, distinctCollations: plan.outputCollations, fastSort: fastSort)
-    unsafe try forEachRow(source, table: table, resolver: resolver, ftsRankedTopK: ftsRankedTopK) {
+    unsafe try forEachRow(
+      source, table: table, resolver: resolver, ftsRankedTopK: ftsRankedTopK,
+      ftsScoreNeeded: ftsScoreNeeded
+    ) {
       rowid, span, score throws(DBError) in
       unsafe try accumulator.consume(rowid: rowid, span: span, score: score)
     }
@@ -532,7 +548,7 @@ enum SelectExecutor {
   /// `body` returns false to stop early.
   private static func forEachRow<R: PageResolver>(
     _ source: RowSource, table: Catalog.TableRecord, resolver: R, existenceOnly: Bool = false,
-    ftsRankedTopK: Int? = nil,
+    ftsRankedTopK: Int? = nil, ftsScoreNeeded: Bool = true,
     _ body: (Int64, UnsafeRawBufferPointer, Double) throws(DBError) -> Bool
   ) throws(DBError) {
     switch source {
@@ -605,9 +621,15 @@ enum SelectExecutor {
       // `base.id = fts.rowid` exactly as for an ordinary rowid source.
       let docids = try FTSMatch.evaluate(query, record: record, resolver: resolver)
       for docid in docids {
-        let score = try FTSScorer.score(
-          query, record: record, resolver: resolver, docid: docid,
-          weights: resolvedWeights, global: global)
+        // F6e: a membership-only query (no `rank`/`bm25` referenced) never reads
+        // the score, so skip the per-doc FTSScorer.score — which re-decodes the
+        // term's whole posting list, the score-all O(n²) MATCH cost.
+        let score =
+          ftsScoreNeeded
+          ? try FTSScorer.score(
+            query, record: record, resolver: resolver, docid: docid,
+            weights: resolvedWeights, global: global)
+          : 0
         if try unsafe !body(docid, empty, score) { return }
       }
     }
@@ -1432,6 +1454,45 @@ enum SelectExecutor {
       return t == 0 && c == 0
     default:
       return false
+    }
+  }
+
+  /// True when `e` (or any sub-expression) reads bound column `(table, column)`.
+  /// Used to decide whether an FTS query needs per-doc bm25 scoring (F6e): a
+  /// membership-only MATCH never reads the `rank` slot, so scoring is dead work.
+  /// A scalar subquery is treated conservatively (assume the score may be read).
+  private static func exprReferences(_ e: SQLExpr, table: Int, column: Int) -> Bool {
+    switch e {
+    case .boundColumn(let t, let c): return t == table && c == column
+    case .literal, .column, .parameter, .aggregateResult: return false
+    case .binary(_, let l, let r):
+      return exprReferences(l, table: table, column: column)
+        || exprReferences(r, table: table, column: column)
+    case .unary(_, let x), .cast(let x, _), .collate(let x, _):
+      return exprReferences(x, table: table, column: column)
+    case .like(let x, let p, _):
+      return exprReferences(x, table: table, column: column)
+        || exprReferences(p, table: table, column: column)
+    case .isNull(let x, _):
+      return exprReferences(x, table: table, column: column)
+    case .inList(let x, let list, _):
+      return exprReferences(x, table: table, column: column)
+        || list.contains { exprReferences($0, table: table, column: column) }
+    case .inJSONEach(let x, let s, _):
+      return exprReferences(x, table: table, column: column)
+        || exprReferences(s, table: table, column: column)
+    case .caseWhen(let op, let whens, let elseExpr):
+      if let op, exprReferences(op, table: table, column: column) { return true }
+      if whens.contains(where: {
+        exprReferences($0.condition, table: table, column: column)
+          || exprReferences($0.result, table: table, column: column)
+      }) { return true }
+      if let elseExpr { return exprReferences(elseExpr, table: table, column: column) }
+      return false
+    case .function(_, let args, _, _):
+      return args.contains { exprReferences($0, table: table, column: column) }
+    case .scalarSubquery:
+      return true
     }
   }
 

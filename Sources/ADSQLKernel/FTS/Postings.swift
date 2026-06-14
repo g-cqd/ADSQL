@@ -146,4 +146,34 @@ public enum FTSPostings {
     }
     return result
   }
+
+  /// Docids only, from a SINGLE-block value (F6d block-per-key storage): reads the
+  /// block header + docid gaps and STOPS, skipping the per-doc field-TF/position
+  /// payload entirely. For membership (`MATCH`) where only docids are needed — the
+  /// skipped payload is the bulk of a long list's bytes (F6e).
+  public static func decodeDocids(singleBlock bytes: [UInt8]) throws(DBError) -> [Int64] {
+    var offset = 0
+    guard Varint.read(bytes, &offset) == 1 else {
+      throw DBError.integrityFailure("fts postings: decodeDocids expects a single-block value")
+    }
+    guard let rawDocCount = Varint.read(bytes, &offset),
+      let firstZigzag = Varint.read(bytes, &offset),
+      Varint.read(bytes, &offset) != nil,  // lastDocId
+      Varint.read(bytes, &offset) != nil  // maxTotalTF
+    else { throw DBError.integrityFailure("fts postings: truncated block header") }
+    let docCount = Int(rawDocCount)
+    guard docCount >= 1 else { throw DBError.integrityFailure("fts postings: empty block") }
+    var docids: [Int64] = []
+    docids.reserveCapacity(docCount)
+    var docid = Varint.unzigzag(firstZigzag)
+    docids.append(docid)
+    for _ in 1..<docCount {
+      guard let gap = Varint.read(bytes, &offset) else {
+        throw DBError.integrityFailure("fts postings: truncated docid gap")
+      }
+      docid += Int64(gap)
+      docids.append(docid)
+    }
+    return docids
+  }
 }

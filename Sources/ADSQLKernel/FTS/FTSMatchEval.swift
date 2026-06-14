@@ -77,8 +77,10 @@ enum FTSMatch {
     /// Docids of a single term, optionally restricted to documents where the
     /// term occurs in one of `columns` (via the per-field term frequencies).
     private func docids(_ term: [UInt8], columns: Set<Int>?) throws(DBError) -> [Int64] {
+      // No column filter: membership needs only docids — take the F6e fast path
+      // that skips each doc's TF/position payload.
+      guard let columns else { return try FTSIndex.docids(resolver, record, term: term) ?? [] }
       guard let postings = try FTSIndex.postings(resolver, record, term: term) else { return [] }
-      guard let columns else { return postings.map(\.docid) }
       return postings.compactMap { posting in
         columns.contains { $0 < posting.fieldTFs.count && posting.fieldTFs[$0] > 0 }
           ? posting.docid : nil

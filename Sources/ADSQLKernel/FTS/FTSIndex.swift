@@ -216,6 +216,28 @@ enum FTSIndex {
     return combined
   }
 
+  /// Docids only for `term` — unions the term's block-keys, decoding just docids
+  /// from each block and skipping its TF/position payload (F6e membership fast
+  /// path). nil when the term is absent.
+  static func docids(
+    _ resolver: some PageResolver, _ record: Catalog.FTSRecord, term: [UInt8]
+  ) throws(DBError) -> [Int64]? {
+    let df = try documentFrequency(resolver, record, term: term)
+    guard df > 0 else { return nil }
+    let lastNo = blockNo(forDF: df)
+    var ids: [Int64] = []
+    ids.reserveCapacity(Int(df))
+    for no in 0...lastNo {
+      guard let value = try Relation.getBytes(resolver, record.postings, key: blockKey(term, no)),
+        !value.isEmpty
+      else {
+        throw DBError.integrityFailure("fts postings: missing block \(no)")
+      }
+      ids.append(contentsOf: try FTSPostings.decodeDocids(singleBlock: value))
+    }
+    return ids
+  }
+
   static func documentFrequency(
     _ resolver: some PageResolver, _ record: Catalog.FTSRecord, term: [UInt8]
   ) throws(DBError) -> UInt64 {
