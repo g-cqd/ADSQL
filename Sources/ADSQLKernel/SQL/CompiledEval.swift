@@ -122,9 +122,63 @@ enum CompiledEval {
         }
         return try elseThunk?() ?? .null
       }
+    case .like(let subject, let pattern, let negated):
+      guard let cs = sub(subject), let cp = sub(pattern) else { return nil }
+      return { () throws(DBError) -> Value in
+        let s = try cs()
+        let p = try cp()
+        guard !s.isNull, !p.isNull else { return .null }
+        let matched = SQLFunctions.like(
+          text: SQLFunctions.textify(s), pattern: SQLFunctions.textify(p))
+        return .integer((matched != negated) ? 1 : 0)
+      }
+    case .inList(let subject, let items, let negated):
+      guard let cs = sub(subject) else { return nil }
+      // Empty list is a constant, but tree-walk still evaluates `subject` first —
+      // mirror that (its evaluation may throw) before returning the constant.
+      if items.isEmpty {
+        return { () throws(DBError) -> Value in _ = try cs(); return .integer(negated ? 1 : 0) }
+      }
+      // Bake each side's (schema-fixed) affinity + the collation now; the per-row
+      // thunk applies only the value coercion, exactly as `SQLEval.inList` does —
+      // including the `lhs` carry across items (a numeric-affinity item coerces a
+      // TEXT lhs once, and the coerced value persists for the remaining items).
+      var compiledItems: [(Thunk, SQLEval.Affinity)] = []
+      compiledItems.reserveCapacity(items.count)
+      for item in items {
+        guard let ci = sub(item) else { return nil }
+        compiledItems.append((ci, SQLEval.affinity(item, env)))
+      }
+      let subjectAffinity = SQLEval.affinity(subject, env)
+      let collation = SQLEval.resolveCollation(subject, nil, env)
+      return { () throws(DBError) -> Value in
+        var lhs = try cs()
+        if lhs.isNull { return .null }
+        var sawNull = false
+        for (item, itemAffinity) in compiledItems {
+          var rhs = try item()
+          SQLEval.applyAffinities(subjectAffinity, itemAffinity, &lhs, &rhs)
+          switch SQLCompare.equal(lhs, rhs, collation: collation) {
+          case .yes: return .integer(negated ? 0 : 1)
+          case .unknown: sawNull = true
+          case .no: break
+          }
+        }
+        if sawNull { return .null }
+        return .integer(negated ? 1 : 0)
+      }
+    case .function(let name, let args, let star, let offset):
+      // `SQLFunctions.call` evaluates its argument expressions through `env` (which
+      // is wired to the same row context), so compiling the call site does not
+      // compile the arguments — but it lets a scalar function participate in an
+      // otherwise-compiled expression (e.g. `upper(x) = ?`) instead of forcing the
+      // whole expression onto the tree-walk fallback. Identical semantics.
+      return { () throws(DBError) -> Value in
+        try SQLFunctions.call(name, args: args, star: star, offset: offset, env)
+      }
     default:
-      // .column (correlated), .scalarSubquery, .inList, .inJSONEach, .like,
-      // .function, .aggregateResult — handled by the tree-walk fallback.
+      // .column (correlated), .scalarSubquery, .inJSONEach, .aggregateResult —
+      // handled by the tree-walk fallback.
       return nil
     }
   }

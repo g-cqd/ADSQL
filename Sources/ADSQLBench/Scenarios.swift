@@ -11,10 +11,13 @@ struct BenchConfig {
   var concurrentSeconds = 2.0
   var pointGets = 30_000
   var coldIterations = 40
+  // Defaults mirror the shipped library defaults (ExecutionOptions) so a bare bench
+  // run reflects what users actually get; `--eval`/`--join`/`--insert` override for
+  // A/B comparisons against the reference paths.
   /// Per-row evaluator strategy for the SQL scenarios (`--eval`).
-  var evaluator: ExecutionOptions.Evaluator = .treeWalk
+  var evaluator: ExecutionOptions.Evaluator = .compiledClosures
   /// Join strategy for the SQL scenarios (`--join`).
-  var joinStrategy: ExecutionOptions.Join = .nestedLoop
+  var joinStrategy: ExecutionOptions.Join = .auto
   /// Insert strategy for the SQL scenarios (`--insert`).
   var insertStrategy: ExecutionOptions.Insert = .standard
 }

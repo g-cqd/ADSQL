@@ -77,6 +77,20 @@ struct SQLStrategyMatrixTests {
     "SELECT DISTINCT tag FROM t",                                         // distinct projection (NOCASE)
     "SELECT id FROM t WHERE name = 'Bravo' COLLATE NOCASE ORDER BY id",   // explicit COLLATE
     "SELECT id, name || '!' AS n FROM t WHERE id <= 3 ORDER BY id",       // concat
+    // Newly compiled cases (R3): LIKE, IN-list, scalar functions — each must stay
+    // compiled ≡ tree-walk ≡ SQLite, including NULL 3VL and collation.
+    "SELECT id, name FROM t WHERE name LIKE 'a%' ORDER BY id",            // LIKE prefix (ASCII case-insensitive)
+    "SELECT id FROM t WHERE name NOT LIKE 'B%' ORDER BY id",              // NOT LIKE
+    "SELECT id, tag FROM t WHERE tag LIKE '%' ORDER BY id",               // LIKE over NULLs (NULL ⇒ no match)
+    "SELECT id FROM t WHERE score IN (1, 2, 3) ORDER BY id",              // IN integer list
+    "SELECT id FROM t WHERE name IN ('alpha', 'Delta') ORDER BY id",      // IN TEXT list (BINARY)
+    "SELECT id, tag FROM t WHERE tag IN ('x', 'z') ORDER BY id",          // IN under the column's NOCASE collation
+    "SELECT id FROM t WHERE score NOT IN (0, 1) ORDER BY id",             // NOT IN (NULL lhs ⇒ unknown)
+    "SELECT id FROM t WHERE score IN (NULL, 2) ORDER BY id",              // NULL in the list (3VL)
+    "SELECT id, upper(name) AS u FROM t WHERE id <= 4 ORDER BY id",       // scalar function projection
+    "SELECT id FROM t WHERE length(name) > 4 ORDER BY id",                // function in WHERE
+    "SELECT id FROM t WHERE upper(name) = 'ALPHA' ORDER BY id",           // function inside a compiled comparison
+    "SELECT id, coalesce(score, -99) AS s FROM t ORDER BY id",            // coalesce over NULLs
   ]
 
   @Test(arguments: queries)
