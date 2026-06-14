@@ -9,550 +9,552 @@
 /// Everything here is value-typed so group commit's `TxnRestorePoint` can
 /// capture and restore a failing request's relational delta by plain copy.
 enum TreeKey: Hashable, Sendable {
-  case table(UInt32)
-  case index(UInt32)
-  case ftsDict(UInt32)
-  case ftsPostings(UInt32)
-  case ftsStats(UInt32)
+    case table(UInt32)
+    case index(UInt32)
+    case ftsDict(UInt32)
+    case ftsPostings(UInt32)
+    case ftsStats(UInt32)
 }
 
 public struct RelationState: Sendable {
-  var version: Catalog.VersionRow
-  var tableRecords: [String: Catalog.TableRecord] = [:]
-  var indexRecords: [String: Catalog.IndexRecord] = [:]
-  var ftsRecords: [String: Catalog.FTSRecord] = [:]
-  /// F6f memtable: documents buffered this transaction, flushed coalesced into a
-  /// table's FTS trees at the first read of that table (`flushFTS`) or at commit
-  /// (`serializeState`). Value-typed, so `TxnRestorePoint` snapshots/restores it
-  /// for free on a group-commit rollback.
-  var ftsBuffer: [String: [FTSIndex.PendingDoc]] = [:]
-  /// Parsed trigger definitions keyed by name (re-parsed from the stored raw
-  /// CREATE TRIGGER text at load time, like SQLite's `sqlite_schema`).
-  var triggerRecords: [String: TriggerDefinition] = [:]
-  /// Triggers added or dropped this transaction whose catalog row needs a
-  /// write-back (value = the raw SQL text, or nil for a drop).
-  var triggerWrites: [String: String?] = [:]
-  /// Handle last persisted (nil = record not on disk yet).
-  var handleBaselines: [TreeKey: TreeHandle?] = [:]
-  /// AUTOINCREMENT high-water marks touched this transaction.
-  var sequences: [UInt32: UInt64] = [:]
-  var sequenceBaselines: [UInt32: UInt64] = [:]
-  /// Transient per-transaction cache of the largest rowid for a plain
-  /// (non-AUTOINCREMENT) rowid table, so an ascending insert run allocates
-  /// `cached + 1` instead of an O(depth) `move(.last)` probe every row. NOT
-  /// serialized — re-derived from the tree on first use each transaction;
-  /// value-typed, so `TxnRestorePoint` restores it for free on a group-commit
-  /// rollback. Invalidated on delete (the max may be gone → reuse, matching SQLite).
-  var maxRowidCache: [UInt32: Int64] = [:]
-  /// Set by DDL: bump catalogVersion at serialization.
-  var schemaDirty = false
+    var version: Catalog.VersionRow
+    var tableRecords: [String: Catalog.TableRecord] = [:]
+    var indexRecords: [String: Catalog.IndexRecord] = [:]
+    var ftsRecords: [String: Catalog.FTSRecord] = [:]
+    /// F6f memtable: documents buffered this transaction, flushed coalesced into a
+    /// table's FTS trees at the first read of that table (`flushFTS`) or at commit
+    /// (`serializeState`). Value-typed, so `TxnRestorePoint` snapshots/restores it
+    /// for free on a group-commit rollback.
+    var ftsBuffer: [String: [FTSIndex.PendingDoc]] = [:]
+    /// Parsed trigger definitions keyed by name (re-parsed from the stored raw
+    /// CREATE TRIGGER text at load time, like SQLite's `sqlite_schema`).
+    var triggerRecords: [String: TriggerDefinition] = [:]
+    /// Triggers added or dropped this transaction whose catalog row needs a
+    /// write-back (value = the raw SQL text, or nil for a drop).
+    var triggerWrites: [String: String?] = [:]
+    /// Handle last persisted (nil = record not on disk yet).
+    var handleBaselines: [TreeKey: TreeHandle?] = [:]
+    /// AUTOINCREMENT high-water marks touched this transaction.
+    var sequences: [UInt32: UInt64] = [:]
+    var sequenceBaselines: [UInt32: UInt64] = [:]
+    /// Transient per-transaction cache of the largest rowid for a plain
+    /// (non-AUTOINCREMENT) rowid table, so an ascending insert run allocates
+    /// `cached + 1` instead of an O(depth) `move(.last)` probe every row. NOT
+    /// serialized — re-derived from the tree on first use each transaction;
+    /// value-typed, so `TxnRestorePoint` restores it for free on a group-commit
+    /// rollback. Invalidated on delete (the max may be gone → reuse, matching SQLite).
+    var maxRowidCache: [UInt32: Int64] = [:]
+    /// Set by DDL: bump catalogVersion at serialization.
+    var schemaDirty = false
 
-  var schema: Schema {
-    Schema(
-      catalogVersion: version.catalogVersion,
-      tables: tableRecords.mapValues(\.definition),
-      indexes: indexRecords.mapValues(\.definition),
-      ftsTables: ftsRecords.mapValues(\.definition),
-      triggers: triggerRecords)
-  }
+    var schema: Schema {
+        Schema(
+            catalogVersion: version.catalogVersion,
+            tables: tableRecords.mapValues(\.definition),
+            indexes: indexRecords.mapValues(\.definition),
+            ftsTables: ftsRecords.mapValues(\.definition),
+            triggers: triggerRecords)
+    }
 
-  func tableName(for id: UInt32) -> String? {
-    tableRecords.first { $0.value.tableId == id }?.key
-  }
+    func tableName(for id: UInt32) -> String? {
+        tableRecords.first { $0.value.tableId == id }?.key
+    }
 }
 
 enum Relation {
-  // MARK: - Byte-array bridges over BTree (typed-throws-safe)
+    // MARK: - Byte-array bridges over BTree (typed-throws-safe)
 
-  static func putBytes(
-    _ ctx: TxnContext, _ tree: inout TreeHandle, key: [UInt8], value: [UInt8]
-  ) throws(DBError) {
-    var failure: DBError?
-    key.withUnsafeBytes { keyBytes in
-      value.withUnsafeBytes { valueBytes in
-        do throws(DBError) {
-          unsafe try BTree.put(ctx: ctx, tree: &tree, key: keyBytes, value: valueBytes)
-        } catch {
-          failure = error
+    static func putBytes(
+        _ ctx: TxnContext, _ tree: inout TreeHandle, key: [UInt8], value: [UInt8]
+    ) throws(DBError) {
+        var failure: DBError?
+        key.withUnsafeBytes { keyBytes in
+            value.withUnsafeBytes { valueBytes in
+                do throws(DBError) {
+                    unsafe try BTree.put(ctx: ctx, tree: &tree, key: keyBytes, value: valueBytes)
+                } catch {
+                    failure = error
+                }
+            }
         }
-      }
+        if let failure { throw failure }
     }
-    if let failure { throw failure }
-  }
 
-  /// Table-tree put for an ascending, caller-guaranteed-maximal rowid key, routed
-  /// through the warm rightmost-leaf append cache (`BTree.appendMax`). Equivalent
-  /// to `putBytes` but skips the per-row root→leaf descent + COW shadow when the
-  /// cell fits the cached leaf; any ineligibility falls through to the proven put.
-  static func putRowAppend(
-    _ ctx: TxnContext, _ tree: inout TreeHandle, tableId: UInt32, key: [UInt8], value: [UInt8]
-  ) throws(DBError) {
-    var cache = ctx.appendCache[tableId]
-    var failure: DBError?
-    key.withUnsafeBytes { keyBytes in
-      value.withUnsafeBytes { valueBytes in
-        do throws(DBError) {
-          unsafe try BTree.appendMax(
-            ctx: ctx, tree: &tree, key: keyBytes, value: valueBytes, cache: &cache)
-        } catch {
-          failure = error
+    /// Table-tree put for an ascending, caller-guaranteed-maximal rowid key, routed
+    /// through the warm rightmost-leaf append cache (`BTree.appendMax`). Equivalent
+    /// to `putBytes` but skips the per-row root→leaf descent + COW shadow when the
+    /// cell fits the cached leaf; any ineligibility falls through to the proven put.
+    static func putRowAppend(
+        _ ctx: TxnContext, _ tree: inout TreeHandle, tableId: UInt32, key: [UInt8], value: [UInt8]
+    ) throws(DBError) {
+        var cache = ctx.appendCache[tableId]
+        var failure: DBError?
+        key.withUnsafeBytes { keyBytes in
+            value.withUnsafeBytes { valueBytes in
+                do throws(DBError) {
+                    unsafe try BTree.appendMax(
+                        ctx: ctx, tree: &tree, key: keyBytes, value: valueBytes, cache: &cache)
+                } catch {
+                    failure = error
+                }
+            }
         }
-      }
+        ctx.appendCache[tableId] = cache
+        if let failure { throw failure }
     }
-    ctx.appendCache[tableId] = cache
-    if let failure { throw failure }
-  }
 
-  @discardableResult
-  static func deleteBytes(
-    _ ctx: TxnContext, _ tree: inout TreeHandle, key: [UInt8]
-  ) throws(DBError) -> Bool {
-    var result: Result<Bool, DBError> = .success(false)
-    key.withUnsafeBytes { keyBytes in
-      do throws(DBError) {
-        result = unsafe .success(try BTree.delete(ctx: ctx, tree: &tree, key: keyBytes))
-      } catch {
-        result = .failure(error)
-      }
-    }
-    return try result.get()
-  }
-
-  /// Zero-copy point read: looks up `key` and hands its value to `body` as a
-  /// mapped page span (no record copy); returns nil when the key is absent.
-  /// The span is valid only for the duration of `body`.
-  static func withRowValue<R>(
-    _ resolver: some PageResolver, _ tree: TreeHandle, key: [UInt8],
-    _ body: (BTree.ValueRef) throws(DBError) -> R
-  ) throws(DBError) -> R? {
-    var result: Result<R?, DBError> = .success(nil)
-    key.withUnsafeBytes { keyBytes in
-      do throws(DBError) {
-        if let ref = unsafe try BTree.get(resolver: resolver, tree: tree, key: keyBytes) {
-          result = .success(try body(ref))
+    @discardableResult
+    static func deleteBytes(
+        _ ctx: TxnContext, _ tree: inout TreeHandle, key: [UInt8]
+    ) throws(DBError) -> Bool {
+        var result: Result<Bool, DBError> = .success(false)
+        key.withUnsafeBytes { keyBytes in
+            do throws(DBError) {
+                result = unsafe .success(try BTree.delete(ctx: ctx, tree: &tree, key: keyBytes))
+            } catch {
+                result = .failure(error)
+            }
         }
-      } catch {
-        result = .failure(error)
-      }
+        return try result.get()
     }
-    return try result.get()
-  }
 
-  static func getBytes(
-    _ resolver: some PageResolver, _ tree: TreeHandle, key: [UInt8]
-  ) throws(DBError) -> [UInt8]? {
-    var result: Result<[UInt8]?, DBError> = .success(nil)
-    key.withUnsafeBytes { keyBytes in
-      do throws(DBError) {
-        guard let ref = unsafe try BTree.get(resolver: resolver, tree: tree, key: keyBytes) else {
-          return
+    /// Zero-copy point read: looks up `key` and hands its value to `body` as a
+    /// mapped page span (no record copy); returns nil when the key is absent.
+    /// The span is valid only for the duration of `body`.
+    static func withRowValue<R>(
+        _ resolver: some PageResolver, _ tree: TreeHandle, key: [UInt8],
+        _ body: (BTree.ValueRef) throws(DBError) -> R
+    ) throws(DBError) -> R? {
+        var result: Result<R?, DBError> = .success(nil)
+        key.withUnsafeBytes { keyBytes in
+            do throws(DBError) {
+                if let ref = unsafe try BTree.get(resolver: resolver, tree: tree, key: keyBytes) {
+                    result = .success(try body(ref))
+                }
+            } catch {
+                result = .failure(error)
+            }
         }
-        result = .success(try BTree.copyValue(ref, resolver: resolver))
-      } catch {
-        result = .failure(error)
-      }
+        return try result.get()
     }
-    return try result.get()
-  }
 
-  // MARK: - State lifecycle
-
-  /// Loads the full catalog from a snapshot's main tree.
-  static func loadState(
-    resolver: some PageResolver, mainTree: TreeHandle
-  ) throws(DBError) -> RelationState {
-    var state = RelationState(version: Catalog.VersionRow())
-    if let versionBytes = try getBytes(resolver, mainTree, key: Catalog.versionKey) {
-      var decoded: Result<Catalog.VersionRow, DBError> = .success(Catalog.VersionRow())
-      versionBytes.withUnsafeBytes { raw in
-        do throws(DBError) { decoded = unsafe .success(try Catalog.decodeVersion(raw)) } catch {
-          decoded = .failure(error)
+    static func getBytes(
+        _ resolver: some PageResolver, _ tree: TreeHandle, key: [UInt8]
+    ) throws(DBError) -> [UInt8]? {
+        var result: Result<[UInt8]?, DBError> = .success(nil)
+        key.withUnsafeBytes { keyBytes in
+            do throws(DBError) {
+                guard let ref = unsafe try BTree.get(resolver: resolver, tree: tree, key: keyBytes) else {
+                    return
+                }
+                result = .success(try BTree.copyValue(ref, resolver: resolver))
+            } catch {
+                result = .failure(error)
+            }
         }
-      }
-      state.version = try decoded.get()
+        return try result.get()
     }
 
-    // Tables first (index records resolve table names through them).
-    unsafe try scanKind(resolver, mainTree, kind: Catalog.kindTable) { name, valueBytes throws(DBError) in
-      let record = unsafe try Catalog.decodeTable(valueBytes, name: name)
-      state.tableRecords[name] = record
-      state.handleBaselines[.table(record.tableId)] = record.handle
-    }
-    unsafe try scanKind(resolver, mainTree, kind: Catalog.kindIndex) { name, valueBytes throws(DBError) in
-      let record = unsafe try Catalog.decodeIndex(valueBytes, name: name)
-      state.indexRecords[name] = record
-      state.handleBaselines[.index(record.indexId)] = record.handle
-    }
-    unsafe try scanKind(resolver, mainTree, kind: Catalog.kindFTS) { name, valueBytes throws(DBError) in
-      let record = unsafe try Catalog.decodeFTS(valueBytes, name: name)
-      state.ftsRecords[name] = record
-      state.handleBaselines[.ftsDict(record.ftsId)] = record.dict
-      state.handleBaselines[.ftsPostings(record.ftsId)] = record.postings
-      state.handleBaselines[.ftsStats(record.ftsId)] = record.stats
-    }
-    // Triggers are stored as raw CREATE TRIGGER text and re-parsed here (like
-    // SQLite's sqlite_schema). A stored row that already round-tripped through
-    // the parser at create time re-parses cleanly; corruption surfaces as a
-    // catchable DBError, not a trap.
-    unsafe try scanKind(resolver, mainTree, kind: Catalog.kindTrigger) { name, valueBytes throws(DBError) in
-      let text = unsafe String(decoding: valueBytes, as: UTF8.self)
-      state.triggerRecords[name] = try parseTriggerText(text, expectedName: name)
-    }
-    return state
-  }
+    // MARK: - State lifecycle
 
-  /// Re-parses a stored CREATE TRIGGER text into a `TriggerDefinition`,
-  /// verifying the name matches its catalog key.
-  static func parseTriggerText(
-    _ text: String, expectedName: String
-  ) throws(DBError) -> TriggerDefinition {
-    guard case .createTrigger(let create) = try SQLParser.parseOne(text) else {
-      throw DBError.integrityFailure("catalog: trigger \(expectedName) text is not CREATE TRIGGER")
-    }
-    guard create.definition.name == expectedName else {
-      throw DBError.integrityFailure(
-        "catalog: trigger name \(create.definition.name) ≠ key \(expectedName)")
-    }
-    return create.definition
-  }
-
-  private static func scanKind(
-    _ resolver: some PageResolver, _ mainTree: TreeHandle, kind: UInt8,
-    _ body: (String, UnsafeRawBufferPointer) throws(DBError) -> Void
-  ) throws(DBError) {
-    let (lower, upper) = Catalog.kindBounds(kind)
-    var cursor = Cursor(resolver: resolver, tree: mainTree)
-    var positioned = false
-    var failure: DBError?
-    lower.withUnsafeBytes { raw in
-      do throws(DBError) {
-        _ = unsafe try cursor.seek(raw)
-        positioned = cursor.isValid
-      } catch {
-        failure = error
-      }
-    }
-    if let failure { throw failure }
-    while positioned {
-      let proceed: Bool? = unsafe try cursor.withCurrent { (key, ref) throws(DBError) in
-        guard key.count >= 2, unsafe key[0] == Catalog.prefix, unsafe key[1] == kind else { return false }
-        _ = upper
-        let name = unsafe String(decoding: key[2...], as: UTF8.self)
-        guard case .inline(let valueBytes) = ref else {
-          // Catalog records are small; an overflow value means corruption.
-          throw DBError.integrityFailure("catalog record \(name) not inline")
+    /// Loads the full catalog from a snapshot's main tree.
+    static func loadState(
+        resolver: some PageResolver, mainTree: TreeHandle
+    ) throws(DBError) -> RelationState {
+        var state = RelationState(version: Catalog.VersionRow())
+        if let versionBytes = try getBytes(resolver, mainTree, key: Catalog.versionKey) {
+            var decoded: Result<Catalog.VersionRow, DBError> = .success(Catalog.VersionRow())
+            versionBytes.withUnsafeBytes { raw in
+                do throws(DBError) { decoded = unsafe .success(try Catalog.decodeVersion(raw)) } catch {
+                    decoded = .failure(error)
+                }
+            }
+            state.version = try decoded.get()
         }
-        try valueBytes.withUnsafeBytes { (raw) throws(DBError) in unsafe try body(name, raw) }
-        return true
-      }
-      guard proceed == true else { break }
-      positioned = try cursor.next()
-    }
-  }
 
-  /// Populates `ctx.relation` from the transaction's snapshot if needed.
-  @discardableResult
-  static func ensureState(_ ctx: TxnContext) throws(DBError) -> RelationState {
-    if let state = ctx.relation { return state }
-    let state = try loadState(resolver: ctx, mainTree: ctx.meta.mainTree)
-    ctx.relation = state
-    return state
-  }
-
-  // MARK: - Commit-time write-back
-
-  /// Persists changed handles, sequences, and the version row into catalog
-  /// rows. Runs after the user body (requestEpoch must be 0) and strictly
-  /// before `FreeList.serialize`.
-  static func serializeState(ctx: TxnContext) throws(DBError) {
-    try flushAllFTS(ctx)  // F6f: flush buffered FTS docs into the trees before serializing handles.
-    guard var state = ctx.relation else { return }
-    var main = ctx.meta.mainTree
-
-    for name in state.tableRecords.keys.sorted() {
-      let record = state.tableRecords[name]!
-      let key = TreeKey.table(record.tableId)
-      if state.handleBaselines[key] != record.handle {
-        try putBytes(ctx, &main, key: Catalog.tableKey(name), value: Catalog.encode(record))
-        state.handleBaselines[key] = record.handle
-      }
-    }
-    for name in state.indexRecords.keys.sorted() {
-      let record = state.indexRecords[name]!
-      let key = TreeKey.index(record.indexId)
-      if state.handleBaselines[key] != record.handle {
-        try putBytes(ctx, &main, key: Catalog.indexKey(name), value: Catalog.encode(record))
-        state.handleBaselines[key] = record.handle
-      }
-    }
-    for name in state.ftsRecords.keys.sorted() {
-      let record = state.ftsRecords[name]!
-      let dictKey = TreeKey.ftsDict(record.ftsId)
-      let postKey = TreeKey.ftsPostings(record.ftsId)
-      let statsKey = TreeKey.ftsStats(record.ftsId)
-      if state.handleBaselines[dictKey] != record.dict
-        || state.handleBaselines[postKey] != record.postings
-        || state.handleBaselines[statsKey] != record.stats {
-        try putBytes(ctx, &main, key: Catalog.ftsKey(name), value: Catalog.encode(record))
-        state.handleBaselines[dictKey] = record.dict
-        state.handleBaselines[postKey] = record.postings
-        state.handleBaselines[statsKey] = record.stats
-      }
-    }
-    for name in state.triggerWrites.keys.sorted() {
-      let pending = state.triggerWrites[name]!
-      if let text = pending {
-        try putBytes(ctx, &main, key: Catalog.triggerKey(name), value: Array(text.utf8))
-      } else {
-        try deleteBytes(ctx, &main, key: Catalog.triggerKey(name))
-      }
-    }
-    state.triggerWrites.removeAll(keepingCapacity: false)
-    for tableId in state.sequences.keys.sorted() {
-      let value = state.sequences[tableId]!
-      if state.sequenceBaselines[tableId] != value {
-        var bytes: [UInt8] = []
-        withUnsafeBytes(of: value.littleEndian) { unsafe bytes.append(contentsOf: $0) }
-        try putBytes(ctx, &main, key: Catalog.sequenceKey(tableId), value: bytes)
-        state.sequenceBaselines[tableId] = value
-      }
-    }
-    if state.schemaDirty {
-      state.version.catalogVersion += 1
-      try putBytes(ctx, &main, key: Catalog.versionKey, value: Catalog.encode(state.version))
-      state.schemaDirty = false
+        // Tables first (index records resolve table names through them).
+        unsafe try scanKind(resolver, mainTree, kind: Catalog.kindTable) { name, valueBytes throws(DBError) in
+            let record = unsafe try Catalog.decodeTable(valueBytes, name: name)
+            state.tableRecords[name] = record
+            state.handleBaselines[.table(record.tableId)] = record.handle
+        }
+        unsafe try scanKind(resolver, mainTree, kind: Catalog.kindIndex) { name, valueBytes throws(DBError) in
+            let record = unsafe try Catalog.decodeIndex(valueBytes, name: name)
+            state.indexRecords[name] = record
+            state.handleBaselines[.index(record.indexId)] = record.handle
+        }
+        unsafe try scanKind(resolver, mainTree, kind: Catalog.kindFTS) { name, valueBytes throws(DBError) in
+            let record = unsafe try Catalog.decodeFTS(valueBytes, name: name)
+            state.ftsRecords[name] = record
+            state.handleBaselines[.ftsDict(record.ftsId)] = record.dict
+            state.handleBaselines[.ftsPostings(record.ftsId)] = record.postings
+            state.handleBaselines[.ftsStats(record.ftsId)] = record.stats
+        }
+        // Triggers are stored as raw CREATE TRIGGER text and re-parsed here (like
+        // SQLite's sqlite_schema). A stored row that already round-tripped through
+        // the parser at create time re-parses cleanly; corruption surfaces as a
+        // catchable DBError, not a trap.
+        unsafe try scanKind(resolver, mainTree, kind: Catalog.kindTrigger) { name, valueBytes throws(DBError) in
+            let text = unsafe String(decoding: valueBytes, as: UTF8.self)
+            state.triggerRecords[name] = try parseTriggerText(text, expectedName: name)
+        }
+        return state
     }
 
-    ctx.meta.mainTree = main
-    ctx.relation = state
-  }
+    /// Re-parses a stored CREATE TRIGGER text into a `TriggerDefinition`,
+    /// verifying the name matches its catalog key.
+    static func parseTriggerText(
+        _ text: String, expectedName: String
+    ) throws(DBError) -> TriggerDefinition {
+        guard case .createTrigger(let create) = try SQLParser.parseOne(text) else {
+            throw DBError.integrityFailure("catalog: trigger \(expectedName) text is not CREATE TRIGGER")
+        }
+        guard create.definition.name == expectedName else {
+            throw DBError.integrityFailure(
+                "catalog: trigger name \(create.definition.name) ≠ key \(expectedName)")
+        }
+        return create.definition
+    }
 
-  // MARK: - DDL
+    private static func scanKind(
+        _ resolver: some PageResolver, _ mainTree: TreeHandle, kind: UInt8,
+        _ body: (String, UnsafeRawBufferPointer) throws(DBError) -> Void
+    ) throws(DBError) {
+        let (lower, upper) = Catalog.kindBounds(kind)
+        var cursor = Cursor(resolver: resolver, tree: mainTree)
+        var positioned = false
+        var failure: DBError?
+        lower.withUnsafeBytes { raw in
+            do throws(DBError) {
+                _ = unsafe try cursor.seek(raw)
+                positioned = cursor.isValid
+            } catch {
+                failure = error
+            }
+        }
+        if let failure { throw failure }
+        while positioned {
+            let proceed: Bool? = unsafe try cursor.withCurrent { (key, ref) throws(DBError) in
+                guard key.count >= 2, unsafe key[0] == Catalog.prefix, unsafe key[1] == kind else { return false }
+                _ = upper
+                let name = unsafe String(decoding: key[2...], as: UTF8.self)
+                guard case .inline(let valueBytes) = ref else {
+                    // Catalog records are small; an overflow value means corruption.
+                    throw DBError.integrityFailure("catalog record \(name) not inline")
+                }
+                try valueBytes.withUnsafeBytes { (raw) throws(DBError) in unsafe try body(name, raw) }
+                return true
+            }
+            guard proceed == true else { break }
+            positioned = try cursor.next()
+        }
+    }
 
-  static func createTable(_ ctx: TxnContext, _ definition: TableDefinition) throws(DBError) {
-    try definition.validate()
-    var state = try ensureState(ctx)
-    guard state.tableRecords[definition.name] == nil, state.ftsRecords[definition.name] == nil else {
-      throw DBError.tableExists(definition.name)
+    /// Populates `ctx.relation` from the transaction's snapshot if needed.
+    @discardableResult
+    static func ensureState(_ ctx: TxnContext) throws(DBError) -> RelationState {
+        if let state = ctx.relation { return state }
+        let state = try loadState(resolver: ctx, mainTree: ctx.meta.mainTree)
+        ctx.relation = state
+        return state
     }
-    guard definition.name.utf8.count <= 255 else {
-      throw DBError.invalidDefinition("table name too long")
-    }
-    for fk in definition.foreignKeys {
-      guard fk.parentTable == definition.name || state.tableRecords[fk.parentTable] != nil else {
-        throw DBError.noSuchTable(fk.parentTable)
-      }
-    }
-    let id = state.version.nextTableId
-    state.version.nextTableId += 1
-    state.tableRecords[definition.name] = Catalog.TableRecord(
-      tableId: id, handle: .empty, definition: definition)
-    state.handleBaselines[.table(id)] = nil as TreeHandle?
-    state.schemaDirty = true
-    ctx.relation = state
-  }
 
-  /// Creates an FTS virtual table: a catalog record owning three (initially
-  /// empty) B+trees. Roots are allocated lazily on first write (F2), exactly
-  /// like a table/index handle. No indexing here — F0 is foundations only.
-  static func createVirtualTable(_ ctx: TxnContext, _ definition: FTSDefinition) throws(DBError) {
-    var state = try ensureState(ctx)
-    guard state.tableRecords[definition.name] == nil, state.ftsRecords[definition.name] == nil else {
-      throw DBError.tableExists(definition.name)
-    }
-    guard definition.name.utf8.count <= 255 else {
-      throw DBError.invalidDefinition("virtual table name too long")
-    }
-    guard !definition.columns.isEmpty else {
-      throw DBError.invalidDefinition("fts5 table \(definition.name) has no columns")
-    }
-    for column in definition.columns where column.utf8.count > 255 {
-      throw DBError.invalidDefinition("fts5 table \(definition.name): column name too long")
-    }
-    for token in definition.tokenize where token.utf8.count > 255 {
-      throw DBError.invalidDefinition("fts5 table \(definition.name): tokenizer argument too long")
-    }
-    if case .external(let table, let rowid) = definition.content {
-      guard table.utf8.count <= 255, rowid.utf8.count <= 255 else {
-        throw DBError.invalidDefinition(
-          "fts5 table \(definition.name): content table/rowid name too long")
-      }
-    }
-    let id = state.version.nextTableId
-    state.version.nextTableId += 1
-    state.ftsRecords[definition.name] = Catalog.FTSRecord(
-      ftsId: id, dict: .empty, postings: .empty, stats: .empty, definition: definition)
-    state.handleBaselines[.ftsDict(id)] = nil as TreeHandle?
-    state.handleBaselines[.ftsPostings(id)] = nil as TreeHandle?
-    state.handleBaselines[.ftsStats(id)] = nil as TreeHandle?
-    state.schemaDirty = true
-    ctx.relation = state
-  }
+    // MARK: - Commit-time write-back
 
-  static func dropTable(_ ctx: TxnContext, name: String) throws(DBError) {
-    var state = try ensureState(ctx)
-    guard let record = state.tableRecords[name] else {
-      // `DROP TABLE` also removes an FTS virtual table.
-      if state.ftsRecords[name] != nil { return try dropVirtualTable(ctx, name: name) }
-      throw DBError.noSuchTable(name)
-    }
-    // Another table referencing this one blocks the drop.
-    for (otherName, other) in state.tableRecords where otherName != name {
-      if other.definition.foreignKeys.contains(where: { $0.parentTable == name }) {
-        throw DBError.foreignKeyViolation(table: otherName)
-      }
-    }
-    var main = ctx.meta.mainTree
+    /// Persists changed handles, sequences, and the version row into catalog
+    /// rows. Runs after the user body (requestEpoch must be 0) and strictly
+    /// before `FreeList.serialize`.
+    static func serializeState(ctx: TxnContext) throws(DBError) {
+        try flushAllFTS(ctx)  // F6f: flush buffered FTS docs into the trees before serializing handles.
+        guard var state = ctx.relation else { return }
+        var main = ctx.meta.mainTree
 
-    let ownIndexes = state.indexRecords.filter { $0.value.tableId == record.tableId }
-    for (indexName, indexRecord) in ownIndexes.sorted(by: { $0.key < $1.key }) {
-      try freeTree(ctx, handle: indexRecord.handle)
-      try deleteBytes(ctx, &main, key: Catalog.indexKey(indexName))
-      state.indexRecords.removeValue(forKey: indexName)
-      state.handleBaselines.removeValue(forKey: .index(indexRecord.indexId))
-    }
-    try freeTree(ctx, handle: record.handle)
-    try deleteBytes(ctx, &main, key: Catalog.tableKey(name))
-    try deleteBytes(ctx, &main, key: Catalog.sequenceKey(record.tableId))
-    state.tableRecords.removeValue(forKey: name)
-    state.handleBaselines.removeValue(forKey: .table(record.tableId))
-    state.sequences.removeValue(forKey: record.tableId)
-    state.sequenceBaselines.removeValue(forKey: record.tableId)
-    state.maxRowidCache.removeValue(forKey: record.tableId)
-    // Triggers on this table go with it (SQLite drops dependent triggers).
-    for triggerName in state.triggerRecords.keys.sorted()
-    where state.triggerRecords[triggerName]!.table == name {
-      state.triggerRecords.removeValue(forKey: triggerName)
-      state.triggerWrites[triggerName] = nil as String?
-    }
-    state.schemaDirty = true
-    ctx.hoistedRoster.removeAll(keepingCapacity: true)
+        for name in state.tableRecords.keys.sorted() {
+            let record = state.tableRecords[name]!
+            let key = TreeKey.table(record.tableId)
+            if state.handleBaselines[key] != record.handle {
+                try putBytes(ctx, &main, key: Catalog.tableKey(name), value: Catalog.encode(record))
+                state.handleBaselines[key] = record.handle
+            }
+        }
+        for name in state.indexRecords.keys.sorted() {
+            let record = state.indexRecords[name]!
+            let key = TreeKey.index(record.indexId)
+            if state.handleBaselines[key] != record.handle {
+                try putBytes(ctx, &main, key: Catalog.indexKey(name), value: Catalog.encode(record))
+                state.handleBaselines[key] = record.handle
+            }
+        }
+        for name in state.ftsRecords.keys.sorted() {
+            let record = state.ftsRecords[name]!
+            let dictKey = TreeKey.ftsDict(record.ftsId)
+            let postKey = TreeKey.ftsPostings(record.ftsId)
+            let statsKey = TreeKey.ftsStats(record.ftsId)
+            if state.handleBaselines[dictKey] != record.dict
+                || state.handleBaselines[postKey] != record.postings
+                || state.handleBaselines[statsKey] != record.stats
+            {
+                try putBytes(ctx, &main, key: Catalog.ftsKey(name), value: Catalog.encode(record))
+                state.handleBaselines[dictKey] = record.dict
+                state.handleBaselines[postKey] = record.postings
+                state.handleBaselines[statsKey] = record.stats
+            }
+        }
+        for name in state.triggerWrites.keys.sorted() {
+            let pending = state.triggerWrites[name]!
+            if let text = pending {
+                try putBytes(ctx, &main, key: Catalog.triggerKey(name), value: Array(text.utf8))
+            } else {
+                try deleteBytes(ctx, &main, key: Catalog.triggerKey(name))
+            }
+        }
+        state.triggerWrites.removeAll(keepingCapacity: false)
+        for tableId in state.sequences.keys.sorted() {
+            let value = state.sequences[tableId]!
+            if state.sequenceBaselines[tableId] != value {
+                var bytes: [UInt8] = []
+                withUnsafeBytes(of: value.littleEndian) { unsafe bytes.append(contentsOf: $0) }
+                try putBytes(ctx, &main, key: Catalog.sequenceKey(tableId), value: bytes)
+                state.sequenceBaselines[tableId] = value
+            }
+        }
+        if state.schemaDirty {
+            state.version.catalogVersion += 1
+            try putBytes(ctx, &main, key: Catalog.versionKey, value: Catalog.encode(state.version))
+            state.schemaDirty = false
+        }
 
-    ctx.meta.mainTree = main
-    ctx.relation = state
-  }
+        ctx.meta.mainTree = main
+        ctx.relation = state
+    }
 
-  /// Drops an FTS virtual table and frees the three trees it owns.
-  static func dropVirtualTable(_ ctx: TxnContext, name: String) throws(DBError) {
-    var state = try ensureState(ctx)
-    guard let record = state.ftsRecords[name] else { throw DBError.noSuchTable(name) }
-    var main = ctx.meta.mainTree
-    try freeTree(ctx, handle: record.dict)
-    try freeTree(ctx, handle: record.postings)
-    try freeTree(ctx, handle: record.stats)
-    try deleteBytes(ctx, &main, key: Catalog.ftsKey(name))
-    state.ftsRecords.removeValue(forKey: name)
-    state.handleBaselines.removeValue(forKey: .ftsDict(record.ftsId))
-    state.handleBaselines.removeValue(forKey: .ftsPostings(record.ftsId))
-    state.handleBaselines.removeValue(forKey: .ftsStats(record.ftsId))
-    state.schemaDirty = true
-    ctx.meta.mainTree = main
-    ctx.relation = state
-  }
+    // MARK: - DDL
 
-  // MARK: - Triggers (M5/F5)
+    static func createTable(_ ctx: TxnContext, _ definition: TableDefinition) throws(DBError) {
+        try definition.validate()
+        var state = try ensureState(ctx)
+        guard state.tableRecords[definition.name] == nil, state.ftsRecords[definition.name] == nil else {
+            throw DBError.tableExists(definition.name)
+        }
+        guard definition.name.utf8.count <= 255 else {
+            throw DBError.invalidDefinition("table name too long")
+        }
+        for fk in definition.foreignKeys {
+            guard fk.parentTable == definition.name || state.tableRecords[fk.parentTable] != nil else {
+                throw DBError.noSuchTable(fk.parentTable)
+            }
+        }
+        let id = state.version.nextTableId
+        state.version.nextTableId += 1
+        state.tableRecords[definition.name] = Catalog.TableRecord(
+            tableId: id, handle: .empty, definition: definition)
+        state.handleBaselines[.table(id)] = nil as TreeHandle?
+        state.schemaDirty = true
+        ctx.relation = state
+    }
 
-  /// Registers a trigger: validates its name (unique across the table/index/
-  /// fts/trigger namespace) and its target (an existing base table), then
-  /// records it for write-back as raw CREATE TRIGGER text. No firing here —
-  /// the DML path looks triggers up by (table, event) when rows change.
-  static func createTrigger(_ ctx: TxnContext, _ definition: TriggerDefinition) throws(DBError) {
-    var state = try ensureState(ctx)
-    guard definition.name.utf8.count <= 255 else {
-      throw DBError.invalidDefinition("trigger name too long")
+    /// Creates an FTS virtual table: a catalog record owning three (initially
+    /// empty) B+trees. Roots are allocated lazily on first write (F2), exactly
+    /// like a table/index handle. No indexing here — F0 is foundations only.
+    static func createVirtualTable(_ ctx: TxnContext, _ definition: FTSDefinition) throws(DBError) {
+        var state = try ensureState(ctx)
+        guard state.tableRecords[definition.name] == nil, state.ftsRecords[definition.name] == nil else {
+            throw DBError.tableExists(definition.name)
+        }
+        guard definition.name.utf8.count <= 255 else {
+            throw DBError.invalidDefinition("virtual table name too long")
+        }
+        guard !definition.columns.isEmpty else {
+            throw DBError.invalidDefinition("fts5 table \(definition.name) has no columns")
+        }
+        for column in definition.columns where column.utf8.count > 255 {
+            throw DBError.invalidDefinition("fts5 table \(definition.name): column name too long")
+        }
+        for token in definition.tokenize where token.utf8.count > 255 {
+            throw DBError.invalidDefinition("fts5 table \(definition.name): tokenizer argument too long")
+        }
+        if case .external(let table, let rowid) = definition.content {
+            guard table.utf8.count <= 255, rowid.utf8.count <= 255 else {
+                throw DBError.invalidDefinition(
+                    "fts5 table \(definition.name): content table/rowid name too long")
+            }
+        }
+        let id = state.version.nextTableId
+        state.version.nextTableId += 1
+        state.ftsRecords[definition.name] = Catalog.FTSRecord(
+            ftsId: id, dict: .empty, postings: .empty, stats: .empty, definition: definition)
+        state.handleBaselines[.ftsDict(id)] = nil as TreeHandle?
+        state.handleBaselines[.ftsPostings(id)] = nil as TreeHandle?
+        state.handleBaselines[.ftsStats(id)] = nil as TreeHandle?
+        state.schemaDirty = true
+        ctx.relation = state
     }
-    guard state.triggerRecords[definition.name] == nil else {
-      throw DBError.triggerExists(definition.name)
-    }
-    // Shared schema namespace (SQLite keeps triggers alongside tables/indexes).
-    guard state.tableRecords[definition.name] == nil,
-      state.indexRecords[definition.name] == nil,
-      state.ftsRecords[definition.name] == nil else {
-      throw DBError.invalidDefinition(
-        "object named \(definition.name) already exists")
-    }
-    guard state.tableRecords[definition.table] != nil else {
-      if state.ftsRecords[definition.table] != nil {
-        throw DBError.invalidDefinition("cannot create trigger on virtual table \(definition.table)")
-      }
-      throw DBError.noSuchTable(definition.table)
-    }
-    state.triggerRecords[definition.name] = definition
-    state.triggerWrites[definition.name] = definition.sql
-    state.schemaDirty = true
-    ctx.relation = state
-  }
 
-  static func dropTrigger(_ ctx: TxnContext, name: String) throws(DBError) {
-    var state = try ensureState(ctx)
-    guard state.triggerRecords[name] != nil else { throw DBError.noSuchTrigger(name) }
-    state.triggerRecords.removeValue(forKey: name)
-    state.triggerWrites[name] = nil as String?
-    state.schemaDirty = true
-    ctx.relation = state
-  }
+    static func dropTable(_ ctx: TxnContext, name: String) throws(DBError) {
+        var state = try ensureState(ctx)
+        guard let record = state.tableRecords[name] else {
+            // `DROP TABLE` also removes an FTS virtual table.
+            if state.ftsRecords[name] != nil { return try dropVirtualTable(ctx, name: name) }
+            throw DBError.noSuchTable(name)
+        }
+        // Another table referencing this one blocks the drop.
+        for (otherName, other) in state.tableRecords where otherName != name {
+            if other.definition.foreignKeys.contains(where: { $0.parentTable == name }) {
+                throw DBError.foreignKeyViolation(table: otherName)
+            }
+        }
+        var main = ctx.meta.mainTree
 
-  /// Single-record catalog fetches (read paths avoid full catalog loads).
-  static func tableRecord(
-    _ resolver: some PageResolver, mainTree: TreeHandle, name: String
-  ) throws(DBError) -> Catalog.TableRecord? {
-    guard let bytes = try getBytes(resolver, mainTree, key: Catalog.tableKey(name)) else {
-      return nil
-    }
-    var result: Result<Catalog.TableRecord, DBError> = .failure(.noSuchTable(name))
-    bytes.withUnsafeBytes { raw in
-      do throws(DBError) {
-        result = unsafe .success(try Catalog.decodeTable(raw, name: name))
-      } catch {
-        result = .failure(error)
-      }
-    }
-    return try result.get()
-  }
+        let ownIndexes = state.indexRecords.filter { $0.value.tableId == record.tableId }
+        for (indexName, indexRecord) in ownIndexes.sorted(by: { $0.key < $1.key }) {
+            try freeTree(ctx, handle: indexRecord.handle)
+            try deleteBytes(ctx, &main, key: Catalog.indexKey(indexName))
+            state.indexRecords.removeValue(forKey: indexName)
+            state.handleBaselines.removeValue(forKey: .index(indexRecord.indexId))
+        }
+        try freeTree(ctx, handle: record.handle)
+        try deleteBytes(ctx, &main, key: Catalog.tableKey(name))
+        try deleteBytes(ctx, &main, key: Catalog.sequenceKey(record.tableId))
+        state.tableRecords.removeValue(forKey: name)
+        state.handleBaselines.removeValue(forKey: .table(record.tableId))
+        state.sequences.removeValue(forKey: record.tableId)
+        state.sequenceBaselines.removeValue(forKey: record.tableId)
+        state.maxRowidCache.removeValue(forKey: record.tableId)
+        // Triggers on this table go with it (SQLite drops dependent triggers).
+        for triggerName in state.triggerRecords.keys.sorted()
+        where state.triggerRecords[triggerName]!.table == name {
+            state.triggerRecords.removeValue(forKey: triggerName)
+            state.triggerWrites[triggerName] = nil as String?
+        }
+        state.schemaDirty = true
+        ctx.hoistedRoster.removeAll(keepingCapacity: true)
 
-  static func indexRecord(
-    _ resolver: some PageResolver, mainTree: TreeHandle, name: String
-  ) throws(DBError) -> Catalog.IndexRecord? {
-    guard let bytes = try getBytes(resolver, mainTree, key: Catalog.indexKey(name)) else {
-      return nil
+        ctx.meta.mainTree = main
+        ctx.relation = state
     }
-    var result: Result<Catalog.IndexRecord, DBError> = .failure(.noSuchIndex(name))
-    bytes.withUnsafeBytes { raw in
-      do throws(DBError) {
-        result = unsafe .success(try Catalog.decodeIndex(raw, name: name))
-      } catch {
-        result = .failure(error)
-      }
-    }
-    return try result.get()
-  }
 
-  /// Single-record FTS catalog fetch (the read path resolves an FTS table's
-  /// dictionary/postings/stats roots without a full catalog load), mirroring
-  /// `tableRecord`/`indexRecord`. nil when the FTS table is absent.
-  static func ftsRecord(
-    _ resolver: some PageResolver, mainTree: TreeHandle, name: String
-  ) throws(DBError) -> Catalog.FTSRecord? {
-    guard let bytes = try getBytes(resolver, mainTree, key: Catalog.ftsKey(name)) else {
-      return nil
+    /// Drops an FTS virtual table and frees the three trees it owns.
+    static func dropVirtualTable(_ ctx: TxnContext, name: String) throws(DBError) {
+        var state = try ensureState(ctx)
+        guard let record = state.ftsRecords[name] else { throw DBError.noSuchTable(name) }
+        var main = ctx.meta.mainTree
+        try freeTree(ctx, handle: record.dict)
+        try freeTree(ctx, handle: record.postings)
+        try freeTree(ctx, handle: record.stats)
+        try deleteBytes(ctx, &main, key: Catalog.ftsKey(name))
+        state.ftsRecords.removeValue(forKey: name)
+        state.handleBaselines.removeValue(forKey: .ftsDict(record.ftsId))
+        state.handleBaselines.removeValue(forKey: .ftsPostings(record.ftsId))
+        state.handleBaselines.removeValue(forKey: .ftsStats(record.ftsId))
+        state.schemaDirty = true
+        ctx.meta.mainTree = main
+        ctx.relation = state
     }
-    var result: Result<Catalog.FTSRecord, DBError> = .failure(.noSuchTable(name))
-    bytes.withUnsafeBytes { raw in
-      do throws(DBError) {
-        result = unsafe .success(try Catalog.decodeFTS(raw, name: name))
-      } catch {
-        result = .failure(error)
-      }
-    }
-    return try result.get()
-  }
 
-  /// Returns every page of a tree (nodes + overflow) to the transaction.
-  static func freeTree(_ ctx: TxnContext, handle: TreeHandle) throws(DBError) {
-    guard handle.rootPage != 0 else { return }
-    let report = try BTree.validate(resolver: ctx, tree: handle)
-    for page in report.reachablePages.sorted() {
-      ctx.freePage(page)
+    // MARK: - Triggers (M5/F5)
+
+    /// Registers a trigger: validates its name (unique across the table/index/
+    /// fts/trigger namespace) and its target (an existing base table), then
+    /// records it for write-back as raw CREATE TRIGGER text. No firing here —
+    /// the DML path looks triggers up by (table, event) when rows change.
+    static func createTrigger(_ ctx: TxnContext, _ definition: TriggerDefinition) throws(DBError) {
+        var state = try ensureState(ctx)
+        guard definition.name.utf8.count <= 255 else {
+            throw DBError.invalidDefinition("trigger name too long")
+        }
+        guard state.triggerRecords[definition.name] == nil else {
+            throw DBError.triggerExists(definition.name)
+        }
+        // Shared schema namespace (SQLite keeps triggers alongside tables/indexes).
+        guard state.tableRecords[definition.name] == nil,
+            state.indexRecords[definition.name] == nil,
+            state.ftsRecords[definition.name] == nil
+        else {
+            throw DBError.invalidDefinition(
+                "object named \(definition.name) already exists")
+        }
+        guard state.tableRecords[definition.table] != nil else {
+            if state.ftsRecords[definition.table] != nil {
+                throw DBError.invalidDefinition("cannot create trigger on virtual table \(definition.table)")
+            }
+            throw DBError.noSuchTable(definition.table)
+        }
+        state.triggerRecords[definition.name] = definition
+        state.triggerWrites[definition.name] = definition.sql
+        state.schemaDirty = true
+        ctx.relation = state
     }
-  }
+
+    static func dropTrigger(_ ctx: TxnContext, name: String) throws(DBError) {
+        var state = try ensureState(ctx)
+        guard state.triggerRecords[name] != nil else { throw DBError.noSuchTrigger(name) }
+        state.triggerRecords.removeValue(forKey: name)
+        state.triggerWrites[name] = nil as String?
+        state.schemaDirty = true
+        ctx.relation = state
+    }
+
+    /// Single-record catalog fetches (read paths avoid full catalog loads).
+    static func tableRecord(
+        _ resolver: some PageResolver, mainTree: TreeHandle, name: String
+    ) throws(DBError) -> Catalog.TableRecord? {
+        guard let bytes = try getBytes(resolver, mainTree, key: Catalog.tableKey(name)) else {
+            return nil
+        }
+        var result: Result<Catalog.TableRecord, DBError> = .failure(.noSuchTable(name))
+        bytes.withUnsafeBytes { raw in
+            do throws(DBError) {
+                result = unsafe .success(try Catalog.decodeTable(raw, name: name))
+            } catch {
+                result = .failure(error)
+            }
+        }
+        return try result.get()
+    }
+
+    static func indexRecord(
+        _ resolver: some PageResolver, mainTree: TreeHandle, name: String
+    ) throws(DBError) -> Catalog.IndexRecord? {
+        guard let bytes = try getBytes(resolver, mainTree, key: Catalog.indexKey(name)) else {
+            return nil
+        }
+        var result: Result<Catalog.IndexRecord, DBError> = .failure(.noSuchIndex(name))
+        bytes.withUnsafeBytes { raw in
+            do throws(DBError) {
+                result = unsafe .success(try Catalog.decodeIndex(raw, name: name))
+            } catch {
+                result = .failure(error)
+            }
+        }
+        return try result.get()
+    }
+
+    /// Single-record FTS catalog fetch (the read path resolves an FTS table's
+    /// dictionary/postings/stats roots without a full catalog load), mirroring
+    /// `tableRecord`/`indexRecord`. nil when the FTS table is absent.
+    static func ftsRecord(
+        _ resolver: some PageResolver, mainTree: TreeHandle, name: String
+    ) throws(DBError) -> Catalog.FTSRecord? {
+        guard let bytes = try getBytes(resolver, mainTree, key: Catalog.ftsKey(name)) else {
+            return nil
+        }
+        var result: Result<Catalog.FTSRecord, DBError> = .failure(.noSuchTable(name))
+        bytes.withUnsafeBytes { raw in
+            do throws(DBError) {
+                result = unsafe .success(try Catalog.decodeFTS(raw, name: name))
+            } catch {
+                result = .failure(error)
+            }
+        }
+        return try result.get()
+    }
+
+    /// Returns every page of a tree (nodes + overflow) to the transaction.
+    static func freeTree(_ ctx: TxnContext, handle: TreeHandle) throws(DBError) {
+        guard handle.rootPage != 0 else { return }
+        let report = try BTree.validate(resolver: ctx, tree: handle)
+        for page in report.reachablePages.sorted() {
+            ctx.freePage(page)
+        }
+    }
 }

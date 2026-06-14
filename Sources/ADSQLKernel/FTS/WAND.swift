@@ -55,86 +55,86 @@
 /// (`classify` returns nil), preserving correctness while WAND speeds the common
 /// case. The fallback decision is made before any pruning, at query time.
 enum FTSWAND {
-  // MARK: - Eligibility
+    // MARK: - Eligibility
 
-  /// How a WAND-eligible query's single-term leaves combine.
-  enum Combination { case and, or }
+    /// How a WAND-eligible query's single-term leaves combine.
+    enum Combination { case and, or }
 
-  /// The positive single-term leaves of a WAND-eligible query and their
-  /// combination, or nil if the query falls back (a phrase, prefix, NOT operand,
-  /// or column filter appears). Terms are the raw query words; the caller
-  /// tokenizes them with the table tokenizer exactly as the scorer does.
-  struct Eligible {
-    var terms: [String]
-    var op: Combination
-  }
-
-  static func classify(_ query: FTSQuery) -> Eligible? {
-    switch query {
-    case .phrase(let text, let prefix):
-      // A prefix leaf (`term*`) expands to many dictionary terms with a
-      // union-derived IDF (no tight single-block bound); a multi-word phrase
-      // (`"a b"`) needs positions/adjacency, not an AND of its words. Both fall
-      // back. A multi-word phrase carries internal whitespace; reject it upfront
-      // (the runtime also rejects any term that does not tokenize to one stem).
-      if prefix || text.contains(where: { $0 == " " || $0 == "\t" || $0 == "\n" || $0 == "\r" }) {
-        return nil
-      }
-      return Eligible(terms: [text], op: .or)
-    case .and(let lhs, let rhs):
-      return merge(classify(lhs), classify(rhs), as: .and)
-    case .or(let lhs, let rhs):
-      return merge(classify(lhs), classify(rhs), as: .or)
-    case .not, .column:
-      // NOT operands never score (exclusion); column filters narrow the weight
-      // set per leaf. Both complicate the block bound — fall back.
-      return nil
+    /// The positive single-term leaves of a WAND-eligible query and their
+    /// combination, or nil if the query falls back (a phrase, prefix, NOT operand,
+    /// or column filter appears). Terms are the raw query words; the caller
+    /// tokenizes them with the table tokenizer exactly as the scorer does.
+    struct Eligible {
+        var terms: [String]
+        var op: Combination
     }
-  }
 
-  /// Combines two eligible sub-results under `op`, requiring both sides eligible
-  /// and the SAME combination throughout (no AND/OR mixing — kept simple and
-  /// provably correct; a mixed tree falls back).
-  private static func merge(_ lhs: Eligible?, _ rhs: Eligible?, as op: Combination) -> Eligible? {
-    guard let lhs, let rhs else { return nil }
-    if lhs.terms.count > 1, lhs.op != op { return nil }
-    if rhs.terms.count > 1, rhs.op != op { return nil }
-    return Eligible(terms: lhs.terms + rhs.terms, op: op)
-  }
+    static func classify(_ query: FTSQuery) -> Eligible? {
+        switch query {
+        case .phrase(let text, let prefix):
+            // A prefix leaf (`term*`) expands to many dictionary terms with a
+            // union-derived IDF (no tight single-block bound); a multi-word phrase
+            // (`"a b"`) needs positions/adjacency, not an AND of its words. Both fall
+            // back. A multi-word phrase carries internal whitespace; reject it upfront
+            // (the runtime also rejects any term that does not tokenize to one stem).
+            if prefix || text.contains(where: { $0 == " " || $0 == "\t" || $0 == "\n" || $0 == "\r" }) {
+                return nil
+            }
+            return Eligible(terms: [text], op: .or)
+        case .and(let lhs, let rhs):
+            return merge(classify(lhs), classify(rhs), as: .and)
+        case .or(let lhs, let rhs):
+            return merge(classify(lhs), classify(rhs), as: .or)
+        case .not, .column:
+            // NOT operands never score (exclusion); column filters narrow the weight
+            // set per leaf. Both complicate the block bound — fall back.
+            return nil
+        }
+    }
 
-  // MARK: - Entry point
+    /// Combines two eligible sub-results under `op`, requiring both sides eligible
+    /// and the SAME combination throughout (no AND/OR mixing — kept simple and
+    /// provably correct; a mixed tree falls back).
+    private static func merge(_ lhs: Eligible?, _ rhs: Eligible?, as op: Combination) -> Eligible? {
+        guard let lhs, let rhs else { return nil }
+        if lhs.terms.count > 1, lhs.op != op { return nil }
+        if rhs.terms.count > 1, rhs.op != op { return nil }
+        return Eligible(terms: lhs.terms + rhs.terms, op: op)
+    }
 
-  /// Attempts block-max WAND for the top-`k` of `query` against `record`,
-  /// returning the top-k `(docid, score)` (unordered — the executor's bounded
-  /// top-N re-applies the full ORDER BY) or **nil to fall back** to the score-all
-  /// path. nil is returned whenever WAND is inapplicable (an ineligible query
-  /// shape, degenerate stats, or a term that does not resolve to a single stem),
-  /// so the caller always has a correct path. An empty non-nil array means the
-  /// query legitimately matched nothing.
-  ///
-  /// `weights` must already be padded to the FTS column count; `global` is the
-  /// corpus aggregate fetched once by the caller.
-  static func topK<R: PageResolver>(
-    query: FTSQuery, record: Catalog.FTSRecord, resolver: R,
-    weights: [Double], global: FTSGlobalStats, k: Int
-  ) throws(DBError) -> [(docid: Int64, score: Double)]? {
-    guard k >= 1, let eligible = classify(query) else { return nil }
-    return try FTSWANDTopK.run(
-      eligible: eligible, query: query, record: record, resolver: resolver,
-      weights: weights, global: global, k: k)
-  }
+    // MARK: - Entry point
 
-  // MARK: - Bound math
+    /// Attempts block-max WAND for the top-`k` of `query` against `record`,
+    /// returning the top-k `(docid, score)` (unordered — the executor's bounded
+    /// top-N re-applies the full ORDER BY) or **nil to fall back** to the score-all
+    /// path. nil is returned whenever WAND is inapplicable (an ineligible query
+    /// shape, degenerate stats, or a term that does not resolve to a single stem),
+    /// so the caller always has a correct path. An empty non-nil array means the
+    /// query legitimately matched nothing.
+    ///
+    /// `weights` must already be padded to the FTS column count; `global` is the
+    /// corpus aggregate fetched once by the caller.
+    static func topK<R: PageResolver>(
+        query: FTSQuery, record: Catalog.FTSRecord, resolver: R,
+        weights: [Double], global: FTSGlobalStats, k: Int
+    ) throws(DBError) -> [(docid: Int64, score: Double)]? {
+        guard k >= 1, let eligible = classify(query) else { return nil }
+        return try FTSWANDTopK.run(
+            eligible: eligible, query: query, record: record, resolver: resolver,
+            weights: weights, global: global, k: k)
+    }
 
-  /// The admissible per-block score bound `f(maxWeight·maxTotalTF, dMin)` (see the
-  /// type doc). 0 when the block holds no term occurrences (maxTotalTF == 0) or
-  /// the weight is 0 — that block can never contribute.
-  static func blockBound(
-    idf: Double, maxTotalTF: UInt32, maxWeight: Double, avgdl: Double, dMin: Double
-  ) -> Double {
-    guard maxTotalTF > 0, maxWeight > 0, avgdl > 0 else { return 0 }
-    let wfUB = maxWeight * Double(maxTotalTF)
-    let lengthNorm = FTSScorer.k1 * (1 - FTSScorer.b + FTSScorer.b * dMin / avgdl)
-    return idf * wfUB * (FTSScorer.k1 + 1) / (wfUB + lengthNorm)
-  }
+    // MARK: - Bound math
+
+    /// The admissible per-block score bound `f(maxWeight·maxTotalTF, dMin)` (see the
+    /// type doc). 0 when the block holds no term occurrences (maxTotalTF == 0) or
+    /// the weight is 0 — that block can never contribute.
+    static func blockBound(
+        idf: Double, maxTotalTF: UInt32, maxWeight: Double, avgdl: Double, dMin: Double
+    ) -> Double {
+        guard maxTotalTF > 0, maxWeight > 0, avgdl > 0 else { return 0 }
+        let wfUB = maxWeight * Double(maxTotalTF)
+        let lengthNorm = FTSScorer.k1 * (1 - FTSScorer.b + FTSScorer.b * dMin / avgdl)
+        return idf * wfUB * (FTSScorer.k1 + 1) / (wfUB + lengthNorm)
+    }
 }

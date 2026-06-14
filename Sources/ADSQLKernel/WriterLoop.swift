@@ -10,158 +10,158 @@ import Synchronization
 /// Callers resume only after their data is durable per the database's
 /// profile — a returned `write` IS a committed write.
 extension Database {
-  struct PendingWrite: @unchecked Sendable {
-    /// Runs the user body against the shared context. On success returns a
-    /// completion taking the eventual commit outcome (nil = committed); on
-    /// a body throw the request resumes itself and returns nil.
-    let attempt: (TxnContext) -> ((DBError?) -> Void)?
-    /// Fails the request without ever running its body.
-    let fail: (DBError) -> Void
-  }
+    struct PendingWrite: @unchecked Sendable {
+        /// Runs the user body against the shared context. On success returns a
+        /// completion taking the eventual commit outcome (nil = committed); on
+        /// a body throw the request resumes itself and returns nil.
+        let attempt: (TxnContext) -> ((DBError?) -> Void)?
+        /// Fails the request without ever running its body.
+        let fail: (DBError) -> Void
+    }
 
-  /// Submits a write transaction for group commit.
-  public func write<R: Sendable>(
-    _ body: @escaping @Sendable (borrowing WriteTxn) throws(DBError) -> R
-  ) async throws(DBError) -> R {
-    guard !options.readOnly else { throw DBError.readOnlyDatabase }
-    let outcome: Result<R, DBError> = await withCheckedContinuation { continuation in
-      enqueue(
-        PendingWrite(
-          attempt: { ctx in
-            do throws(DBError) {
-              let txn = WriteTxn(ctx: ctx)
-              let value = try body(txn)
-              return { commitError in
-                continuation.resume(
-                  returning: commitError.map { .failure($0) } ?? .success(value))
-              }
-            } catch {
-              continuation.resume(returning: .failure(error))
-              return nil
+    /// Submits a write transaction for group commit.
+    public func write<R: Sendable>(
+        _ body: @escaping @Sendable (borrowing WriteTxn) throws(DBError) -> R
+    ) async throws(DBError) -> R {
+        guard !options.readOnly else { throw DBError.readOnlyDatabase }
+        let outcome: Result<R, DBError> = await withCheckedContinuation { continuation in
+            enqueue(
+                PendingWrite(
+                    attempt: { ctx in
+                        do throws(DBError) {
+                            let txn = WriteTxn(ctx: ctx)
+                            let value = try body(txn)
+                            return { commitError in
+                                continuation.resume(
+                                    returning: commitError.map { .failure($0) } ?? .success(value))
+                            }
+                        } catch {
+                            continuation.resume(returning: .failure(error))
+                            return nil
+                        }
+                    },
+                    fail: { error in
+                        continuation.resume(returning: .failure(error))
+                    }))
+        }
+        return try outcome.get()
+    }
+
+    func enqueue(_ item: PendingWrite) {
+        let scheduleDrain: Bool = pendingWrites.withLock { queue in
+            queue.append(item)
+            return queue.count == 1
+        }
+        if scheduleDrain {
+            writerThread.async { [self] in drainPendingWrites() }
+        }
+    }
+
+    /// Runs on the serial writer queue (mutually exclusive with `writeSync`).
+    private func drainPendingWrites() {
+        let maxBatchRequests = 128
+
+        while true {
+            let batch: [PendingWrite] = pendingWrites.withLock { queue in
+                let take = min(queue.count, maxBatchRequests)
+                let slice = Array(queue.prefix(take))
+                queue.removeFirst(take)
+                return slice
             }
-          },
-          fail: { error in
-            continuation.resume(returning: .failure(error))
-          }))
-    }
-    return try outcome.get()
-  }
+            if batch.isEmpty { return }
 
-  func enqueue(_ item: PendingWrite) {
-    let scheduleDrain: Bool = pendingWrites.withLock { queue in
-      queue.append(item)
-      return queue.count == 1
-    }
-    if scheduleDrain {
-      writerThread.async { [self] in drainPendingWrites() }
-    }
-  }
+            readerTable.sweepStaleSlots()
+            let foreignMin = readerTable.minimumGeneration() ?? UInt64.max
+            let snapshot: (Meta, UInt64)? = shared.withLock { state in
+                guard !state.closed else { return nil }
+                let localMin = state.readers.keys.min() ?? UInt64.max
+                return (state.meta, state.meta.reclaimLimit(minReader: min(localMin, foreignMin)))
+            }
+            guard let (meta, reclaimLimit) = snapshot else {
+                for item in batch { item.fail(.databaseClosed) }
+                continue
+            }
 
-  /// Runs on the serial writer queue (mutually exclusive with `writeSync`).
-  private func drainPendingWrites() {
-    let maxBatchRequests = 128
+            let ctx = TxnContext(source: pager, meta: meta)
+            ctx.appendCursorEnabled = options.execution.insert == .appendCursor
+            ctx.insertHoistEnabled = options.execution.insert == .hoisted
+            do throws(DBError) {
+                try FreeList.harvest(ctx: ctx, upTo: reclaimLimit)
+            } catch {
+                for item in batch { item.fail(error) }
+                continue
+            }
+            let baselineMain = ctx.meta.mainTree
 
-    while true {
-      let batch: [PendingWrite] = pendingWrites.withLock { queue in
-        let take = min(queue.count, maxBatchRequests)
-        let slice = Array(queue.prefix(take))
-        queue.removeFirst(take)
-        return slice
-      }
-      if batch.isEmpty { return }
+            var completions: [(DBError?) -> Void] = []
+            for item in batch {
+                let restore = TxnRestorePoint(ctx: ctx)
+                ctx.beginRequestScope()
+                if let completion = item.attempt(ctx) {
+                    completions.append(completion)
+                } else {
+                    ctx.rollbackRequestScope()
+                    restore.apply(to: ctx)
+                }
+            }
+            // Leave request scoping before catalog/free-list serialization.
+            ctx.requestEpoch = 0
+            if ctx.relation != nil {
+                do throws(DBError) {
+                    try Relation.serializeState(ctx: ctx)
+                } catch {
+                    for completion in completions { completion(error) }
+                    continue
+                }
+            }
 
-      readerTable.sweepStaleSlots()
-      let foreignMin = readerTable.minimumGeneration() ?? UInt64.max
-      let snapshot: (Meta, UInt64)? = shared.withLock { state in
-        guard !state.closed else { return nil }
-        let localMin = state.readers.keys.min() ?? UInt64.max
-        return (state.meta, state.meta.reclaimLimit(minReader: min(localMin, foreignMin)))
-      }
-      guard let (meta, reclaimLimit) = snapshot else {
-        for item in batch { item.fail(.databaseClosed) }
-        continue
-      }
+            if completions.isEmpty { continue }
+            // Read-only batch: nothing to persist, nothing to sync.
+            if ctx.meta.mainTree == baselineMain && ctx.pendingFree.isEmpty && ctx.dirty.isEmpty {
+                for completion in completions { completion(nil) }
+                continue
+            }
 
-      let ctx = TxnContext(source: pager, meta: meta)
-      ctx.appendCursorEnabled = options.execution.insert == .appendCursor
-      ctx.insertHoistEnabled = options.execution.insert == .hoisted
-      do throws(DBError) {
-        try FreeList.harvest(ctx: ctx, upTo: reclaimLimit)
-      } catch {
-        for item in batch { item.fail(error) }
-        continue
-      }
-      let baselineMain = ctx.meta.mainTree
-
-      var completions: [(DBError?) -> Void] = []
-      for item in batch {
-        let restore = TxnRestorePoint(ctx: ctx)
-        ctx.beginRequestScope()
-        if let completion = item.attempt(ctx) {
-          completions.append(completion)
-        } else {
-          ctx.rollbackRequestScope()
-          restore.apply(to: ctx)
+            do throws(DBError) {
+                try FreeList.serialize(ctx: ctx)
+                guard Int(ctx.allocator.highWater) * Format.pageSize <= options.maxMapSize else {
+                    throw DBError.mapFull
+                }
+                let newMeta = try Committer.commit(
+                    ctx: ctx, channel: channel, durability: options.durability)
+                shared.withLock { $0.meta = newMeta }
+                if let state = ctx.relation { relationSchemaCache.publish(state.schema) }
+                for completion in completions { completion(nil) }
+            } catch {
+                for completion in completions { completion(error) }
+            }
         }
-      }
-      // Leave request scoping before catalog/free-list serialization.
-      ctx.requestEpoch = 0
-      if ctx.relation != nil {
-        do throws(DBError) {
-          try Relation.serializeState(ctx: ctx)
-        } catch {
-          for completion in completions { completion(error) }
-          continue
-        }
-      }
-
-      if completions.isEmpty { continue }
-      // Read-only batch: nothing to persist, nothing to sync.
-      if ctx.meta.mainTree == baselineMain && ctx.pendingFree.isEmpty && ctx.dirty.isEmpty {
-        for completion in completions { completion(nil) }
-        continue
-      }
-
-      do throws(DBError) {
-        try FreeList.serialize(ctx: ctx)
-        guard Int(ctx.allocator.highWater) * Format.pageSize <= options.maxMapSize else {
-          throw DBError.mapFull
-        }
-        let newMeta = try Committer.commit(
-          ctx: ctx, channel: channel, durability: options.durability)
-        shared.withLock { $0.meta = newMeta }
-        if let state = ctx.relation { relationSchemaCache.publish(state.schema) }
-        for completion in completions { completion(nil) }
-      } catch {
-        for completion in completions { completion(error) }
-      }
     }
-  }
 }
 
 /// Cheap rollback point for one stacked micro-transaction.
 struct TxnRestorePoint {
-  let meta: Meta
-  let pendingFree: [UInt64]
-  let pool: [UInt64]
-  let highWater: UInt64
-  let relation: RelationState?
+    let meta: Meta
+    let pendingFree: [UInt64]
+    let pool: [UInt64]
+    let highWater: UInt64
+    let relation: RelationState?
 
-  init(ctx: TxnContext) {
-    self.meta = ctx.meta
-    self.pendingFree = ctx.pendingFree
-    self.pool = ctx.allocator.pool
-    self.highWater = ctx.allocator.highWater
-    self.relation = ctx.relation
-  }
+    init(ctx: TxnContext) {
+        self.meta = ctx.meta
+        self.pendingFree = ctx.pendingFree
+        self.pool = ctx.allocator.pool
+        self.highWater = ctx.allocator.highWater
+        self.relation = ctx.relation
+    }
 
-  /// Restores scalar state; page buffers are restored by
-  /// `TxnContext.rollbackRequestScope()`.
-  func apply(to ctx: TxnContext) {
-    ctx.meta = meta
-    ctx.pendingFree = pendingFree
-    ctx.allocator.pool = pool
-    ctx.allocator.highWater = highWater
-    ctx.relation = relation
-  }
+    /// Restores scalar state; page buffers are restored by
+    /// `TxnContext.rollbackRequestScope()`.
+    func apply(to ctx: TxnContext) {
+        ctx.meta = meta
+        ctx.pendingFree = pendingFree
+        ctx.allocator.pool = pool
+        ctx.allocator.highWater = highWater
+        ctx.relation = relation
+    }
 }

@@ -14,39 +14,39 @@ import ADSQL
 /// so the matrix grows with the program and never silently measures a fallback
 /// as if it were the real strategy.
 enum StrategyBench {
-  /// Implemented join strategies to sweep (extend with `.merge`/`.auto` in H4).
-  static let joins: [(label: String, value: ExecutionOptions.Join)] = [
-    ("nestedLoop", .nestedLoop),
-    ("hash", .hash),
-    ("merge", .merge),
-    ("auto", .auto),
-  ]
-  /// Implemented evaluator strategies to sweep (extend with `.vdbe` in H6).
-  static let evaluators: [(label: String, value: ExecutionOptions.Evaluator)] = [
-    ("treeWalk", .treeWalk),
-    ("compiled", .compiledClosures),
-  ]
+    /// Implemented join strategies to sweep (extend with `.merge`/`.auto` in H4).
+    static let joins: [(label: String, value: ExecutionOptions.Join)] = [
+        ("nestedLoop", .nestedLoop),
+        ("hash", .hash),
+        ("merge", .merge),
+        ("auto", .auto),
+    ]
+    /// Implemented evaluator strategies to sweep (extend with `.vdbe` in H6).
+    static let evaluators: [(label: String, value: ExecutionOptions.Evaluator)] = [
+        ("treeWalk", .treeWalk),
+        ("compiled", .compiledClosures),
+    ]
 
-  static func run(engines: [String], dir: String, config: BenchConfig) throws {
-    print(
-      "strategy matrix — join×eval over the sql scenario "
-        + "(rows=\(config.rows), point-gets=\(config.pointGets)); "
-        + "accuracy/integrity/etc. gated by the test suites")
+    static func run(engines: [String], dir: String, config: BenchConfig) throws {
+        print(
+            "strategy matrix — join×eval over the sql scenario "
+                + "(rows=\(config.rows), point-gets=\(config.pointGets)); "
+                + "accuracy/integrity/etc. gated by the test suites")
 
-    if engines.contains("sqlite") {
-      print("\n-- sqlite (external baseline) --")
-      try SQLScenario.run("sqlite", dir: dir, config: config)
+        if engines.contains("sqlite") {
+            print("\n-- sqlite (external baseline) --")
+            try SQLScenario.run("sqlite", dir: dir, config: config)
+        }
+        guard engines.contains("adsql") else { return }
+
+        for join in joins {
+            for evaluator in evaluators {
+                var combo = config
+                combo.joinStrategy = join.value
+                combo.evaluator = evaluator.value
+                print("\n-- adsql [join=\(join.label) eval=\(evaluator.label)] --")
+                try SQLScenario.run("adsql", dir: dir, config: combo)
+            }
+        }
     }
-    guard engines.contains("adsql") else { return }
-
-    for join in joins {
-      for evaluator in evaluators {
-        var combo = config
-        combo.joinStrategy = join.value
-        combo.evaluator = evaluator.value
-        print("\n-- adsql [join=\(join.label) eval=\(evaluator.label)] --")
-        try SQLScenario.run("adsql", dir: dir, config: combo)
-      }
-    }
-  }
 }

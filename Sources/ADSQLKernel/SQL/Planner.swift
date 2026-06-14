@@ -15,443 +15,449 @@
 
 /// A lower/upper bound expression plus whether it includes the endpoint.
 struct BoundExpr: Sendable {
-  let expr: SQLExpr
-  let inclusive: Bool
+    let expr: SQLExpr
+    let inclusive: Bool
 }
 
 enum Trailing: Sendable {
-  case range(lower: BoundExpr?, upper: BoundExpr?)
+    case range(lower: BoundExpr?, upper: BoundExpr?)
 }
 
 /// One index range: equality values for the leading columns plus an optional
 /// range on the next column.
 struct IndexProbe: Sendable {
-  let equality: [SQLExpr]
-  let trailing: Trailing?
+    let equality: [SQLExpr]
+    let trailing: Trailing?
 }
 
 enum AccessPlan: Sendable {
-  case tableScan
-  case rowid([SQLExpr])               // one (eq) or many (IN) rowid probes
-  case index(name: String, probes: [IndexProbe], constraint: String)
-  /// Full-text MATCH on an FTS5 table: the row source is the docid set
-  /// `FTSMatch.evaluate` returns for `query` (a literal/parameter expression),
-  /// not a B+tree scan. `query` is the MATCH right-hand operand. `weights` are
-  /// the bm25() per-column weights the binder captured (empty → all-ones, i.e.
-  /// plain `rank`); the executor pads/truncates them to the FTS column count and
-  /// scores each matching doc with them (F4).
-  case fts(table: String, query: SQLExpr, weights: [Double])
+    case tableScan
+    case rowid([SQLExpr])  // one (eq) or many (IN) rowid probes
+    case index(name: String, probes: [IndexProbe], constraint: String)
+    /// Full-text MATCH on an FTS5 table: the row source is the docid set
+    /// `FTSMatch.evaluate` returns for `query` (a literal/parameter expression),
+    /// not a B+tree scan. `query` is the MATCH right-hand operand. `weights` are
+    /// the bm25() per-column weights the binder captured (empty → all-ones, i.e.
+    /// plain `rank`); the executor pads/truncates them to the FTS column count and
+    /// scores each matching doc with them (F4).
+    case fts(table: String, query: SQLExpr, weights: [Double])
 }
 
 /// The result of planning: the access path plus order analysis.
 struct AccessPlanning: Sendable {
-  let plan: AccessPlan
-  /// The chosen path's natural order satisfies ORDER BY (single contiguous
-  /// range or ≤1 row, all ASC, matching collations).
-  let yieldsOrder: Bool
-  /// Rowid (table) order satisfies ORDER BY — used when an index probe falls
-  /// back to a table scan at execution time.
-  let rowidOrderSatisfiesOrderBy: Bool
-  /// The original WHERE conjuncts this probe satisfies *exactly* (the
-  /// equality-prefix `col = const` / rowid eq / rowid IN). The executor may
-  /// drop them from the residual when it uses the probe (not the scan
-  /// fallback). The trailing range column is never exact, so it is excluded.
-  var coveredConjuncts: [SQLExpr] = []
+    let plan: AccessPlan
+    /// The chosen path's natural order satisfies ORDER BY (single contiguous
+    /// range or ≤1 row, all ASC, matching collations).
+    let yieldsOrder: Bool
+    /// Rowid (table) order satisfies ORDER BY — used when an index probe falls
+    /// back to a table scan at execution time.
+    let rowidOrderSatisfiesOrderBy: Bool
+    /// The original WHERE conjuncts this probe satisfies *exactly* (the
+    /// equality-prefix `col = const` / rowid eq / rowid IN). The executor may
+    /// drop them from the residual when it uses the probe (not the scan
+    /// fallback). The trailing range column is never exact, so it is excluded.
+    var coveredConjuncts: [SQLExpr] = []
 }
 
 enum Planner {
-  // MARK: - Sargable constraints
+    // MARK: - Sargable constraints
 
-  private enum Constraint {
-    case eq(column: Int, value: SQLExpr, source: SQLExpr)
-    case inList(column: Int, values: [SQLExpr], source: SQLExpr)
-    case lower(column: Int, value: SQLExpr, inclusive: Bool)
-    case upper(column: Int, value: SQLExpr, inclusive: Bool)
-  }
-
-  static func plan(
-    where whereExpr: SQLExpr?, orderBy: [SQLOrderingTerm],
-    source: TableBinding, indexes: [IndexDefinition], definition: TableDefinition
-  ) -> AccessPlanning {
-    // An FTS leading table is driven by its MATCH conjunct, not by indexes. The
-    // conjunct is covered (dropped from the residual); the docid set the source
-    // yields is already ascending, so it trivially satisfies any ORDER BY the
-    // executor re-sorts anyway (yieldsOrder stays conservative: false unless no
-    // ORDER BY). Falls through to a full scan if no MATCH is present.
-    if source.isFTS, let whereExpr,
-      let (query, conjunct) = ftsMatchConjunct(whereExpr, source: source) {
-      return AccessPlanning(
-        // Default all-ones weights (`rank`); the binder overlays bm25() weights.
-        plan: .fts(table: source.table, query: query, weights: []),
-        yieldsOrder: orderBy.isEmpty,
-        rowidOrderSatisfiesOrderBy: false,
-        coveredConjuncts: [conjunct])
-    }
-    let constraints = whereExpr.map { extract(conjuncts($0), source: source) } ?? []
-    let rowidOrder = rowidOrderSatisfies(orderBy, source: source)
-
-    // 1. Rowid point / IN (the rowid-alias column).
-    if let aliasIndex = source.rowidAliasIndex {
-      if let eq = firstEquality(constraints, column: aliasIndex) {
-        return AccessPlanning(
-          plan: .rowid([eq.value]), yieldsOrder: true,
-          rowidOrderSatisfiesOrderBy: rowidOrder, coveredConjuncts: [eq.source])
-      }
-      if let inList = firstInList(constraints, column: aliasIndex) {
-        let ordered = inList.values.count <= 1 || orderBy.isEmpty
-        return AccessPlanning(
-          plan: .rowid(inList.values), yieldsOrder: ordered,
-          rowidOrderSatisfiesOrderBy: rowidOrder, coveredConjuncts: [inList.source])
-      }
+    private enum Constraint {
+        case eq(column: Int, value: SQLExpr, source: SQLExpr)
+        case inList(column: Int, values: [SQLExpr], source: SQLExpr)
+        case lower(column: Int, value: SQLExpr, inclusive: Bool)
+        case upper(column: Int, value: SQLExpr, inclusive: Bool)
     }
 
-    // 2. Best index by equality-prefix length, then trailing range, then IN
-    //    on a sole leading column.
-    if let chosen = chooseIndex(
-      constraints, orderBy: orderBy, source: source, indexes: indexes,
-      definition: definition, rowidOrder: rowidOrder)
-    {
-      return chosen
-    }
-
-    // 3. Full scan.
-    return AccessPlanning(
-      plan: .tableScan,
-      yieldsOrder: orderBy.isEmpty || rowidOrder,
-      rowidOrderSatisfiesOrderBy: rowidOrder)
-  }
-
-  /// Index/rowid access for a join's inner table from `inner.col = <outer expr>`
-  /// equalities (the values are evaluated per outer row at execution). Mirrors
-  /// the leading-table equality-prefix logic; order is irrelevant for a probe.
-  /// Returns `.tableScan` when no equality hits the rowid alias or an index.
-  static func planJoin(
-    equalities: [(column: Int, value: SQLExpr, source: SQLExpr)],
-    inner: TableBinding, on: SQLExpr, binding: QueryBinding, innerDepth: Int,
-    indexes: [IndexDefinition], definition: TableDefinition
-  ) -> (plan: AccessPlan, coveredConjuncts: [SQLExpr]) {
-    // An FTS inner table is driven by a MATCH conjunct in its ON clause. MATCH
-    // re-evaluates per outer row here (acceptable for F3c; FTS-first avoids it).
-    if inner.isFTS, let (query, _) = ftsMatchConjunct(on, source: inner) {
-      return (.fts(table: inner.table, query: query, weights: []), [])
-    }
-    guard !equalities.isEmpty else { return (.tableScan, []) }
-    // `source` is the originating ON conjunct (so the binder can test whether the
-    // probe covers the *entire* ON for an existence-only inner — see BoundJoin).
-    let constraints = equalities.map { Constraint.eq(column: $0.column, value: $0.value, source: $0.source) }
-    if let aliasIndex = inner.rowidAliasIndex, let eq = firstEquality(constraints, column: aliasIndex) {
-      return (.rowid([eq.value]), [eq.source])
-    }
-    if let chosen = chooseIndex(
-      constraints, orderBy: [], source: inner, indexes: indexes,
-      definition: definition, rowidOrder: false)
-    {
-      return (chosen.plan, chosen.coveredConjuncts)
-    }
-    return (.tableScan, [])
-  }
-
-  // MARK: - Index selection
-
-  private static func chooseIndex(
-    _ constraints: [Constraint], orderBy: [SQLOrderingTerm],
-    source: TableBinding, indexes: [IndexDefinition], definition: TableDefinition,
-    rowidOrder: Bool
-  ) -> AccessPlanning? {
-    var best: (planning: AccessPlanning, score: Int)?
-
-    for index in indexes.sorted(by: { $0.name < $1.name }) {
-      let columns = index.columns.compactMap { definition.columnIndex(of: $0) }
-      guard columns.count == index.columns.count else { continue }
-
-      // Longest leading equality prefix.
-      var equality: [SQLExpr] = []
-      var covered: [SQLExpr] = []
-      var prefixLen = 0
-      while prefixLen < columns.count, let eq = firstEquality(constraints, column: columns[prefixLen]) {
-        equality.append(eq.value)
-        covered.append(eq.source)
-        prefixLen += 1
-      }
-
-      // Optional trailing range on the column right after the prefix.
-      var trailing: Trailing?
-      var constraintText = equality.indices.map { "\(index.columns[$0])=?" }
-      if prefixLen < columns.count {
-        let rangeColumn = columns[prefixLen]
-        let lower = firstLower(constraints, column: rangeColumn)
-        let upper = firstUpper(constraints, column: rangeColumn)
-        if lower != nil || upper != nil {
-          trailing = .range(lower: lower, upper: upper)
-          constraintText.append("\(index.columns[prefixLen]) range")
-        }
-      }
-
-      // IN on a sole leading column (no equality prefix consumed yet).
-      if prefixLen == 0, trailing == nil, columns.count >= 1,
-        let inList = firstInList(constraints, column: columns[0])
-      {
-        let yields = inList.values.count <= 1 || orderBy.isEmpty
-        let planning = AccessPlanning(
-          plan: .index(
-            name: index.name,
-            probes: inList.values.map { IndexProbe(equality: [$0], trailing: nil) },
-            constraint: "\(index.columns[0]) IN (\(inList.values.count))"),
-          yieldsOrder: yields,
-          rowidOrderSatisfiesOrderBy: rowidOrder,
-          coveredConjuncts: [inList.source])
-        consider(&best, planning, score: 1)
-        continue
-      }
-
-      let hasTrailing = trailing != nil
-      guard prefixLen > 0 || hasTrailing else { continue }
-
-      let yields = indexYieldsOrder(
-        orderBy, columns: columns, prefixConsumed: prefixLen + (hasTrailing ? 1 : 0),
-        source: source, index: index, definition: definition)
-      let planning = AccessPlanning(
-        plan: .index(
-          name: index.name,
-          probes: [IndexProbe(equality: equality, trailing: trailing)],
-          constraint: constraintText.joined(separator: " AND ")),
-        yieldsOrder: orderBy.isEmpty || yields,
-        rowidOrderSatisfiesOrderBy: rowidOrder,
-        coveredConjuncts: covered)
-      // Score: equality columns dominate; a trailing range and uniqueness
-      // break ties.
-      let score = prefixLen * 4 + (hasTrailing ? 2 : 0) + (index.unique ? 1 : 0)
-      consider(&best, planning, score: score)
-    }
-
-    return best?.planning
-  }
-
-  private static func consider(
-    _ best: inout (planning: AccessPlanning, score: Int)?, _ planning: AccessPlanning, score: Int
-  ) {
-    if best.map({ score > $0.score }) ?? true {
-      best = (planning, score)
-    }
-  }
-
-  // MARK: - Order analysis
-
-  /// ORDER BY satisfied by index order: terms (after the consumed prefix
-  /// columns) match the index columns in order, all ascending, with matching
-  /// collations.
-  private static func indexYieldsOrder(
-    _ orderBy: [SQLOrderingTerm], columns: [Int], prefixConsumed: Int,
-    source: TableBinding, index: IndexDefinition, definition: TableDefinition
-  ) -> Bool {
-    guard !orderBy.isEmpty else { return true }
-    guard let terms = orderColumns(orderBy, source: source) else { return false }
-    guard prefixConsumed + terms.count <= columns.count else { return false }
-    for (offset, term) in terms.enumerated() {
-      let indexPosition = prefixConsumed + offset
-      guard term.column == columns[indexPosition], !term.descending else { return false }
-      let columnCollation = definition.columns[columns[indexPosition]].collation
-      guard term.collation == columnCollation else { return false }
-    }
-    return true
-  }
-
-  private static func rowidOrderSatisfies(_ orderBy: [SQLOrderingTerm], source: TableBinding) -> Bool {
-    guard let aliasIndex = source.rowidAliasIndex else { return false }
-    guard let terms = orderColumns(orderBy, source: source), terms.count == 1 else { return false }
-    return terms[0].column == aliasIndex && !terms[0].descending
-  }
-
-  private struct OrderColumn { let column: Int; let descending: Bool; let collation: Collation }
-
-  /// Order terms reduced to (column, direction, collation), or nil if any term
-  /// is not a plain column reference.
-  private static func orderColumns(
-    _ orderBy: [SQLOrderingTerm], source: TableBinding
-  ) -> [OrderColumn]? {
-    var result: [OrderColumn] = []
-    for term in orderBy {
-      var expr = term.expr
-      var collation: Collation?
-      if case .collate(let inner, let explicit) = expr {
-        expr = inner
-        collation = explicit
-      }
-      guard case .column(let qualifier, let name, _) = expr,
-        let column = source.columnIndex(qualifier: qualifier, name: name)
-      else { return nil }
-      result.append(
-        OrderColumn(
-          column: column, descending: term.descending,
-          collation: collation ?? source.columnCollations[column]))
-    }
-    return result
-  }
-
-  // MARK: - Conjunct classification
-
-  private static func conjuncts(_ expr: SQLExpr) -> [SQLExpr] {
-    if case .binary(.and, let lhs, let rhs) = expr {
-      return conjuncts(lhs) + conjuncts(rhs)
-    }
-    return [expr]
-  }
-
-  /// The MATCH conjunct constraining FTS table `source`, as
-  /// `(queryExpr, theWholeConjunct)`. The subject (`lhs` of `<subject> MATCH
-  /// <query>`) is the table itself — written as a bare `tbl` / `alias`, which
-  /// parses to `.column(table: nil, name: <binding>)` (FTS5 syntax). The whole
-  /// `.binary(.match,…)` node is returned so the binder can drop it from the
-  /// residual WHERE/ON. nil if no MATCH names this table.
-  static func ftsMatchConjunct(
-    _ expr: SQLExpr, source: TableBinding
-  ) -> (query: SQLExpr, conjunct: SQLExpr)? {
-    for conjunct in conjuncts(expr) {
-      guard case .binary(.match, let subject, let query) = conjunct else { continue }
-      // `tbl MATCH …` parses the subject as a column reference with no table
-      // qualifier whose name is the binding (alias-or-table), e.g. `f`.
-      if case .column(let qualifier, let name, _) = subject,
-        matchesBinding(qualifier: qualifier, name: name, source: source) {
-        return (query, conjunct)
-      }
-    }
-    return nil
-  }
-
-  /// True when a bare/qualified reference designates the FTS table `source`
-  /// itself (not one of its columns) — the MATCH left operand.
-  private static func matchesBinding(
-    qualifier: String?, name: String, source: TableBinding
-  ) -> Bool {
-    if let qualifier { return qualifier.lowercased() == source.binding }
-    return name.lowercased() == source.binding
-  }
-
-  private static func extract(_ conjuncts: [SQLExpr], source: TableBinding) -> [Constraint] {
-    var constraints: [Constraint] = []
-    for conjunct in conjuncts {
-      switch conjunct {
-      case .binary(let op, let lhs, let rhs) where op.isComparison:
-        if let column = columnReference(lhs, source: source), isConstant(rhs) {
-          appendComparison(op, column: column, value: rhs, flipped: false, source: conjunct, to: &constraints)
-        } else if let column = columnReference(rhs, source: source), isConstant(lhs) {
-          appendComparison(op, column: column, value: lhs, flipped: true, source: conjunct, to: &constraints)
-        }
-      case .inList(let subject, let items, let negated):
-        if !negated, let column = columnReference(subject, source: source),
-          !items.isEmpty, items.allSatisfy(isConstant)
+    static func plan(
+        where whereExpr: SQLExpr?, orderBy: [SQLOrderingTerm],
+        source: TableBinding, indexes: [IndexDefinition], definition: TableDefinition
+    ) -> AccessPlanning {
+        // An FTS leading table is driven by its MATCH conjunct, not by indexes. The
+        // conjunct is covered (dropped from the residual); the docid set the source
+        // yields is already ascending, so it trivially satisfies any ORDER BY the
+        // executor re-sorts anyway (yieldsOrder stays conservative: false unless no
+        // ORDER BY). Falls through to a full scan if no MATCH is present.
+        if source.isFTS, let whereExpr,
+            let (query, conjunct) = ftsMatchConjunct(whereExpr, source: source)
         {
-          constraints.append(.inList(column: column, values: items, source: conjunct))
+            return AccessPlanning(
+                // Default all-ones weights (`rank`); the binder overlays bm25() weights.
+                plan: .fts(table: source.table, query: query, weights: []),
+                yieldsOrder: orderBy.isEmpty,
+                rowidOrderSatisfiesOrderBy: false,
+                coveredConjuncts: [conjunct])
         }
-      default:
-        break
-      }
-    }
-    return constraints
-  }
+        let constraints = whereExpr.map { extract(conjuncts($0), source: source) } ?? []
+        let rowidOrder = rowidOrderSatisfies(orderBy, source: source)
 
-  private static func appendComparison(
-    _ op: SQLBinaryOp, column: Int, value: SQLExpr, flipped: Bool, source: SQLExpr,
-    to constraints: inout [Constraint]
-  ) {
-    // When the column is on the right, the comparison direction flips.
-    let effective: SQLBinaryOp
-    switch (op, flipped) {
-    case (.lt, true): effective = .gt
-    case (.gt, true): effective = .lt
-    case (.le, true): effective = .ge
-    case (.ge, true): effective = .le
-    default: effective = op
-    }
-    switch effective {
-    case .eq: constraints.append(.eq(column: column, value: value, source: source))
-    case .lt: constraints.append(.upper(column: column, value: value, inclusive: false))
-    case .le: constraints.append(.upper(column: column, value: value, inclusive: true))
-    case .gt: constraints.append(.lower(column: column, value: value, inclusive: false))
-    case .ge: constraints.append(.lower(column: column, value: value, inclusive: true))
-    default: break  // != is not sargable
-    }
-  }
+        // 1. Rowid point / IN (the rowid-alias column).
+        if let aliasIndex = source.rowidAliasIndex {
+            if let eq = firstEquality(constraints, column: aliasIndex) {
+                return AccessPlanning(
+                    plan: .rowid([eq.value]), yieldsOrder: true,
+                    rowidOrderSatisfiesOrderBy: rowidOrder, coveredConjuncts: [eq.source])
+            }
+            if let inList = firstInList(constraints, column: aliasIndex) {
+                let ordered = inList.values.count <= 1 || orderBy.isEmpty
+                return AccessPlanning(
+                    plan: .rowid(inList.values), yieldsOrder: ordered,
+                    rowidOrderSatisfiesOrderBy: rowidOrder, coveredConjuncts: [inList.source])
+            }
+        }
 
-  private static func columnReference(_ expr: SQLExpr, source: TableBinding) -> Int? {
-    guard case .column(let qualifier, let name, _) = expr else { return nil }
-    return source.columnIndex(qualifier: qualifier, name: name)
-  }
+        // 2. Best index by equality-prefix length, then trailing range, then IN
+        //    on a sole leading column.
+        if let chosen = chooseIndex(
+            constraints, orderBy: orderBy, source: source, indexes: indexes,
+            definition: definition, rowidOrder: rowidOrder)
+        {
+            return chosen
+        }
 
-  /// An expression with no column references (and no subqueries): evaluable
-  /// from parameters alone at execution time.
-  private static func isConstant(_ expr: SQLExpr) -> Bool {
-    switch expr {
-    case .column, .boundColumn, .scalarSubquery, .inJSONEach, .aggregateResult:
-      return false
-    case .literal, .parameter:
-      return true
-    case .collate(let inner, _), .cast(let inner, _), .unary(_, let inner):
-      return isConstant(inner)
-    case .isNull(let inner, _):
-      return isConstant(inner)
-    case .binary(_, let lhs, let rhs):
-      return isConstant(lhs) && isConstant(rhs)
-    case .like(let subject, let pattern, _):
-      return isConstant(subject) && isConstant(pattern)
-    case .inList(let subject, let items, _):
-      return isConstant(subject) && items.allSatisfy(isConstant)
-    case .caseWhen(let operand, let whens, let elseExpr):
-      return (operand.map(isConstant) ?? true)
-        && whens.allSatisfy { isConstant($0.condition) && isConstant($0.result) }
-        && (elseExpr.map(isConstant) ?? true)
-    case .function(_, let args, _, _):
-      return args.allSatisfy(isConstant)
+        // 3. Full scan.
+        return AccessPlanning(
+            plan: .tableScan,
+            yieldsOrder: orderBy.isEmpty || rowidOrder,
+            rowidOrderSatisfiesOrderBy: rowidOrder)
     }
-  }
 
-  private static func firstEquality(
-    _ constraints: [Constraint], column: Int
-  ) -> (value: SQLExpr, source: SQLExpr)? {
-    for case .eq(let c, let value, let source) in constraints where c == column {
-      return (value, source)
+    /// Index/rowid access for a join's inner table from `inner.col = <outer expr>`
+    /// equalities (the values are evaluated per outer row at execution). Mirrors
+    /// the leading-table equality-prefix logic; order is irrelevant for a probe.
+    /// Returns `.tableScan` when no equality hits the rowid alias or an index.
+    static func planJoin(
+        equalities: [(column: Int, value: SQLExpr, source: SQLExpr)],
+        inner: TableBinding, on: SQLExpr, binding: QueryBinding, innerDepth: Int,
+        indexes: [IndexDefinition], definition: TableDefinition
+    ) -> (plan: AccessPlan, coveredConjuncts: [SQLExpr]) {
+        // An FTS inner table is driven by a MATCH conjunct in its ON clause. MATCH
+        // re-evaluates per outer row here (acceptable for F3c; FTS-first avoids it).
+        if inner.isFTS, let (query, _) = ftsMatchConjunct(on, source: inner) {
+            return (.fts(table: inner.table, query: query, weights: []), [])
+        }
+        guard !equalities.isEmpty else { return (.tableScan, []) }
+        // `source` is the originating ON conjunct (so the binder can test whether the
+        // probe covers the *entire* ON for an existence-only inner — see BoundJoin).
+        let constraints = equalities.map { Constraint.eq(column: $0.column, value: $0.value, source: $0.source) }
+        if let aliasIndex = inner.rowidAliasIndex, let eq = firstEquality(constraints, column: aliasIndex) {
+            return (.rowid([eq.value]), [eq.source])
+        }
+        if let chosen = chooseIndex(
+            constraints, orderBy: [], source: inner, indexes: indexes,
+            definition: definition, rowidOrder: false)
+        {
+            return (chosen.plan, chosen.coveredConjuncts)
+        }
+        return (.tableScan, [])
     }
-    return nil
-  }
-  private static func firstInList(
-    _ constraints: [Constraint], column: Int
-  ) -> (values: [SQLExpr], source: SQLExpr)? {
-    for case .inList(let c, let values, let source) in constraints where c == column {
-      return (values, source)
+
+    // MARK: - Index selection
+
+    private static func chooseIndex(
+        _ constraints: [Constraint], orderBy: [SQLOrderingTerm],
+        source: TableBinding, indexes: [IndexDefinition], definition: TableDefinition,
+        rowidOrder: Bool
+    ) -> AccessPlanning? {
+        var best: (planning: AccessPlanning, score: Int)?
+
+        for index in indexes.sorted(by: { $0.name < $1.name }) {
+            let columns = index.columns.compactMap { definition.columnIndex(of: $0) }
+            guard columns.count == index.columns.count else { continue }
+
+            // Longest leading equality prefix.
+            var equality: [SQLExpr] = []
+            var covered: [SQLExpr] = []
+            var prefixLen = 0
+            while prefixLen < columns.count, let eq = firstEquality(constraints, column: columns[prefixLen]) {
+                equality.append(eq.value)
+                covered.append(eq.source)
+                prefixLen += 1
+            }
+
+            // Optional trailing range on the column right after the prefix.
+            var trailing: Trailing?
+            var constraintText = equality.indices.map { "\(index.columns[$0])=?" }
+            if prefixLen < columns.count {
+                let rangeColumn = columns[prefixLen]
+                let lower = firstLower(constraints, column: rangeColumn)
+                let upper = firstUpper(constraints, column: rangeColumn)
+                if lower != nil || upper != nil {
+                    trailing = .range(lower: lower, upper: upper)
+                    constraintText.append("\(index.columns[prefixLen]) range")
+                }
+            }
+
+            // IN on a sole leading column (no equality prefix consumed yet).
+            if prefixLen == 0, trailing == nil, columns.count >= 1,
+                let inList = firstInList(constraints, column: columns[0])
+            {
+                let yields = inList.values.count <= 1 || orderBy.isEmpty
+                let planning = AccessPlanning(
+                    plan: .index(
+                        name: index.name,
+                        probes: inList.values.map { IndexProbe(equality: [$0], trailing: nil) },
+                        constraint: "\(index.columns[0]) IN (\(inList.values.count))"),
+                    yieldsOrder: yields,
+                    rowidOrderSatisfiesOrderBy: rowidOrder,
+                    coveredConjuncts: [inList.source])
+                consider(&best, planning, score: 1)
+                continue
+            }
+
+            let hasTrailing = trailing != nil
+            guard prefixLen > 0 || hasTrailing else { continue }
+
+            let yields = indexYieldsOrder(
+                orderBy, columns: columns, prefixConsumed: prefixLen + (hasTrailing ? 1 : 0),
+                source: source, index: index, definition: definition)
+            let planning = AccessPlanning(
+                plan: .index(
+                    name: index.name,
+                    probes: [IndexProbe(equality: equality, trailing: trailing)],
+                    constraint: constraintText.joined(separator: " AND ")),
+                yieldsOrder: orderBy.isEmpty || yields,
+                rowidOrderSatisfiesOrderBy: rowidOrder,
+                coveredConjuncts: covered)
+            // Score: equality columns dominate; a trailing range and uniqueness
+            // break ties.
+            let score = prefixLen * 4 + (hasTrailing ? 2 : 0) + (index.unique ? 1 : 0)
+            consider(&best, planning, score: score)
+        }
+
+        return best?.planning
     }
-    return nil
-  }
-  private static func firstLower(_ constraints: [Constraint], column: Int) -> BoundExpr? {
-    for case .lower(let c, let value, let inclusive) in constraints where c == column {
-      return BoundExpr(expr: value, inclusive: inclusive)
+
+    private static func consider(
+        _ best: inout (planning: AccessPlanning, score: Int)?, _ planning: AccessPlanning, score: Int
+    ) {
+        if best.map({ score > $0.score }) ?? true {
+            best = (planning, score)
+        }
     }
-    return nil
-  }
-  private static func firstUpper(_ constraints: [Constraint], column: Int) -> BoundExpr? {
-    for case .upper(let c, let value, let inclusive) in constraints where c == column {
-      return BoundExpr(expr: value, inclusive: inclusive)
+
+    // MARK: - Order analysis
+
+    /// ORDER BY satisfied by index order: terms (after the consumed prefix
+    /// columns) match the index columns in order, all ascending, with matching
+    /// collations.
+    private static func indexYieldsOrder(
+        _ orderBy: [SQLOrderingTerm], columns: [Int], prefixConsumed: Int,
+        source: TableBinding, index: IndexDefinition, definition: TableDefinition
+    ) -> Bool {
+        guard !orderBy.isEmpty else { return true }
+        guard let terms = orderColumns(orderBy, source: source) else { return false }
+        guard prefixConsumed + terms.count <= columns.count else { return false }
+        for (offset, term) in terms.enumerated() {
+            let indexPosition = prefixConsumed + offset
+            guard term.column == columns[indexPosition], !term.descending else { return false }
+            let columnCollation = definition.columns[columns[indexPosition]].collation
+            guard term.collation == columnCollation else { return false }
+        }
+        return true
     }
-    return nil
-  }
+
+    private static func rowidOrderSatisfies(_ orderBy: [SQLOrderingTerm], source: TableBinding) -> Bool {
+        guard let aliasIndex = source.rowidAliasIndex else { return false }
+        guard let terms = orderColumns(orderBy, source: source), terms.count == 1 else { return false }
+        return terms[0].column == aliasIndex && !terms[0].descending
+    }
+
+    private struct OrderColumn {
+        let column: Int
+        let descending: Bool
+        let collation: Collation
+    }
+
+    /// Order terms reduced to (column, direction, collation), or nil if any term
+    /// is not a plain column reference.
+    private static func orderColumns(
+        _ orderBy: [SQLOrderingTerm], source: TableBinding
+    ) -> [OrderColumn]? {
+        var result: [OrderColumn] = []
+        for term in orderBy {
+            var expr = term.expr
+            var collation: Collation?
+            if case .collate(let inner, let explicit) = expr {
+                expr = inner
+                collation = explicit
+            }
+            guard case .column(let qualifier, let name, _) = expr,
+                let column = source.columnIndex(qualifier: qualifier, name: name)
+            else { return nil }
+            result.append(
+                OrderColumn(
+                    column: column, descending: term.descending,
+                    collation: collation ?? source.columnCollations[column]))
+        }
+        return result
+    }
+
+    // MARK: - Conjunct classification
+
+    private static func conjuncts(_ expr: SQLExpr) -> [SQLExpr] {
+        if case .binary(.and, let lhs, let rhs) = expr {
+            return conjuncts(lhs) + conjuncts(rhs)
+        }
+        return [expr]
+    }
+
+    /// The MATCH conjunct constraining FTS table `source`, as
+    /// `(queryExpr, theWholeConjunct)`. The subject (`lhs` of `<subject> MATCH
+    /// <query>`) is the table itself — written as a bare `tbl` / `alias`, which
+    /// parses to `.column(table: nil, name: <binding>)` (FTS5 syntax). The whole
+    /// `.binary(.match,…)` node is returned so the binder can drop it from the
+    /// residual WHERE/ON. nil if no MATCH names this table.
+    static func ftsMatchConjunct(
+        _ expr: SQLExpr, source: TableBinding
+    ) -> (query: SQLExpr, conjunct: SQLExpr)? {
+        for conjunct in conjuncts(expr) {
+            guard case .binary(.match, let subject, let query) = conjunct else { continue }
+            // `tbl MATCH …` parses the subject as a column reference with no table
+            // qualifier whose name is the binding (alias-or-table), e.g. `f`.
+            if case .column(let qualifier, let name, _) = subject,
+                matchesBinding(qualifier: qualifier, name: name, source: source)
+            {
+                return (query, conjunct)
+            }
+        }
+        return nil
+    }
+
+    /// True when a bare/qualified reference designates the FTS table `source`
+    /// itself (not one of its columns) — the MATCH left operand.
+    private static func matchesBinding(
+        qualifier: String?, name: String, source: TableBinding
+    ) -> Bool {
+        if let qualifier { return qualifier.lowercased() == source.binding }
+        return name.lowercased() == source.binding
+    }
+
+    private static func extract(_ conjuncts: [SQLExpr], source: TableBinding) -> [Constraint] {
+        var constraints: [Constraint] = []
+        for conjunct in conjuncts {
+            switch conjunct {
+            case .binary(let op, let lhs, let rhs) where op.isComparison:
+                if let column = columnReference(lhs, source: source), isConstant(rhs) {
+                    appendComparison(op, column: column, value: rhs, flipped: false, source: conjunct, to: &constraints)
+                } else if let column = columnReference(rhs, source: source), isConstant(lhs) {
+                    appendComparison(op, column: column, value: lhs, flipped: true, source: conjunct, to: &constraints)
+                }
+            case .inList(let subject, let items, let negated):
+                if !negated, let column = columnReference(subject, source: source),
+                    !items.isEmpty, items.allSatisfy(isConstant)
+                {
+                    constraints.append(.inList(column: column, values: items, source: conjunct))
+                }
+            default:
+                break
+            }
+        }
+        return constraints
+    }
+
+    private static func appendComparison(
+        _ op: SQLBinaryOp, column: Int, value: SQLExpr, flipped: Bool, source: SQLExpr,
+        to constraints: inout [Constraint]
+    ) {
+        // When the column is on the right, the comparison direction flips.
+        let effective: SQLBinaryOp
+        switch (op, flipped) {
+        case (.lt, true): effective = .gt
+        case (.gt, true): effective = .lt
+        case (.le, true): effective = .ge
+        case (.ge, true): effective = .le
+        default: effective = op
+        }
+        switch effective {
+        case .eq: constraints.append(.eq(column: column, value: value, source: source))
+        case .lt: constraints.append(.upper(column: column, value: value, inclusive: false))
+        case .le: constraints.append(.upper(column: column, value: value, inclusive: true))
+        case .gt: constraints.append(.lower(column: column, value: value, inclusive: false))
+        case .ge: constraints.append(.lower(column: column, value: value, inclusive: true))
+        default: break  // != is not sargable
+        }
+    }
+
+    private static func columnReference(_ expr: SQLExpr, source: TableBinding) -> Int? {
+        guard case .column(let qualifier, let name, _) = expr else { return nil }
+        return source.columnIndex(qualifier: qualifier, name: name)
+    }
+
+    /// An expression with no column references (and no subqueries): evaluable
+    /// from parameters alone at execution time.
+    private static func isConstant(_ expr: SQLExpr) -> Bool {
+        switch expr {
+        case .column, .boundColumn, .scalarSubquery, .inJSONEach, .aggregateResult:
+            return false
+        case .literal, .parameter:
+            return true
+        case .collate(let inner, _), .cast(let inner, _), .unary(_, let inner):
+            return isConstant(inner)
+        case .isNull(let inner, _):
+            return isConstant(inner)
+        case .binary(_, let lhs, let rhs):
+            return isConstant(lhs) && isConstant(rhs)
+        case .like(let subject, let pattern, _):
+            return isConstant(subject) && isConstant(pattern)
+        case .inList(let subject, let items, _):
+            return isConstant(subject) && items.allSatisfy(isConstant)
+        case .caseWhen(let operand, let whens, let elseExpr):
+            return (operand.map(isConstant) ?? true)
+                && whens.allSatisfy { isConstant($0.condition) && isConstant($0.result) }
+                && (elseExpr.map(isConstant) ?? true)
+        case .function(_, let args, _, _):
+            return args.allSatisfy(isConstant)
+        }
+    }
+
+    private static func firstEquality(
+        _ constraints: [Constraint], column: Int
+    ) -> (value: SQLExpr, source: SQLExpr)? {
+        for case .eq(let c, let value, let source) in constraints where c == column {
+            return (value, source)
+        }
+        return nil
+    }
+    private static func firstInList(
+        _ constraints: [Constraint], column: Int
+    ) -> (values: [SQLExpr], source: SQLExpr)? {
+        for case .inList(let c, let values, let source) in constraints where c == column {
+            return (values, source)
+        }
+        return nil
+    }
+    private static func firstLower(_ constraints: [Constraint], column: Int) -> BoundExpr? {
+        for case .lower(let c, let value, let inclusive) in constraints where c == column {
+            return BoundExpr(expr: value, inclusive: inclusive)
+        }
+        return nil
+    }
+    private static func firstUpper(_ constraints: [Constraint], column: Int) -> BoundExpr? {
+        for case .upper(let c, let value, let inclusive) in constraints where c == column {
+            return BoundExpr(expr: value, inclusive: inclusive)
+        }
+        return nil
+    }
 }
 
 extension AccessPlan {
-  /// SQLite-EXPLAIN-shaped description for planner assertions.
-  func describe(table: String) -> String {
-    switch self {
-    case .tableScan:
-      return "SCAN \(table)"
-    case .rowid(let probes):
-      return probes.count > 1 ? "SEARCH \(table) USING ROWID (IN)" : "SEARCH \(table) USING ROWID"
-    case .index(let name, _, let constraint):
-      return "SEARCH \(table) USING INDEX \(name) (\(constraint))"
-    case .fts(let ftsTable, _, _):
-      return "SCAN \(ftsTable) VIRTUAL TABLE INDEX (MATCH)"
+    /// SQLite-EXPLAIN-shaped description for planner assertions.
+    func describe(table: String) -> String {
+        switch self {
+        case .tableScan:
+            return "SCAN \(table)"
+        case .rowid(let probes):
+            return probes.count > 1 ? "SEARCH \(table) USING ROWID (IN)" : "SEARCH \(table) USING ROWID"
+        case .index(let name, _, let constraint):
+            return "SEARCH \(table) USING INDEX \(name) (\(constraint))"
+        case .fts(let ftsTable, _, _):
+            return "SCAN \(ftsTable) VIRTUAL TABLE INDEX (MATCH)"
+        }
     }
-  }
 
-  var indexName: String? {
-    if case .index(let name, _, _) = self { return name }
-    return nil
-  }
+    var indexName: String? {
+        if case .index(let name, _, _) = self { return name }
+        return nil
+    }
 }

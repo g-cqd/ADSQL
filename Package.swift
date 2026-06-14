@@ -17,10 +17,11 @@ let strictSettings: [SwiftSetting] = [
 // plus experimental lifetime dependence (SE-0446/0456) — the scope-bounded page views are
 // `~Escapable` over `RawSpan` with `@_lifetime`, so the compiler enforces they cannot outlive their
 // snapshot.
-let kernelSettings: [SwiftSetting] = strictSettings + [
-    .strictMemorySafety(),
-    .enableExperimentalFeature("Lifetimes"),
-]
+let kernelSettings: [SwiftSetting] =
+    strictSettings + [
+        .strictMemorySafety(),
+        .enableExperimentalFeature("Lifetimes"),
+    ]
 
 // Compile-time type-check timing warnings (flag slow expressions / function bodies). These use unsafe
 // flags, which would block version-based dependency resolution if placed on the shipped library, so
@@ -38,6 +39,12 @@ let benchSettings: [SwiftSetting] = strictSettings + timingWarningFlags
 // Tests: additionally enable runtime actor data-race checks.
 let testSettings: [SwiftSetting] =
     strictSettings + timingWarningFlags + [.unsafeFlags(["-enable-actor-data-race-checks"])]
+
+// Dev-only tooling is gated behind `ADSQL_DEV` so packages that depend on ADSQL never resolve it.
+// The `format` / `lint` command plugins carry no external dependencies, so they are always available
+// without the flag; build-time lint enforcement (the `LintBuild` plugin) attaches to the library only
+// in dev/CI.
+let isDev = Context.environment["ADSQL_DEV"] != nil
 
 let package = Package(
     name: "ADSQL",
@@ -61,7 +68,9 @@ let package = Package(
         .target(
             name: "ADSQLKernel", dependencies: ["ADCAtomics"],
             swiftSettings: kernelSettings),
-        .target(name: "ADSQL", dependencies: ["ADSQLKernel"], swiftSettings: strictSettings),
+        .target(
+            name: "ADSQL", dependencies: ["ADSQLKernel"], swiftSettings: strictSettings,
+            plugins: isDev ? ["LintBuild"] : []),
         .executableTarget(name: "ADSQLTool", dependencies: ["ADSQL"], swiftSettings: strictSettings),
         .systemLibrary(name: "CSQLite"),
         .executableTarget(
@@ -77,5 +86,18 @@ let package = Package(
             dependencies: ["ADSQLKernel", "ADSQLTestSupport", "CSQLite"],
             swiftSettings: testSettings
         ),
+
+        // Developer tooling. The command plugins are dependency-free (they drive the toolchain's
+        // bundled `swift format`), so they impose nothing on packages that depend on ADSQL.
+        .plugin(
+            name: "Format",
+            capability: .command(
+                intent: .custom(verb: "format", description: "Format Swift sources with swift-format"),
+                permissions: [.writeToPackageDirectory(reason: "Format Swift sources with swift-format")])),
+        .plugin(
+            name: "Lint",
+            capability: .command(
+                intent: .custom(verb: "lint", description: "Check formatting (swift-format strict)"))),
+        .plugin(name: "LintBuild", capability: .buildTool()),
     ]
 )

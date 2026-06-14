@@ -14,160 +14,160 @@ import Synchronization
 ///   (writeback may reorder *within* barrier groups, never across), later
 ///   groups vanish.
 package final class SimulatedDisk: StorageChannel, @unchecked Sendable {
-  enum Mutation {
-    case write(offset: Int, bytes: [UInt8])
-    case setSize(Int)
-  }
-  struct Record {
-    var mutation: Mutation
-    var group: Int
-  }
-  struct State {
-    var records: [Record] = []
-    var currentGroup = 0
-    var durableFloor = 0
-  }
-
-  private let inner: FileChannel
-  private let state = Mutex(State())
-
-  package var fileDescriptor: Int32 { inner.fileDescriptor }
-
-  package init(path: String) throws(DBError) {
-    self.inner = try FileChannel(path: path, mode: .readWrite(create: true))
-    try inner.truncate(to: 0)
-  }
-
-  // MARK: - StorageChannel
-
-  package func fileSize() throws(DBError) -> Int { try inner.fileSize() }
-
-  package func pread(into buffer: UnsafeMutableRawBufferPointer, at offset: Int) throws(DBError) {
-    try inner.pread(into: buffer, at: offset)
-  }
-
-  package func pwrite(_ buffer: UnsafeRawBufferPointer, at offset: Int) throws(DBError) {
-    state.withLock {
-      $0.records.append(.init(mutation: .write(offset: offset, bytes: [UInt8](buffer)), group: $0.currentGroup))
+    enum Mutation {
+        case write(offset: Int, bytes: [UInt8])
+        case setSize(Int)
     }
-    try inner.pwrite(buffer, at: offset)
-  }
-
-  package func pwritev(_ buffers: [UnsafeRawBufferPointer], at offset: Int) throws(DBError) {
-    var at = offset
-    for buffer in buffers {
-      try pwrite(buffer, at: at)
-      at += buffer.count
+    struct Record {
+        var mutation: Mutation
+        var group: Int
     }
-  }
-
-  package func sync(_ profile: DurabilityProfile) throws(DBError) {
-    state.withLock {
-      switch profile {
-      case .none:
-        break
-      case .barrier:
-        $0.currentGroup += 1
-      case .full:
-        $0.currentGroup += 1
-        $0.durableFloor = $0.currentGroup
-      }
-    }
-    // No real fsync: tests never rely on actual disk durability.
-  }
-
-  package func preallocate(minimumSize: Int) throws(DBError) {
-    let current = try inner.fileSize()
-    if minimumSize > current {
-      state.withLock {
-        $0.records.append(.init(mutation: .setSize(minimumSize), group: $0.currentGroup))
-      }
-    }
-    try inner.preallocate(minimumSize: minimumSize)
-  }
-
-  package func truncate(to size: Int) throws(DBError) {
-    state.withLock {
-      $0.records.append(.init(mutation: .setSize(size), group: $0.currentGroup))
-    }
-    try inner.truncate(to: size)
-  }
-
-  package func close() { inner.close() }
-
-  // MARK: - Crash materialization
-
-  package var crashCutGroups: ClosedRange<Int> {
-    state.withLock { $0.durableFloor...$0.currentGroup }
-  }
-
-  /// Builds the post-power-cut file image for a random cut group drawn from
-  /// `crashCutGroups`.
-  package func materializeCrashImage(seed: UInt64) -> [UInt8] {
-    var rng = SplitMix64(seed: seed)
-    let range = crashCutGroups
-    let cut = range.lowerBound + Int(rng.next() % UInt64(range.count))
-    return materializeCrashImage(cutGroup: cut, tearSeed: rng.next())
-  }
-
-  package func materializeCrashImage(cutGroup: Int, tearSeed: UInt64) -> [UInt8] {
-    var rng = SplitMix64(seed: tearSeed)
-    var image: [UInt8] = []
-    var logicalSize = 0
-
-    func ensure(_ size: Int) {
-      if image.count < size { image.append(contentsOf: repeatElement(0, count: size - image.count)) }
-    }
-    func apply(offset: Int, bytes: ArraySlice<UInt8>) {
-      ensure(offset + bytes.count)
-      image.replaceSubrange(offset..<(offset + bytes.count), with: bytes)
-      logicalSize = max(logicalSize, offset + bytes.count)
+    struct State {
+        var records: [Record] = []
+        var currentGroup = 0
+        var durableFloor = 0
     }
 
-    let records = state.withLock { $0.records }
-    for record in records {
-      if record.group > cutGroup { break }
-      let keepWhole = record.group < cutGroup
-      switch record.mutation {
-      case .setSize(let size):
-        if keepWhole || rng.next() % 2 == 0 {
-          ensure(size)
-          if size < image.count { image.removeSubrange(size...) }
-          logicalSize = size
+    private let inner: FileChannel
+    private let state = Mutex(State())
+
+    package var fileDescriptor: Int32 { inner.fileDescriptor }
+
+    package init(path: String) throws(DBError) {
+        self.inner = try FileChannel(path: path, mode: .readWrite(create: true))
+        try inner.truncate(to: 0)
+    }
+
+    // MARK: - StorageChannel
+
+    package func fileSize() throws(DBError) -> Int { try inner.fileSize() }
+
+    package func pread(into buffer: UnsafeMutableRawBufferPointer, at offset: Int) throws(DBError) {
+        try inner.pread(into: buffer, at: offset)
+    }
+
+    package func pwrite(_ buffer: UnsafeRawBufferPointer, at offset: Int) throws(DBError) {
+        state.withLock {
+            $0.records.append(.init(mutation: .write(offset: offset, bytes: [UInt8](buffer)), group: $0.currentGroup))
         }
-      case .write(let offset, let bytes):
-        if keepWhole {
-          apply(offset: offset, bytes: bytes[...])
-          continue
-        }
-        // Torn write: keep each 4 KiB sub-block independently.
-        var sub = 0
-        while sub < bytes.count {
-          let end = min(sub + Format.subBlockSize, bytes.count)
-          if rng.next() % 2 == 0 {
-            apply(offset: offset + sub, bytes: bytes[sub..<end])
-          }
-          sub = end
-        }
-      }
+        try inner.pwrite(buffer, at: offset)
     }
-    ensure(logicalSize)
-    return image
-  }
 
-  /// Writes a crash image to `path` so it can be reopened as a real database.
-  package func writeCrashImage(_ image: [UInt8], to path: String) throws(DBError) {
-    let out = try FileChannel(path: path, mode: .readWrite(create: true))
-    defer { out.close() }
-    try out.truncate(to: 0)
-    var failure: DBError?
-    image.withUnsafeBytes { raw in
-      do throws(DBError) {
-        try out.pwrite(raw, at: 0)
-      } catch {
-        failure = error
-      }
+    package func pwritev(_ buffers: [UnsafeRawBufferPointer], at offset: Int) throws(DBError) {
+        var at = offset
+        for buffer in buffers {
+            try pwrite(buffer, at: at)
+            at += buffer.count
+        }
     }
-    if let failure { throw failure }
-  }
+
+    package func sync(_ profile: DurabilityProfile) throws(DBError) {
+        state.withLock {
+            switch profile {
+            case .none:
+                break
+            case .barrier:
+                $0.currentGroup += 1
+            case .full:
+                $0.currentGroup += 1
+                $0.durableFloor = $0.currentGroup
+            }
+        }
+        // No real fsync: tests never rely on actual disk durability.
+    }
+
+    package func preallocate(minimumSize: Int) throws(DBError) {
+        let current = try inner.fileSize()
+        if minimumSize > current {
+            state.withLock {
+                $0.records.append(.init(mutation: .setSize(minimumSize), group: $0.currentGroup))
+            }
+        }
+        try inner.preallocate(minimumSize: minimumSize)
+    }
+
+    package func truncate(to size: Int) throws(DBError) {
+        state.withLock {
+            $0.records.append(.init(mutation: .setSize(size), group: $0.currentGroup))
+        }
+        try inner.truncate(to: size)
+    }
+
+    package func close() { inner.close() }
+
+    // MARK: - Crash materialization
+
+    package var crashCutGroups: ClosedRange<Int> {
+        state.withLock { $0.durableFloor...$0.currentGroup }
+    }
+
+    /// Builds the post-power-cut file image for a random cut group drawn from
+    /// `crashCutGroups`.
+    package func materializeCrashImage(seed: UInt64) -> [UInt8] {
+        var rng = SplitMix64(seed: seed)
+        let range = crashCutGroups
+        let cut = range.lowerBound + Int(rng.next() % UInt64(range.count))
+        return materializeCrashImage(cutGroup: cut, tearSeed: rng.next())
+    }
+
+    package func materializeCrashImage(cutGroup: Int, tearSeed: UInt64) -> [UInt8] {
+        var rng = SplitMix64(seed: tearSeed)
+        var image: [UInt8] = []
+        var logicalSize = 0
+
+        func ensure(_ size: Int) {
+            if image.count < size { image.append(contentsOf: repeatElement(0, count: size - image.count)) }
+        }
+        func apply(offset: Int, bytes: ArraySlice<UInt8>) {
+            ensure(offset + bytes.count)
+            image.replaceSubrange(offset..<(offset + bytes.count), with: bytes)
+            logicalSize = max(logicalSize, offset + bytes.count)
+        }
+
+        let records = state.withLock { $0.records }
+        for record in records {
+            if record.group > cutGroup { break }
+            let keepWhole = record.group < cutGroup
+            switch record.mutation {
+            case .setSize(let size):
+                if keepWhole || rng.next() % 2 == 0 {
+                    ensure(size)
+                    if size < image.count { image.removeSubrange(size...) }
+                    logicalSize = size
+                }
+            case .write(let offset, let bytes):
+                if keepWhole {
+                    apply(offset: offset, bytes: bytes[...])
+                    continue
+                }
+                // Torn write: keep each 4 KiB sub-block independently.
+                var sub = 0
+                while sub < bytes.count {
+                    let end = min(sub + Format.subBlockSize, bytes.count)
+                    if rng.next() % 2 == 0 {
+                        apply(offset: offset + sub, bytes: bytes[sub..<end])
+                    }
+                    sub = end
+                }
+            }
+        }
+        ensure(logicalSize)
+        return image
+    }
+
+    /// Writes a crash image to `path` so it can be reopened as a real database.
+    package func writeCrashImage(_ image: [UInt8], to path: String) throws(DBError) {
+        let out = try FileChannel(path: path, mode: .readWrite(create: true))
+        defer { out.close() }
+        try out.truncate(to: 0)
+        var failure: DBError?
+        image.withUnsafeBytes { raw in
+            do throws(DBError) {
+                try out.pwrite(raw, at: 0)
+            } catch {
+                failure = error
+            }
+        }
+        if let failure { throw failure }
+    }
 }
