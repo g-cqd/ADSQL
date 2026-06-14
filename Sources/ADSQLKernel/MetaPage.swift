@@ -155,7 +155,7 @@ public struct Meta: Equatable, Sendable {
     var best: Meta?
     for result in results {
       if case .valid(let meta) = result {
-        if best == nil || meta.generation > best!.generation { best = meta }
+        if best.map({ meta.generation > $0.generation }) ?? true { best = meta }
       }
     }
     if let best { return best }

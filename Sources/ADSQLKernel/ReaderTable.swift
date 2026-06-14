@@ -136,7 +136,7 @@ import Darwin
       guard unsafe adc_load_acquire_u64(slotPointer(index, SlotOffset.ownerPid)) != 0 else { continue }
       let generation = unsafe adc_load_acquire_u64(slotPointer(index, SlotOffset.generation))
       guard generation != 0 else { continue }
-      if minimum == nil || generation < minimum! { minimum = generation }
+      minimum = min(generation, minimum ?? generation)
     }
     return minimum
   }

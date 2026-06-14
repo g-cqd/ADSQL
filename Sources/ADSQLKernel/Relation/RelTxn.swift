@@ -75,7 +75,7 @@ public final class SchemaCache: Sendable {
     }
     let loaded = try Relation.loadState(resolver: resolver, mainTree: meta.mainTree).schema
     cached.withLock { existing in
-      if existing == nil || existing!.catalogVersion <= loaded.catalogVersion {
+      if (existing?.catalogVersion ?? 0) <= loaded.catalogVersion {
         existing = loaded
       }
     }
@@ -85,7 +85,7 @@ public final class SchemaCache: Sendable {
   /// Writer-side publish after a DDL commit (already authoritative).
   func publish(_ schema: Schema) {
     cached.withLock { existing in
-      if existing == nil || existing!.catalogVersion <= schema.catalogVersion {
+      if (existing?.catalogVersion ?? 0) <= schema.catalogVersion {
         existing = schema
       }
     }
