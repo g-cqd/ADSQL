@@ -47,7 +47,13 @@ extension DBError: CustomStringConvertible {
   public var description: String {
     switch self {
     case .io(let errno, let op):
-      let detail = unsafe String(cString: strerror(errno))
+      // strerror returns a shared static buffer; strerror_r writes into a
+      // caller-owned buffer, so concurrent error formatting cannot corrupt it.
+      let detail = withUnsafeTemporaryAllocation(of: CChar.self, capacity: 256) {
+        buffer in
+        _ = unsafe strerror_r(errno, buffer.baseAddress!, buffer.count)
+        return unsafe String(cString: buffer.baseAddress!)
+      }
       return "I/O error in \(op): \(detail) (errno \(errno))"
     case .badMagic: return "not an ADSQL database (bad magic)"
     case .unsupportedFormatVersion(let v): return "unsupported format version \(v)"
