@@ -176,6 +176,20 @@ public struct Cursor<R: PageResolver>: ~Copyable {
     }
   }
 
+  /// Zero-copy access to the current entry's value bytes (an inline value is the
+  /// mapped page span directly; an overflow value is assembled once). The span is
+  /// valid only for the duration of `body`. nil when the cursor is invalid.
+  public mutating func withCurrentValueBytes<T>(
+    _ body: (UnsafeRawBufferPointer) throws(DBError) -> T
+  ) throws(DBError) -> T? {
+    let resolver = self.resolver
+    return unsafe try withCurrent { (_, ref) throws(DBError) in
+      unsafe try BTree.withValueBytes(ref, resolver: resolver) { (raw) throws(DBError) in
+        unsafe try body(raw)
+      }
+    }
+  }
+
   // MARK: - Internals
 
   /// Issues advisory readahead for the window of pages just past the current

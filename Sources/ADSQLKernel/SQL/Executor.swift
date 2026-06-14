@@ -632,8 +632,12 @@ enum SelectExecutor {
           query: query, record: record, resolver: resolver, weights: resolvedWeights,
           global: global)
         : nil
+      // One persistent ascending cursor on the stats tree for the whole scan: the
+      // docids arrive ascending, so `docLength`'s `seekForward` skips the per-doc
+      // root→leaf descent for same-leaf docs (F6n).
+      var statsCursor = Cursor(resolver: resolver, tree: record.stats)
       for docid in docids {
-        let score = try scorer?.score(docid: docid) ?? 0
+        let score = try scorer?.score(docid: docid, statsCursor: &statsCursor) ?? 0
         if try unsafe !body(docid, empty, score) { return }
       }
     }

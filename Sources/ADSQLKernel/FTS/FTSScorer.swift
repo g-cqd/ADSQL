@@ -79,7 +79,8 @@ enum FTSScorer {
   ) throws(DBError) -> Double {
     let prepared = try PreparedScorer(
       query: query, record: record, resolver: resolver, weights: weights, global: global)
-    return try prepared.score(docid: docid)
+    var statsCursor = Cursor(resolver: resolver, tree: record.stats)
+    return try prepared.score(docid: docid, statsCursor: &statsCursor)
   }
 
   // MARK: - Query-scoped scorer
@@ -151,9 +152,9 @@ enum FTSScorer {
     /// resolved leaf, no posting decode. Bit-identical to the per-document path:
     /// same leaf order, same `wf = Σ_c weight_c·freq_c` (over allowed columns),
     /// same zero-frequency skip, same `contribution`, same negation.
-    func score(docid: Int64) throws(DBError) -> Double {
+    func score(docid: Int64, statsCursor: inout Cursor<R>) throws(DBError) -> Double {
       guard !degenerate else { return 0 }
-      guard let docLength = try FTSIndex.docLength(resolver, record, docid: docid) else { return 0 }
+      guard let docLength = try FTSIndex.docLength(&statsCursor, docid: docid) else { return 0 }
       let lengthNorm = FTSScorer.lengthNorm(docLength: docLength, avgdl: avgdl)
       var total = 0.0
       for leaf in leaves {

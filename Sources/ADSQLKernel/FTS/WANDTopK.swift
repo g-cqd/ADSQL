@@ -85,16 +85,20 @@ enum FTSWANDTopK {
       record: record, resolver: resolver, weights: weights, columns: columns, avgdl: avgdl)
 
     var heap = TopKHeap(capacity: k)
+    // One persistent ascending cursor on the stats tree: survivors are scored in
+    // ascending docid order, so `docLength`'s `seekForward` skips the per-doc
+    // root→leaf descent for same-leaf docs (F6n).
+    var statsCursor = Cursor(resolver: resolver, tree: record.stats)
     if cursors.count == 1 {
       // Single term (the hot case, e.g. "view"): pure block-max skipping — drop a
       // whole block whose bound cannot beat θ without decoding or scoring it.
-      try runSingleTerm(&cursors[0], heap: &heap, scorer: scorer)
+      try runSingleTerm(&cursors[0], heap: &heap, scorer: scorer, statsCursor: &statsCursor)
     } else {
       switch eligible.op {
       case .or:
-        try runDisjunctive(&cursors, heap: &heap, scorer: scorer)
+        try runDisjunctive(&cursors, heap: &heap, scorer: scorer, statsCursor: &statsCursor)
       case .and:
-        try runConjunctive(&cursors, heap: &heap, scorer: scorer)
+        try runConjunctive(&cursors, heap: &heap, scorer: scorer, statsCursor: &statsCursor)
       }
     }
     // Convert the kept entries to the `FTSScorer` convention (negated `S`) and
@@ -119,7 +123,8 @@ enum FTSWANDTopK {
   /// pruning pays the most — the late blocks of a near-universal term that all
   /// fall under the rising threshold are jumped over wholesale.
   private static func runSingleTerm<R: PageResolver>(
-    _ cursor: inout FTSWANDCursor, heap: inout TopKHeap, scorer: DocScorer<R>
+    _ cursor: inout FTSWANDCursor, heap: inout TopKHeap, scorer: DocScorer<R>,
+    statsCursor: inout Cursor<R>
   ) throws(DBError) {
     // One reused field-TF buffer for the whole list: the single-term scan scores
     // every doc in an entered block, so a fresh per-doc `[UInt32]` (and the 1-entry
@@ -136,7 +141,8 @@ enum FTSWANDTopK {
         continue
       }
       cursor.currentFieldTFs(into: &fieldTFs)
-      let s = try scorer.scoreSingle(docid: docid, idf: cursor.idf, fieldTFs: fieldTFs)
+      let s = try scorer.scoreSingle(
+        docid: docid, idf: cursor.idf, fieldTFs: fieldTFs, statsCursor: &statsCursor)
       heap.offer(docid: docid, score: s)
       cursor.advancePast()
     }
@@ -151,7 +157,8 @@ enum FTSWANDTopK {
   /// field-TFs. The cursor's galloping `advance(to:)` block-max-skips toward the
   /// next live candidate for free.
   private static func runDisjunctive<R: PageResolver>(
-    _ cursors: inout [FTSWANDCursor], heap: inout TopKHeap, scorer: DocScorer<R>
+    _ cursors: inout [FTSWANDCursor], heap: inout TopKHeap, scorer: DocScorer<R>,
+    statsCursor: inout Cursor<R>
   ) throws(DBError) {
     while true {
       var pivot: Int64 = .max
@@ -180,7 +187,9 @@ enum FTSWANDTopK {
       for index in cursors.indices where cursors[index].current == pivot {
         contributors.append((cursors[index].idf, cursors[index].currentFieldTFs()))
       }
-      heap.offer(docid: pivot, score: try scorer.score(docid: pivot, contributors: contributors))
+      heap.offer(
+        docid: pivot,
+        score: try scorer.score(docid: pivot, contributors: contributors, statsCursor: &statsCursor))
       for index in cursors.indices where cursors[index].current == pivot {
         cursors[index].advancePast()
       }
@@ -195,7 +204,8 @@ enum FTSWANDTopK {
   /// block bound (skip when `< θ`) else score for real from every cursor's
   /// field-TFs.
   private static func runConjunctive<R: PageResolver>(
-    _ cursors: inout [FTSWANDCursor], heap: inout TopKHeap, scorer: DocScorer<R>
+    _ cursors: inout [FTSWANDCursor], heap: inout TopKHeap, scorer: DocScorer<R>,
+    statsCursor: inout Cursor<R>
   ) throws(DBError) {
     while true {
       var target: Int64 = .min
@@ -218,7 +228,10 @@ enum FTSWANDTopK {
         for index in cursors.indices {
           contributors.append((cursors[index].idf, cursors[index].currentFieldTFs()))
         }
-        heap.offer(docid: target, score: try scorer.score(docid: target, contributors: contributors))
+        heap.offer(
+          docid: target,
+          score: try scorer.score(
+            docid: target, contributors: contributors, statsCursor: &statsCursor))
       }
       for index in cursors.indices { cursors[index].advancePast() }
     }
@@ -254,8 +267,11 @@ struct DocScorer<R: PageResolver> {
   /// `contribution(idf, Σ_c weight_c·tf_c, lengthNorm(D))`, skipping a leaf whose
   /// weighted frequency is 0. Returns 0 when the doc has no stats (degenerate;
   /// matches `FTSScorer`).
-  func score(docid: Int64, contributors: [(idf: Double, fieldTFs: [UInt32])]) throws(DBError) -> Double {
-    guard let docLength = try FTSIndex.docLength(resolver, record, docid: docid) else { return 0 }
+  func score(
+    docid: Int64, contributors: [(idf: Double, fieldTFs: [UInt32])],
+    statsCursor: inout Cursor<R>
+  ) throws(DBError) -> Double {
+    guard let docLength = try FTSIndex.docLength(&statsCursor, docid: docid) else { return 0 }
     let lengthNorm = FTSScorer.lengthNorm(docLength: docLength, avgdl: avgdl)
     var total = 0.0
     for contributor in contributors {
@@ -276,8 +292,10 @@ struct DocScorer<R: PageResolver> {
   /// arithmetic to `score` with one contributor (same `wf`, same zero-skip, same
   /// `contribution`), but takes the field-TFs by borrow (a reused buffer) and
   /// avoids the per-doc contributors array.
-  func scoreSingle(docid: Int64, idf: Double, fieldTFs tfs: [UInt32]) throws(DBError) -> Double {
-    guard let docLength = try FTSIndex.docLength(resolver, record, docid: docid) else { return 0 }
+  func scoreSingle(
+    docid: Int64, idf: Double, fieldTFs tfs: [UInt32], statsCursor: inout Cursor<R>
+  ) throws(DBError) -> Double {
+    guard let docLength = try FTSIndex.docLength(&statsCursor, docid: docid) else { return 0 }
     let lengthNorm = FTSScorer.lengthNorm(docLength: docLength, avgdl: avgdl)
     var weightedFreq = 0.0
     for column in 0..<columns {

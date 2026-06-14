@@ -309,31 +309,38 @@ enum FTSIndex {
   }
 
   /// The document's total length `D = Σ_c fieldLengths` — the only forward-record
-  /// datum bm25 scoring needs — read ZERO-COPY and decoding ONLY the leading
-  /// field-length varints. It never copies the record nor decodes the doc's term
-  /// list (the bulk of the record, and a `[[UInt8]]` the scorer would discard), so
-  /// the per-scored-document length read costs a tree descent plus a few varints.
-  /// nil when the doc has no stats row (an absent/removed doc), mirroring
-  /// `docStats`. Hot path: one call per scored document.
-  static func docLength(
-    _ resolver: some PageResolver, _ record: Catalog.FTSRecord, docid: Int64
+  /// datum bm25 scoring needs — read through a PERSISTENT ascending cursor on the
+  /// stats tree. `seekForward` skips the root→leaf descent whenever `docid` lies in
+  /// the cursor's current leaf, so scoring documents in ascending docid order
+  /// (every ranked path does) pays ~one descent per leaf instead of one per
+  /// document — the dominant ranked cost the point-read incurred (F6n). It decodes
+  /// ONLY the leading field-length varints (never the doc's term list), zero-copy.
+  /// nil when the doc has no stats row (absent/removed). Bit-identical `D` to the
+  /// prior point read. Hot path: one call per scored document.
+  static func docLength<R: PageResolver>(
+    _ statsCursor: inout Cursor<R>, docid: Int64
   ) throws(DBError) -> Double? {
-    try Relation.withRowValue(resolver, record.stats, key: KeyCodec.rowKey(docid)) {
-      (ref) throws(DBError) in
-      try unsafe BTree.withValueBytes(ref, resolver: resolver) { (raw) throws(DBError) -> Double in
-        var offset = 0
-        guard let fieldCount = unsafe Varint.read(raw, &offset) else {
-          throw DBError.integrityFailure("fts forward: missing field count")
-        }
-        var total = 0.0
-        for _ in 0..<fieldCount {
-          guard let length = unsafe Varint.read(raw, &offset) else {
-            throw DBError.integrityFailure("fts forward: truncated field length")
-          }
-          total += Double(length)
-        }
-        return total
+    let key = KeyCodec.rowKey(docid)
+    var found = false
+    var failure: DBError?
+    key.withUnsafeBytes { raw in
+      do throws(DBError) { found = unsafe try statsCursor.seekForward(raw) } catch { failure = error }
+    }
+    if let failure { throw failure }
+    guard found else { return nil }
+    return unsafe try statsCursor.withCurrentValueBytes { (raw) throws(DBError) -> Double in
+      var offset = 0
+      guard let fieldCount = unsafe Varint.read(raw, &offset) else {
+        throw DBError.integrityFailure("fts forward: missing field count")
       }
+      var total = 0.0
+      for _ in 0..<fieldCount {
+        guard let length = unsafe Varint.read(raw, &offset) else {
+          throw DBError.integrityFailure("fts forward: truncated field length")
+        }
+        total += Double(length)
+      }
+      return total
     }
   }
 
