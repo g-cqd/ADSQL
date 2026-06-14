@@ -374,10 +374,15 @@ extension Relation {
       try getBytes(ctx, table.handle, key: KeyCodec.rowKey(rowid)) != nil {
       conflicts.append((rowid: rowid, index: "rowid"))
     }
-    let ownIndexes = state.indexRecords.values
-      .filter { $0.tableId == table.tableId }
-      .sorted { $0.definition.name < $1.definition.name }
-    for index in ownIndexes where index.definition.unique {
+    // Owned secondary indexes in name order — computed once and reused by both the
+    // unique-conflict scan and the write loop below (the index roster is stable
+    // across an OR REPLACE delete, which changes handles, not the set of indexes),
+    // dropping one per-row filter+sort+allocation.
+    let ownIndexNames = state.indexRecords.keys
+      .filter { state.indexRecords[$0]!.tableId == table.tableId }
+      .sorted()
+    for indexName in ownIndexNames where state.indexRecords[indexName]!.definition.unique {
+      let index = state.indexRecords[indexName]!
       if let conflicting = try uniqueConflict(ctx, index: index, table: table, row: row) {
         conflicts.append((rowid: conflicting, index: index.definition.name))
       }
@@ -427,8 +432,7 @@ extension Relation {
     table.handle = handle
     state.tableRecords[tableName] = table
 
-    for indexName in state.indexRecords.keys.sorted() {
-      guard state.indexRecords[indexName]!.tableId == table.tableId else { continue }
+    for indexName in ownIndexNames {
       var index = state.indexRecords[indexName]!
       try indexEntryKey(index: index, table: table, row: row, rowid: rowid, into: &ctx.indexKeyScratch)
       var indexHandle = index.handle
