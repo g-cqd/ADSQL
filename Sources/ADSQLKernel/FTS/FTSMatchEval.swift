@@ -67,11 +67,14 @@ enum FTSMatch {
       _ term: [UInt8], prefix: Bool, columns: Set<Int>?
     ) throws(DBError) -> [Int64] {
       if !prefix { return try docids(term, columns: columns) }
-      var result: [Int64] = []
+      // Each expansion's docids are docid-ascending; balanced-merge them so a
+      // wide prefix costs O(total · log E) rather than the linear fold's O(total · E)
+      // (the fold re-copied the growing accumulator on every expansion).
+      var lists: [[Int64]] = []
       for expansion in try FTSIndex.termsMatchingPrefix(resolver, record, prefix: term) {
-        result = FTSMatch.union(result, try docids(expansion, columns: columns))
+        lists.append(try docids(expansion, columns: columns))
       }
-      return result
+      return FTSMatch.unionAll(lists)
     }
 
     /// Docids of a single term, optionally restricted to documents where the
@@ -91,15 +94,16 @@ enum FTSMatch {
       _ tokens: [[UInt8]], prefix: Bool, columns: Set<Int>?
     ) throws(DBError) -> [Int64] {
       guard prefix else { return try phraseAdjacency(tokens, columns: columns) }
-      // Trailing `*`: expand the last token over its prefix terms, OR the phrases.
-      var result: [Int64] = []
+      // Trailing `*`: expand the last token over its prefix terms, OR the phrases
+      // (balanced-merge the per-expansion match sets — see `evalTerm`).
+      var lists: [[Int64]] = []
       let last = tokens[tokens.count - 1]
       for expansion in try FTSIndex.termsMatchingPrefix(resolver, record, prefix: last) {
         var expanded = tokens
         expanded[expanded.count - 1] = expansion
-        result = FTSMatch.union(result, try phraseAdjacency(expanded, columns: columns))
+        lists.append(try phraseAdjacency(expanded, columns: columns))
       }
-      return result
+      return FTSMatch.unionAll(lists)
     }
 
     /// Docids where `tokens` occur at consecutive positions within one allowed
@@ -152,6 +156,30 @@ enum FTSMatch {
     }
 
     // MARK: sorted-set merges (inputs docid-ascending & deduped)
+  }
+
+  /// Unions any number of docid-ascending lists into one (ascending, deduped) by
+  /// balanced pairwise merge: O(total · log lists) instead of a linear fold's
+  /// O(total · lists). Used for prefix expansion, where `lists` can be wide.
+  static func unionAll(_ lists: [[Int64]]) -> [Int64] {
+    if lists.isEmpty { return [] }
+    var level = lists
+    while level.count > 1 {
+      var next: [[Int64]] = []
+      next.reserveCapacity((level.count + 1) / 2)
+      var index = 0
+      while index < level.count {
+        if index + 1 < level.count {
+          next.append(union(level[index], level[index + 1]))
+          index += 2
+        } else {
+          next.append(level[index])
+          index += 1
+        }
+      }
+      level = next
+    }
+    return level[0]
   }
 
   static func union(_ a: [Int64], _ b: [Int64]) -> [Int64] {

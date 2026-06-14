@@ -424,11 +424,28 @@ enum FTSIndex {
     }
     if let failure { throw failure }
     while positioned {
-      guard let key = try cursor.currentKey(), key.starts(with: prefix) else { break }
-      guard let value = try cursor.currentValue() else { break }
+      // One cursor access per block: prefix-check the raw key in place (no key
+      // copy) and materialize the value only if it still belongs to this term.
+      // nil ⇒ key left the term's range (or the cursor went invalid) ⇒ stop.
+      let value: [UInt8]? =
+        unsafe try cursor.withCurrent { (key, ref) throws(DBError) -> [UInt8]? in
+          guard unsafe rawHasPrefix(key, prefix) else { return nil }
+          return try BTree.copyValue(ref, resolver: resolver)
+        } ?? nil
+      guard let value else { break }
       try body(value)
       positioned = try cursor.next()
     }
+  }
+
+  /// Whether the raw cursor key begins with `prefix`, compared in place against the
+  /// mapped page bytes (no `[UInt8]` materialization — the per-block key copy was
+  /// pure overhead, the key is only tested, never kept).
+  @inline(__always)
+  private static func rawHasPrefix(_ key: UnsafeRawBufferPointer, _ prefix: [UInt8]) -> Bool {
+    guard key.count >= prefix.count else { return false }
+    for index in 0..<prefix.count where unsafe key[index] != prefix[index] { return false }
+    return true
   }
 
   private static func writeBlock(
