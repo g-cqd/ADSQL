@@ -1,16 +1,20 @@
-/// FTS index build + maintenance (M5/F2b). Drives a tokenized document into the
-/// three per-FTS-table B+trees the catalog `FTSRecord` owns:
+/// FTS index build + maintenance (M5/F2b, F6d). Drives a tokenized document into
+/// the three per-FTS-table B+trees the catalog `FTSRecord` owns:
 ///
-///   - **dict**: `term → varint df` (df == posting-list length; re-derived each
-///     write so it never drifts). Gives F3 prefix-term enumeration + IDF without
-///     decoding postings.
-///   - **postings**: `term → block-compressed posting list` (F2a `FTSPostings`).
+///   - **dict**: `term → varint df` (df == posting-list length). Gives F3
+///     prefix-term enumeration + IDF without decoding postings.
+///   - **postings**: a term's block-compressed posting list (F2a `FTSPostings`),
+///     stored **one fixed-size block per key** (F6d): key `varint(len)||term||
+///     bigEndian(blockNo)`, value a single-block `FTSPostings` payload (≤128
+///     docs). Appending a document rewrites only the last block (O(blockSize))
+///     instead of the whole list (O(list)), turning a bulk build from O(n²) into
+///     O(n). Blocks stay packed (all full but the last), so `blockNo = (df-1)/128`
+///     and a term's blocks are `0...lastNo` — no separate segment directory.
 ///   - **stats**: `rowKey(docid) → forward record` (field lengths + the doc's
 ///     distinct terms — the delete companion) and `[0x00] → global aggregates`.
 ///
-/// Maintenance is read-modify-write per term, mirroring the secondary-index loops
-/// (`DML.swift`). Self-contained content only; segments/merge are a deferred perf
-/// pass (a single list per term is correct, not yet write-optimal).
+/// Readers reconstitute a term's whole list by unioning its block-keys
+/// (`postingsValue`), so `postings`/MATCH/WAND/the scorer are unchanged.
 enum FTSIndex {
   /// Tokens longer than this are skipped (kept out of the term keyspace); they
   /// still count toward field length. B+tree keys are bounded by `maxKeySize`.
@@ -54,12 +58,40 @@ enum FTSIndex {
     for (term, info) in termInfo {
       let posting = FTSPosting(
         docid: docid, fieldTFs: info.fieldTFs, positions: storePositions ? info.positions : [])
-      var list = try decodePostings(ctx, postings, term: term, columns: columns, positions: storePositions)
-      insertInDocidOrder(&list, posting)
-      try Relation.putBytes(
-        ctx, &postings, key: term,
-        value: FTSPostings.encode(list, columns: columns, storePositions: storePositions))
-      try Relation.putBytes(ctx, &dict, key: term, value: encodeDF(UInt64(list.count)))
+      let oldDF = try documentFrequency(ctx, dict, term: term)
+      if oldDF == 0 {
+        try writeBlock(ctx, &postings, term: term, blockNo: 0, [posting], columns: columns, positions: storePositions)
+        try Relation.putBytes(ctx, &dict, key: term, value: encodeDF(1))
+        continue
+      }
+      let lastNo = blockNo(forDF: oldDF)
+      var lastBlock = try readBlock(
+        ctx, postings, term: term, blockNo: lastNo, columns: columns, positions: storePositions)
+      if let lastDocid = lastBlock.last?.docid, posting.docid > lastDocid {
+        // Ascending fast path: rewrite only the last (partial) block, or open a
+        // fresh one when it is full. O(blockSize), the bulk-build common case.
+        if lastBlock.count < FTSPostings.blockSize {
+          lastBlock.append(posting)
+          try writeBlock(
+            ctx, &postings, term: term, blockNo: lastNo, lastBlock, columns: columns,
+            positions: storePositions)
+        } else {
+          try writeBlock(
+            ctx, &postings, term: term, blockNo: lastNo + 1, [posting], columns: columns,
+            positions: storePositions)
+        }
+        try Relation.putBytes(ctx, &dict, key: term, value: encodeDF(oldDF + 1))
+      } else {
+        // Out-of-order docid: fall back to read-all, insert, re-pack. O(list),
+        // no worse than the pre-F6d whole-list rewrite (and not the hot path).
+        var list = try fullList(
+          ctx, postings, term: term, df: oldDF, columns: columns, positions: storePositions)
+        insertInDocidOrder(&list, posting)
+        try rewritePacked(
+          ctx, &postings, term: term, oldLastNo: lastNo, list, columns: columns,
+          positions: storePositions)
+        try Relation.putBytes(ctx, &dict, key: term, value: encodeDF(UInt64(list.count)))
+      }
     }
 
     try Relation.putBytes(
@@ -91,15 +123,19 @@ enum FTSIndex {
     var postings = record.postings
     var stats = record.stats
     for term in forward.terms {
-      var list = try decodePostings(ctx, postings, term: term, columns: columns, positions: storePositions)
+      let oldDF = try documentFrequency(ctx, dict, term: term)
+      guard oldDF > 0 else { continue }
+      let lastNo = blockNo(forDF: oldDF)
+      var list = try fullList(
+        ctx, postings, term: term, df: oldDF, columns: columns, positions: storePositions)
       list.removeAll { $0.docid == docid }
+      // Drop the term's existing blocks, then re-pack what remains.
+      for no in 0...lastNo { _ = try Relation.deleteBytes(ctx, &postings, key: blockKey(term, no)) }
       if list.isEmpty {
-        _ = try Relation.deleteBytes(ctx, &postings, key: term)
         _ = try Relation.deleteBytes(ctx, &dict, key: term)
       } else {
-        try Relation.putBytes(
-          ctx, &postings, key: term,
-          value: FTSPostings.encode(list, columns: columns, storePositions: storePositions))
+        try writePacked(
+          ctx, &postings, term: term, list, columns: columns, positions: storePositions)
         try Relation.putBytes(ctx, &dict, key: term, value: encodeDF(UInt64(list.count)))
       }
     }
@@ -149,17 +185,41 @@ enum FTSIndex {
   static func postings(
     _ resolver: some PageResolver, _ record: Catalog.FTSRecord, term: [UInt8]
   ) throws(DBError) -> [FTSPosting]? {
-    guard let bytes = try Relation.getBytes(resolver, record.postings, key: term) else { return nil }
+    guard let value = try postingsValue(resolver, record, term: term) else { return nil }
     return try FTSPostings.decode(
-      bytes, columns: record.definition.columns.count,
+      value, columns: record.definition.columns.count,
       storePositions: record.definition.detail != .none)
+  }
+
+  /// A term's whole posting list reconstituted as a single multi-block
+  /// `FTSPostings` value, unioning its `0...lastNo` block-keys. nil when the term
+  /// is absent. Readers (`postings`, MATCH, WAND, the scorer) consume this so
+  /// they are oblivious to the block-per-key storage.
+  static func postingsValue(
+    _ resolver: some PageResolver, _ record: Catalog.FTSRecord, term: [UInt8]
+  ) throws(DBError) -> [UInt8]? {
+    let df = try documentFrequency(resolver, record, term: term)
+    guard df > 0 else { return nil }
+    let lastNo = blockNo(forDF: df)
+    var combined: [UInt8] = []
+    Varint.append(UInt64(lastNo) + 1, to: &combined)
+    for no in 0...lastNo {
+      guard let value = try Relation.getBytes(resolver, record.postings, key: blockKey(term, no)),
+        !value.isEmpty
+      else {
+        throw DBError.integrityFailure("fts postings: missing block \(no)")
+      }
+      // value == varint(1) || block; the single-byte count prefix is dropped and
+      // the running total re-emitted at the head.
+      combined.append(contentsOf: value.dropFirst())
+    }
+    return combined
   }
 
   static func documentFrequency(
     _ resolver: some PageResolver, _ record: Catalog.FTSRecord, term: [UInt8]
   ) throws(DBError) -> UInt64 {
-    guard let bytes = try Relation.getBytes(resolver, record.dict, key: term) else { return 0 }
-    return decodeDF(bytes)
+    try documentFrequency(resolver, record.dict, term: term)
   }
 
   static func globalStats(
@@ -209,13 +269,98 @@ enum FTSIndex {
     return terms
   }
 
+  // MARK: - Block-per-key storage (F6d)
+
+  /// The packed-block invariant means a term's blocks are `0...(df-1)/128`.
+  @inline(__always)
+  private static func blockNo(forDF df: UInt64) -> UInt32 {
+    UInt32((df - 1) / UInt64(FTSPostings.blockSize))
+  }
+
+  /// Postings key: `varint(termLen) || term || bigEndian(blockNo)`. The length
+  /// prefix keeps one term's keys from colliding with another's (no term is a
+  /// key-prefix of another), and the 4-byte big-endian `blockNo` sorts blocks
+  /// ascending == docid-ascending.
+  private static func blockKey(_ term: [UInt8], _ no: UInt32) -> [UInt8] {
+    var key: [UInt8] = []
+    key.reserveCapacity(term.count + 6)
+    Varint.append(UInt64(term.count), to: &key)
+    key.append(contentsOf: term)
+    key.append(UInt8(truncatingIfNeeded: no >> 24))
+    key.append(UInt8(truncatingIfNeeded: no >> 16))
+    key.append(UInt8(truncatingIfNeeded: no >> 8))
+    key.append(UInt8(truncatingIfNeeded: no))
+    return key
+  }
+
+  private static func writeBlock(
+    _ ctx: TxnContext, _ handle: inout TreeHandle, term: [UInt8], blockNo no: UInt32,
+    _ block: [FTSPosting], columns: Int, positions: Bool
+  ) throws(DBError) {
+    try Relation.putBytes(
+      ctx, &handle, key: blockKey(term, no),
+      value: FTSPostings.encode(block, columns: columns, storePositions: positions))
+  }
+
+  private static func readBlock(
+    _ resolver: some PageResolver, _ handle: TreeHandle, term: [UInt8], blockNo no: UInt32,
+    columns: Int, positions: Bool
+  ) throws(DBError) -> [FTSPosting] {
+    guard let value = try Relation.getBytes(resolver, handle, key: blockKey(term, no)) else { return [] }
+    return try FTSPostings.decode(value, columns: columns, storePositions: positions)
+  }
+
+  /// Decodes a term's whole list from its `0...lastNo` block-keys (lastNo from `df`).
+  private static func fullList(
+    _ resolver: some PageResolver, _ handle: TreeHandle, term: [UInt8], df: UInt64,
+    columns: Int, positions: Bool
+  ) throws(DBError) -> [FTSPosting] {
+    let lastNo = blockNo(forDF: df)
+    var list: [FTSPosting] = []
+    for no in 0...lastNo {
+      list.append(contentsOf: try readBlock(
+        resolver, handle, term: term, blockNo: no, columns: columns, positions: positions))
+    }
+    return list
+  }
+
+  /// Writes `list` (docid-ascending) as packed blocks `0...`.
+  private static func writePacked(
+    _ ctx: TxnContext, _ handle: inout TreeHandle, term: [UInt8], _ list: [FTSPosting],
+    columns: Int, positions: Bool
+  ) throws(DBError) {
+    var no: UInt32 = 0
+    var start = 0
+    while start < list.count {
+      let end = min(start + FTSPostings.blockSize, list.count)
+      try writeBlock(
+        ctx, &handle, term: term, blockNo: no, Array(list[start..<end]), columns: columns,
+        positions: positions)
+      no += 1
+      start = end
+    }
+  }
+
+  /// Re-packs a term after an out-of-order insert: drops the old `0...oldLastNo`
+  /// blocks, then writes the merged list packed. (`list` is non-empty here.)
+  private static func rewritePacked(
+    _ ctx: TxnContext, _ handle: inout TreeHandle, term: [UInt8], oldLastNo: UInt32,
+    _ list: [FTSPosting], columns: Int, positions: Bool
+  ) throws(DBError) {
+    let newLastNo = blockNo(forDF: UInt64(list.count))
+    for no in 0...max(oldLastNo, newLastNo) {
+      _ = try Relation.deleteBytes(ctx, &handle, key: blockKey(term, no))
+    }
+    try writePacked(ctx, &handle, term: term, list, columns: columns, positions: positions)
+  }
+
   // MARK: - Helpers
 
-  private static func decodePostings(
-    _ resolver: some PageResolver, _ handle: TreeHandle, term: [UInt8], columns: Int, positions: Bool
-  ) throws(DBError) -> [FTSPosting] {
-    guard let bytes = try Relation.getBytes(resolver, handle, key: term) else { return [] }
-    return try FTSPostings.decode(bytes, columns: columns, storePositions: positions)
+  private static func documentFrequency(
+    _ resolver: some PageResolver, _ dict: TreeHandle, term: [UInt8]
+  ) throws(DBError) -> UInt64 {
+    guard let bytes = try Relation.getBytes(resolver, dict, key: term) else { return 0 }
+    return decodeDF(bytes)
   }
 
   private static func insertInDocidOrder(_ list: inout [FTSPosting], _ posting: FTSPosting) {

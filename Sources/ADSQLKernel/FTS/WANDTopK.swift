@@ -225,7 +225,9 @@ enum FTSWANDTopK {
   private static func rawPostings(
     _ resolver: some PageResolver, _ record: Catalog.FTSRecord, term: [UInt8]
   ) throws(DBError) -> [UInt8]? {
-    try Relation.getBytes(resolver, record.postings, key: term)
+    // F6d: a term's postings live across block-keys; union them into the single
+    // multi-block value the WAND cursor parses.
+    try FTSIndex.postingsValue(resolver, record, term: term)
   }
 }
 

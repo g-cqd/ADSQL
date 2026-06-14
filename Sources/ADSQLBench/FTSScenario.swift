@@ -14,33 +14,20 @@ import Foundation
 /// This baseline DATA-DRIVES the later perf slices (F6c block-max WAND, F6d
 /// segments/merge). No engine tuning happens here — bench only.
 ///
-/// CRITICAL: ADSQL's `FTSIndex.add` re-decodes/re-encodes the whole posting list
-/// per term per doc (worse-than-O(n²) once common terms accumulate), so large
-/// builds are infeasible today. The corpus size is therefore clamped (see
-/// `rowCap`) and `--rows` tunes it; the build rows/s is reported HONESTLY even
-/// though it trails FTS5 by a wide margin (F6b measured ~400 rows/s at 2k vs
-/// FTS5's ~100k) — that gap is the expected signal motivating the F6d
-/// segments/merge slice. MATCH and ranked top-k latency are *also* far behind at
-/// the modest size (the F6c WAND signal — ranked top-k is tens of ms because the
-/// whole candidate set is scored). See `rowCap` for the measured build curve.
+/// ADSQL's `FTSIndex` stores postings one block per key (F6d): appending a
+/// document rewrites only the last block, so the build is O(n) — not the pre-F6d
+/// O(n²) whole-list re-encode. Larger corpora are now feasible; `rowCap` bounds a
+/// bare run and `--rows` tunes it. The build still trails FTS5 by a roughly
+/// constant factor, and MATCH latency is dominated by decoding very common terms'
+/// long lists (the F6e codec signal); ranked top-k uses block-max WAND (F6c).
 enum FTSScenario {
   /// Corpus-size clamp. `--rows` is clamped to this; a bare run (BenchConfig
-  /// defaults rows to 200k) and `--full` both land here. Kept at 2k — the
-  /// F6a-comparable size — so a bare run finishes in well under a minute on
-  /// ADSQL (build ≈5s + the latency phases) and is repeatable.
-  ///
-  /// This is BELOW the write-amp ceiling on purpose. ADSQL build scales
-  /// worse-than-O(n²) because `FTSIndex.add` re-encodes the whole posting list
-  /// per term per doc, and very common terms (e.g. "view", in nearly every
-  /// abstract) grow without bound (F6b measured, this machine, durability=none):
-  ///   500→0.30s · 1k→1.1s · 2k→4.7s · 4k→16.7s (each doubling ≈ 3.6–4.2× time),
-  /// and 5k already exceeds ~60s while 8k blows past 3 min (super-quadratic once
-  /// hot lists dominate). So the ≲60s *build* ceiling is ≈4–5k; ranked top-k
-  /// scoring grows with the corpus on top of that. SQLite FTS5 builds linearly
-  /// (~100k rows/s) — that gap is the F6d segments/merge signal, and the ranked
-  /// top-k cost is the F6c WAND signal. Raise this to probe nearer the ceiling
-  /// (expect a minute-plus build); lower `--rows` for a quicker run.
-  static let rowCap = 2_000
+  /// defaults rows to 200k) and `--full` land here. F6d's O(n) build makes this
+  /// size finish in seconds — pre-F6d an 8k build took >3 min; now ≈3 s. Pre-F6d
+  /// build curve, for reference: 500→0.30s · 1k→1.1s · 2k→4.7s · 4k→16.7s ·
+  /// 5k>60s (super-O(n²)); F6d is ~linear (≈ constant rows/s across sizes).
+  /// SQLite FTS5 builds at ≈100k rows/s.
+  static let rowCap = 8_000
 
   /// The apple-docs headline shape — identical DDL/tokenizer/weights on both
   /// engines. `bm25(documents_fts, 10, 5, 3, 2, 1)` weights title heaviest.
