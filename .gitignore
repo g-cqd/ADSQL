@@ -1,6 +1,34 @@
+# Swift Package Manager / Xcode
 .build/
 .swiftpm/
+*.xcodeproj
+*.xcworkspace
+Package.resolved
+DerivedData/
+.derivedData/
+xcuserdata/
+*.xcuserstate
+
+# DocC / Pages build output
+_site/
+*.doccarchive
+
+# Code coverage / profiling
+*.profraw
+*.profdata
+
+# Editors
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# macOS
 .DS_Store
+._*
+
+# ADSQL database files + benchmark artifacts
 *.adsql
 *.adsql-lock
 /bench-results/

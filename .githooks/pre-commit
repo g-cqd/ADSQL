@@ -1,0 +1,9 @@
+#!/bin/sh
+# ADSQL pre-commit hook — formatting gate (check-only).
+#
+# Enable once per clone:   git config core.hooksPath .githooks
+# Auto-fix formatting:     swift package --allow-writing-to-package-directory format
+#
+# Runs the same `lint` command plugin CI uses, so local and CI rules can't drift.
+echo "pre-commit: swift package lint"
+swift package lint
