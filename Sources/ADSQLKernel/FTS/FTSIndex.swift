@@ -85,7 +85,7 @@ enum FTSIndex {
         // Out-of-order docid: fall back to read-all, insert, re-pack. O(list),
         // no worse than the pre-F6d whole-list rewrite (and not the hot path).
         var list = try fullList(
-          ctx, postings, term: term, df: oldDF, columns: columns, positions: storePositions)
+          ctx, postings, term: term, columns: columns, positions: storePositions)
         insertInDocidOrder(&list, posting)
         try rewritePacked(
           ctx, &postings, term: term, oldLastNo: lastNo, list, columns: columns,
@@ -127,7 +127,7 @@ enum FTSIndex {
       guard oldDF > 0 else { continue }
       let lastNo = blockNo(forDF: oldDF)
       var list = try fullList(
-        ctx, postings, term: term, df: oldDF, columns: columns, positions: storePositions)
+        ctx, postings, term: term, columns: columns, positions: storePositions)
       list.removeAll { $0.docid == docid }
       // Drop the term's existing blocks, then re-pack what remains.
       for no in 0...lastNo { _ = try Relation.deleteBytes(ctx, &postings, key: blockKey(term, no)) }
@@ -198,21 +198,17 @@ enum FTSIndex {
   static func postingsValue(
     _ resolver: some PageResolver, _ record: Catalog.FTSRecord, term: [UInt8]
   ) throws(DBError) -> [UInt8]? {
-    let df = try documentFrequency(resolver, record, term: term)
-    guard df > 0 else { return nil }
-    let lastNo = blockNo(forDF: df)
-    var combined: [UInt8] = []
-    Varint.append(UInt64(lastNo) + 1, to: &combined)
-    for no in 0...lastNo {
-      guard let value = try Relation.getBytes(resolver, record.postings, key: blockKey(term, no)),
-        !value.isEmpty
-      else {
-        throw DBError.integrityFailure("fts postings: missing block \(no)")
-      }
-      // value == varint(1) || block; the single-byte count prefix is dropped and
-      // the running total re-emitted at the head.
-      combined.append(contentsOf: value.dropFirst())
+    // One range scan over the term's block-keys, reassembled into the single
+    // multi-block value. Each block value is `varint(1) || block`; the per-block
+    // count prefix is dropped and the running total re-emitted at the head.
+    var bodies: [[UInt8]] = []
+    try forEachBlockValue(resolver, record.postings, term: term) { value in
+      bodies.append(Array(value.dropFirst()))
     }
+    guard !bodies.isEmpty else { return nil }
+    var combined: [UInt8] = []
+    Varint.append(UInt64(bodies.count), to: &combined)
+    for body in bodies { combined.append(contentsOf: body) }
     return combined
   }
 
@@ -222,20 +218,13 @@ enum FTSIndex {
   static func docids(
     _ resolver: some PageResolver, _ record: Catalog.FTSRecord, term: [UInt8]
   ) throws(DBError) -> [Int64]? {
-    let df = try documentFrequency(resolver, record, term: term)
-    guard df > 0 else { return nil }
-    let lastNo = blockNo(forDF: df)
     var ids: [Int64] = []
-    ids.reserveCapacity(Int(df))
-    for no in 0...lastNo {
-      guard let value = try Relation.getBytes(resolver, record.postings, key: blockKey(term, no)),
-        !value.isEmpty
-      else {
-        throw DBError.integrityFailure("fts postings: missing block \(no)")
-      }
+    var present = false
+    try forEachBlockValue(resolver, record.postings, term: term) { (value) throws(DBError) in
+      present = true
       ids.append(contentsOf: try FTSPostings.decodeDocids(singleBlock: value))
     }
-    return ids
+    return present ? ids : nil
   }
 
   static func documentFrequency(
@@ -304,15 +293,53 @@ enum FTSIndex {
   /// key-prefix of another), and the 4-byte big-endian `blockNo` sorts blocks
   /// ascending == docid-ascending.
   private static func blockKey(_ term: [UInt8], _ no: UInt32) -> [UInt8] {
-    var key: [UInt8] = []
-    key.reserveCapacity(term.count + 6)
-    Varint.append(UInt64(term.count), to: &key)
-    key.append(contentsOf: term)
+    var key = blockKeyPrefix(term)
     key.append(UInt8(truncatingIfNeeded: no >> 24))
     key.append(UInt8(truncatingIfNeeded: no >> 16))
     key.append(UInt8(truncatingIfNeeded: no >> 8))
     key.append(UInt8(truncatingIfNeeded: no))
     return key
+  }
+
+  /// The shared key prefix of a term's block-keys: `varint(len) || term`. A block
+  /// adds a 4-byte big-endian `blockNo`; the length prefix means no term's prefix
+  /// is a prefix of another's, so a range scan over this enumerates exactly one
+  /// term's blocks.
+  private static func blockKeyPrefix(_ term: [UInt8]) -> [UInt8] {
+    var key: [UInt8] = []
+    key.reserveCapacity(term.count + 2)
+    Varint.append(UInt64(term.count), to: &key)
+    key.append(contentsOf: term)
+    return key
+  }
+
+  /// Visits a term's block values in `blockNo` order via ONE cursor range scan
+  /// (seek the prefix, walk while it holds) — far cheaper than a point-get per
+  /// block on a multi-block term (one tree descent + leaf walk vs one descent
+  /// each). Used by every read path.
+  private static func forEachBlockValue(
+    _ resolver: some PageResolver, _ handle: TreeHandle, term: [UInt8],
+    _ body: ([UInt8]) throws(DBError) -> Void
+  ) throws(DBError) {
+    let prefix = blockKeyPrefix(term)
+    var cursor = Cursor(resolver: resolver, tree: handle)
+    var positioned = false
+    var failure: DBError?
+    prefix.withUnsafeBytes { raw in
+      do throws(DBError) {
+        _ = unsafe try cursor.seek(raw)
+        positioned = cursor.isValid
+      } catch {
+        failure = error
+      }
+    }
+    if let failure { throw failure }
+    while positioned {
+      guard let key = try cursor.currentKey(), key.starts(with: prefix) else { break }
+      guard let value = try cursor.currentValue() else { break }
+      try body(value)
+      positioned = try cursor.next()
+    }
   }
 
   private static func writeBlock(
@@ -332,16 +359,15 @@ enum FTSIndex {
     return try FTSPostings.decode(value, columns: columns, storePositions: positions)
   }
 
-  /// Decodes a term's whole list from its `0...lastNo` block-keys (lastNo from `df`).
+  /// Decodes a term's whole list via a range scan over its block-keys.
   private static func fullList(
-    _ resolver: some PageResolver, _ handle: TreeHandle, term: [UInt8], df: UInt64,
+    _ resolver: some PageResolver, _ handle: TreeHandle, term: [UInt8],
     columns: Int, positions: Bool
   ) throws(DBError) -> [FTSPosting] {
-    let lastNo = blockNo(forDF: df)
     var list: [FTSPosting] = []
-    for no in 0...lastNo {
-      list.append(contentsOf: try readBlock(
-        resolver, handle, term: term, blockNo: no, columns: columns, positions: positions))
+    try forEachBlockValue(resolver, handle, term: term) { (value) throws(DBError) in
+      list.append(
+        contentsOf: try FTSPostings.decode(value, columns: columns, storePositions: positions))
     }
     return list
   }
