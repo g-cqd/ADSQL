@@ -25,7 +25,8 @@ public enum Overflow {
             unsafe allocated.append(try pager.allocateOverflowPage())
         }
         var remaining = unsafe value
-        for unsafe (i, slot) in unsafe allocated.enumerated() {
+        for i in 0..<pages {
+            let slot = unsafe allocated[i]
             let take = min(remaining.count, Format.overflowCapacity)
             unsafe PageHeader.initialize(slot.buffer, type: .overflow)
             unsafe PageHeader.setCellCount(slot.buffer, take)  // dataLen
