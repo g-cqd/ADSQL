@@ -31,6 +31,12 @@ struct FTSWANDCursor {
   private var blockIndex = 0
   private var docids: [Int64] = []
   private var docPos = 0
+  /// Monotonic per-doc field-TF scan within the current block: the byte offset of
+  /// `payloadScanDocPos`'s payload. `currentFieldTFs` advances this forward (never
+  /// re-walking from the block's payload start), so stepping over a block's docs
+  /// costs O(block) rather than O(block²). Reset by `decodeBlock`.
+  private var payloadScanOffset = 0
+  private var payloadScanDocPos = 0
   /// True once the cursor has advanced past the final docid.
   private(set) var exhausted = false
 
@@ -136,6 +142,8 @@ struct FTSWANDCursor {
     docids = ids
     docPos = 0
     blockIndex = index
+    payloadScanOffset = header.payloadOffset
+    payloadScanDocPos = 0
   }
 
   /// Advances to the first docid ≥ `target`, galloping over whole blocks via
@@ -173,19 +181,27 @@ struct FTSWANDCursor {
   }
 
   /// The per-column term frequencies of the CURRENT doc, decoded on demand from
-  /// its field-TF bytes (the cursor already knows the block's `payloadOffset` and
-  /// the doc's index within the block). Returns an all-zero vector when exhausted.
-  /// These are the SAME bytes `FTSScorer` reads for this doc, so a score computed
-  /// from them is bit-identical. Position runs (when present) are skipped per
-  /// preceding doc to reach this doc's field-TFs.
-  func currentFieldTFs() -> [UInt32] {
+  /// its field-TF bytes. A monotonic payload scan (`payloadScanOffset` /
+  /// `payloadScanDocPos`) advances forward with the cursor, so each preceding doc's
+  /// payload is stepped over exactly ONCE per block — whole-block scoring is
+  /// O(block), not O(block²) (it previously re-walked from the block's payload
+  /// start on every doc, the dominant ranked cost after F6i). docPos only moves
+  /// forward within a block (`advance`/`advancePast`) and resets on `decodeBlock`,
+  /// so the scan never needs to rewind; docs the pruner passes without scoring are
+  /// caught up (and stepped over once) on the next call. Returns an all-zero
+  /// vector when exhausted. These are the SAME bytes `FTSScorer` reads for this
+  /// doc, so a score computed from them is bit-identical.
+  mutating func currentFieldTFs() -> [UInt32] {
     guard !exhausted else { return [UInt32](repeating: 0, count: columns) }
-    let header = blocks[blockIndex]
-    var offset = header.payloadOffset
-    // Skip the payloads of the `docPos` docs before the current one.
-    for _ in 0..<docPos {
-      skipOneDocPayload(&offset)
+    // Catch the scan up to the current doc (forward-only; each intervening doc's
+    // payload is skipped once).
+    while payloadScanDocPos < docPos {
+      skipOneDocPayload(&payloadScanOffset)
+      payloadScanDocPos += 1
     }
+    // Read this doc's field-TFs without consuming them: the scan stays at this
+    // doc's payload start so the next doc resumes from here.
+    var offset = payloadScanOffset
     var tfs = [UInt32](repeating: 0, count: columns)
     for column in 0..<columns {
       guard let tf = Varint.read(bytes, &offset) else { break }
