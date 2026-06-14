@@ -2,7 +2,7 @@ import Darwin
 import Foundation
 
 // adsql-bench [--rows N] [--seconds S] [--engine adsql|sqlite] [--dir PATH] [scenarios...]
-// Scenarios: cold get scan concurrent upsert table sql fts
+// Scenarios: cold get scan concurrent upsert table sql fts strategy
 // Default (no scenario args): cold get scan concurrent upsert table.
 // `sql` and `fts` are opt-in (heavier): the FTS index build is write-amplified
 // today (F6b), so a bare run would otherwise stall on it — pass `fts` explicitly.
@@ -80,6 +80,11 @@ do {
         try SQLScenario.run(engine, dir: dir, config: config)
       case "fts":
         try FTSScenario.run(engine, dir: dir, config: config)
+      case "strategy":
+        // Self-contained matrix over both engines; run once, on the first engine.
+        if engine == engines.first {
+          try StrategyBench.run(engines: engines, dir: dir, config: config)
+        }
       default:
         print("unknown scenario \(scenario)")
         exit(1)
