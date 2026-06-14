@@ -1,3 +1,5 @@
+import Synchronization
+
 /// A multi-statement write transaction: every statement runs against one
 /// shared `WriteTxn`, so a batch of writes commits once (one durability
 /// point) instead of per statement. The handle is only valid inside the

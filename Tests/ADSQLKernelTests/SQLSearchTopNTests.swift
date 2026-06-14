@@ -1,5 +1,6 @@
 import ADSQLKernel
 import ADSQLTestSupport
+import Foundation
 import Testing
 
 /// Differential tests for the bounded top-N (ORDER BY + small LIMIT over an

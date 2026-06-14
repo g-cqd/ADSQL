@@ -1,4 +1,4 @@
-import ADSQLKernel
+package import ADSQLKernel
 
 /// Vectored-write test helper: copies each chunk into stable heap buffers so
 /// the gather path of `pwritev` is exercised without escaping `withUnsafeBytes`

@@ -1,4 +1,5 @@
 import Dispatch
+import Synchronization
 import Testing
 import ADSQLTestSupport
 @testable import ADSQLKernel

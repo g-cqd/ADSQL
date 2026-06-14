@@ -1,4 +1,4 @@
-import ADSQLKernel
+package import ADSQLKernel
 import Synchronization
 
 /// Storage channel that journals every mutation while writing through to a
