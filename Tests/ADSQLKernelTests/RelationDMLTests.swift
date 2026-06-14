@@ -69,6 +69,28 @@ private func verifyAgainstModel(_ db: Database, _ model: RelationalModelStore) t
 
 @Suite("Relation DML model tests")
 struct RelationDMLModelTests {
+  // Built outside the fuzz loop's nested `writeSync { for { switch } }` closures so
+  // the loop body stays under the long-function-body timing limit.
+  private static func randomDocsValues(_ rng: inout SplitMix64) -> [String: Value] {
+    var values: [String: Value] = [
+      "key": .text("k\(rng.next() % 60)"),
+      "title": .text(RandomValues.string(&rng)),
+    ]
+    if rng.next() % 3 == 0 { values["score"] = .integer(Int64(rng.next() % 5)) }
+    if rng.next() % 4 == 0 { values["payload"] = .blob(RandomValues.bytes(&rng, maxLength: 12)) }
+    if rng.next() % 8 == 0 { values["id"] = .integer(Int64(rng.next() % 500) + 1) }
+    return values
+  }
+
+  private static func randomUpdateSet(_ rng: inout SplitMix64) -> [String: Value] {
+    var set: [String: Value] = [:]
+    if rng.next() % 2 == 0 { set["title"] = .text(RandomValues.string(&rng)) }
+    if rng.next() % 2 == 0 { set["score"] = .integer(Int64(rng.next() % 5)) }
+    if rng.next() % 5 == 0 { set["key"] = .text("k\(rng.next() % 60)") }
+    if set.isEmpty { set["score"] = .integer(9) }
+    return set
+  }
+
   @Test(arguments: [UInt64(11), 222, 3333])
   func randomOpsMatchModel(seed: UInt64) throws {
     let dir = TempDir()
@@ -93,13 +115,7 @@ struct RelationDMLModelTests {
           switch rng.next() % 10 {
           case 0..<5: // insert into docs
             let policy = policies[Int(rng.next() % 3)]
-            var values: [String: Value] = [
-              "key": .text("k\(rng.next() % 60)"),
-              "title": .text(RandomValues.string(&rng)),
-            ]
-            if rng.next() % 3 == 0 { values["score"] = .integer(Int64(rng.next() % 5)) }
-            if rng.next() % 4 == 0 { values["payload"] = .blob(RandomValues.bytes(&rng, maxLength: 12)) }
-            if rng.next() % 8 == 0 { values["id"] = .integer(Int64(rng.next() % 500) + 1) }
+            let values = Self.randomDocsValues(&rng)
             let expected = model.insert(into: "docs", values, onConflict: policy)
             do throws(DBError) {
               let got = try txn.insert(into: "docs", values, onConflict: policy)
@@ -125,11 +141,7 @@ struct RelationDMLModelTests {
             }
           case 7..<9: // update random docs row
             let target = Int64(rng.next() % 80) + 1
-            var set: [String: Value] = [:]
-            if rng.next() % 2 == 0 { set["title"] = .text(RandomValues.string(&rng)) }
-            if rng.next() % 2 == 0 { set["score"] = .integer(Int64(rng.next() % 5)) }
-            if rng.next() % 5 == 0 { set["key"] = .text("k\(rng.next() % 60)") }
-            if set.isEmpty { set["score"] = .integer(9) }
+            let set = Self.randomUpdateSet(&rng)
             let expected = model.update("docs", rowid: target, set: set)
             do throws(DBError) {
               let got = try txn.update("docs", rowid: target, set: set)
@@ -356,12 +368,29 @@ struct RelationDMLSemanticsTests {
   /// the eager `next()`/`Row` path, for both table (rowid-order) and index
   /// (key-order, warm table-cursor fetch) scans, across every column kind: the
   /// rowid alias, a static default, a blob, text, and NULLs.
-  @Test func lazyRowViewMatchesEagerRow() throws {
-    let dir = TempDir()
-    defer { dir.cleanup() }
-    let db = try makeDB(dir, "lazyview.adsql")
-    defer { db.close() }
-
+  // Hoisted out of the test bodies (generic local funcs + a shared 3-doc fixture)
+  // so each split @Test stays under the long-function-body timing limit.
+  private static func eagerRows<R: PageResolver>(
+    _ cursor: inout RowCursor<R>
+  ) throws(DBError) -> [[Value]] {
+    var out: [[Value]] = []
+    while let row = try cursor.next() { out.append(row.values) }
+    return out
+  }
+  private static func lazyRows<R: PageResolver>(
+    _ cursor: inout RowCursor<R>, columnCount: Int
+  ) throws(DBError) -> [[Value]] {
+    var out: [[Value]] = []
+    try cursor.forEachRow { (view) throws(DBError) in
+      var values: [Value] = []
+      for index in 0..<columnCount { values.append(try view.value(at: index)) }
+      out.append(values)
+      return true
+    }
+    return out
+  }
+  private func makeRowViewDB(_ dir: TempDir, _ name: String) throws -> Database {
+    let db = try makeDB(dir, name)
     try db.writeSync { (txn) throws(DBError) in
       _ = try txn.insert(into: "docs", [
         "key": .text("a"), "title": .text("Alpha"),
@@ -370,42 +399,47 @@ struct RelationDMLSemanticsTests {
       _ = try txn.insert(into: "docs", [
         "key": .text("c"), "title": .text("Gamma"), "score": .integer(2)])
     }
+    return db
+  }
+
+  @Test func lazyRowViewMatchesEagerRow() throws {
+    let dir = TempDir()
+    defer { dir.cleanup() }
+    let db = try makeRowViewDB(dir, "lazyview.adsql")
+    defer { db.close() }
     let columnCount = docsDef.columns.count
 
-    func eager<R: PageResolver>(_ cursor: inout RowCursor<R>) throws(DBError) -> [[Value]] {
-      var out: [[Value]] = []
-      while let row = try cursor.next() { out.append(row.values) }
-      return out
-    }
-    func lazy<R: PageResolver>(_ cursor: inout RowCursor<R>) throws(DBError) -> [[Value]] {
-      var out: [[Value]] = []
-      try cursor.forEachRow { (view) throws(DBError) in
-        var values: [Value] = []
-        for index in 0..<columnCount { values.append(try view.value(at: index)) }
-        out.append(values)
-        return true
-      }
-      return out
-    }
-
     let tableEager = try db.read { (txn) throws(DBError) in
-      try txn.withRowCursor(table: "docs") { (c) throws(DBError) in try eager(&c) }
+      try txn.withRowCursor(table: "docs") { (c) throws(DBError) in try Self.eagerRows(&c) }
     }
     let tableLazy = try db.read { (txn) throws(DBError) in
-      try txn.withRowCursor(table: "docs") { (c) throws(DBError) in try lazy(&c) }
+      try txn.withRowCursor(table: "docs") { (c) throws(DBError) in
+        try Self.lazyRows(&c, columnCount: columnCount)
+      }
     }
     let indexEager = try db.read { (txn) throws(DBError) in
-      try txn.withIndexCursor(index: "i_docs_title") { (c) throws(DBError) in try eager(&c) }
+      try txn.withIndexCursor(index: "i_docs_title") { (c) throws(DBError) in try Self.eagerRows(&c) }
     }
     let indexLazy = try db.read { (txn) throws(DBError) in
-      try txn.withIndexCursor(index: "i_docs_title") { (c) throws(DBError) in try lazy(&c) }
+      try txn.withIndexCursor(index: "i_docs_title") { (c) throws(DBError) in
+        try Self.lazyRows(&c, columnCount: columnCount)
+      }
     }
 
     #expect(tableEager == tableLazy)
     #expect(indexEager == indexLazy)
     #expect(tableEager.count == 3)
-    #expect(tableLazy[0] == [.integer(1), .text("a"), .text("Alpha"), .integer(5), .blob([1, 2, 3])])
-    #expect(tableLazy[1] == [.integer(2), .text("b"), .null, .integer(0), .null])
+    let expectedRow0: [Value] = [.integer(1), .text("a"), .text("Alpha"), .integer(5), .blob([1, 2, 3])]
+    let expectedRow1: [Value] = [.integer(2), .text("b"), .null, .integer(0), .null]
+    #expect(tableLazy[0] == expectedRow0)
+    #expect(tableLazy[1] == expectedRow1)
+  }
+
+  @Test func rowViewNameBasedAccess() throws {
+    let dir = TempDir()
+    defer { dir.cleanup() }
+    let db = try makeRowViewDB(dir, "rowviewnames.adsql")
+    defer { db.close() }
 
     // Name-based access, the rowid alias by name, and a missing column.
     var probes: [(rowid: Int64, keyByName: Value?, idByName: Int64?, missing: Value?)] = []

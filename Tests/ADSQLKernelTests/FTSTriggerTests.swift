@@ -400,13 +400,14 @@ struct FTSTriggerTests {
 
     #expect(rowsMatch(ours, theirs, ordered: true), "adsql \(ours)\nsqlite \(theirs)")
     // Spot-check the captured NEW/OLD values directly too.
-    #expect(ours == [
+    let expected: [[Value]] = [
       [.text("insert"), .integer(1), .null, .integer(100)],
       [.text("insert"), .integer(2), .null, .integer(50)],
       [.text("update"), .integer(1), .integer(100), .integer(175)],
       [.text("update"), .integer(2), .integer(50), .integer(40)],
       [.text("delete"), .integer(1), .integer(175), .null],
-    ])
+    ]
+    #expect(ours == expected)
   }
 
   @Test func whenClauseGatesFiring() throws {

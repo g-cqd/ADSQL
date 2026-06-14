@@ -186,31 +186,53 @@ struct SQLPlannerResidualTests {
     }
   }
 
-  private static func randomQuery(_ rng: inout SplitMix64) -> (sql: String, ordered: Bool) {
+  // One random predicate. A `switch` (each case an independent statement) instead
+  // of a 16-element interpolated-string array literal — the latter forces the
+  // type-checker to unify all elements in one expression and tripped the
+  // long-function-body timing flag.
+  private static func randomPredicate(_ rng: inout SplitMix64) -> String {
+    // Two 8-case halves rather than one 16-case switch — keeps each function body
+    // under the long-function-body timing limit.
+    rng.next() % 2 == 0 ? randomPredicateA(&rng) : randomPredicateB(&rng)
+  }
+
+  private static func randomPredicateA(_ rng: inout SplitMix64) -> String {
     func pick<T>(_ items: [T]) -> T { items[Int(rng.next() % UInt64(items.count))] }
     let fw = IndexedDocs.frameworks
+    switch rng.next() % 8 {
+    case 0: return "id = \(1 + rng.next() % 40)"
+    case 1: return "id IN (\(1 + rng.next() % 40), \(1 + rng.next() % 40), \(1 + rng.next() % 40))"
+    case 2: return "key = 'doc\(1 + rng.next() % 45)'"
+    case 3: return "framework = '\(pick(fw))'"
+    case 4: return "framework IN ('\(pick(fw))', '\(pick(fw))')"
+    case 5: return "framework IS NULL"
+    case 6: return "score = \(rng.next() % 6)"
+    default: return "score > \(rng.next() % 6)"
+    }
+  }
 
-    let predicates: [String] = [
-      "id = \(1 + rng.next() % 40)",
-      "id IN (\(1 + rng.next() % 40), \(1 + rng.next() % 40), \(1 + rng.next() % 40))",
-      "key = 'doc\(1 + rng.next() % 45)'",
-      "framework = '\(pick(fw))'",
-      "framework IN ('\(pick(fw))', '\(pick(fw))')",
-      "framework IS NULL",
-      "score = \(rng.next() % 6)",
-      "score > \(rng.next() % 6)",
-      "score >= \(rng.next() % 4) AND score < \(3 + rng.next() % 4)",
-      "score = \(rng.next() % 6) AND weight > \(Double(rng.next() % 800) / 100.0)",
-      "weight > \(Double(rng.next() % 1000) / 100.0)",
-      "weight IS NOT NULL",
-      "title = 'alpha'",
-      "score BETWEEN \(rng.next() % 4) AND \(2 + rng.next() % 4)",
-      "score NOT BETWEEN \(rng.next() % 4) AND \(2 + rng.next() % 4)",
-      "id BETWEEN \(1 + rng.next() % 20) AND \(20 + rng.next() % 20)",
-    ]
+  private static func randomPredicateB(_ rng: inout SplitMix64) -> String {
+    switch rng.next() % 8 {
+    case 0: return "score >= \(rng.next() % 4) AND score < \(3 + rng.next() % 4)"
+    case 1:
+      let w = Double(rng.next() % 800) / 100.0
+      return "score = \(rng.next() % 6) AND weight > \(w)"
+    case 2:
+      let w = Double(rng.next() % 1000) / 100.0
+      return "weight > \(w)"
+    case 3: return "weight IS NOT NULL"
+    case 4: return "title = 'alpha'"
+    case 5: return "score BETWEEN \(rng.next() % 4) AND \(2 + rng.next() % 4)"
+    case 6: return "score NOT BETWEEN \(rng.next() % 4) AND \(2 + rng.next() % 4)"
+    default: return "id BETWEEN \(1 + rng.next() % 20) AND \(20 + rng.next() % 20)"
+    }
+  }
 
-    var clauses: [String] = [pick(predicates)]
-    if rng.next() % 2 == 0 { clauses.append(pick(predicates)) }
+  private static func randomQuery(_ rng: inout SplitMix64) -> (sql: String, ordered: Bool) {
+    func pick<T>(_ items: [T]) -> T { items[Int(rng.next() % UInt64(items.count))] }
+
+    var clauses: [String] = [randomPredicate(&rng)]
+    if rng.next() % 2 == 0 { clauses.append(randomPredicate(&rng)) }
     let whereClause = "WHERE " + clauses.joined(separator: " AND ")
 
     let projections = ["*", "id", "id, score", "id, framework, weight"]

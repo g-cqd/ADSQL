@@ -1,4 +1,4 @@
-package import ADSQLKernel
+import ADSQLKernel
 
 /// Reference model for property tests: a plain dictionary with lexicographic
 /// ordering on demand. Deliberately naive — correctness oracle, not fast.

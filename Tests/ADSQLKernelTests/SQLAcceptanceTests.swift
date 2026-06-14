@@ -182,26 +182,39 @@ struct SQLFuzzTests {
     }
   }
 
-  private static func randomQuery(_ rng: inout SplitMix64) -> (sql: String, ordered: Bool) {
+  // Two halves rather than one 11-element interpolated-string array literal, which
+  // tripped the long-function-body timing flag (see SQLPlannerTests.randomPredicate).
+  private static func acceptancePredicate(_ rng: inout SplitMix64) -> String {
+    rng.next() % 2 == 0 ? acceptancePredicateA(&rng) : acceptancePredicateB(&rng)
+  }
+  private static func acceptancePredicateA(_ rng: inout SplitMix64) -> String {
     func pick<T>(_ items: [T]) -> T { items[Int(rng.next() % UInt64(items.count))] }
     let fw = DocsCorpus.frameworks
+    switch rng.next() % 6 {
+    case 0: return "d.framework = '\(pick(fw))'"
+    case 1: return "d.framework IS NULL"
+    case 2: return "d.framework IS NOT NULL"
+    case 3: return "d.language = 'en'"
+    case 4: return "d.language IS NULL"
+    default: return "d.id < \(5 + rng.next() % 40)"
+    }
+  }
+  private static func acceptancePredicateB(_ rng: inout SplitMix64) -> String {
+    switch rng.next() % 5 {
+    case 0: return "d.id IN (\(1 + rng.next() % 44), \(1 + rng.next() % 44), \(1 + rng.next() % 44))"
+    case 1: return "d.source_type IN (SELECT value FROM json_each('[\"api\",\"sample\"]'))"
+    case 2: return "COALESCE(d.is_deprecated, 0) = 0"
+    case 3: return "d.title LIKE 'b%'"
+    default: return "CAST(json_extract(d.source_metadata, '$.year') AS INTEGER) > 2020"
+    }
+  }
 
-    let predicates = [
-      "d.framework = '\(pick(fw))'",
-      "d.framework IS NULL",
-      "d.framework IS NOT NULL",
-      "d.language = 'en'",
-      "d.language IS NULL",
-      "d.id < \(5 + rng.next() % 40)",
-      "d.id IN (\(1 + rng.next() % 44), \(1 + rng.next() % 44), \(1 + rng.next() % 44))",
-      "d.source_type IN (SELECT value FROM json_each('[\"api\",\"sample\"]'))",
-      "COALESCE(d.is_deprecated, 0) = 0",
-      "d.title LIKE 'b%'",
-      "CAST(json_extract(d.source_metadata, '$.year') AS INTEGER) > 2020",
-    ]
+  private static func randomQuery(_ rng: inout SplitMix64) -> (sql: String, ordered: Bool) {
+    func pick<T>(_ items: [T]) -> T { items[Int(rng.next() % UInt64(items.count))] }
+
     var clauses: [String] = []
     let predicateCount = Int(rng.next() % 3)
-    for _ in 0..<predicateCount { clauses.append(pick(predicates)) }
+    for _ in 0..<predicateCount { clauses.append(Self.acceptancePredicate(&rng)) }
     let whereClause = clauses.isEmpty ? "" : " WHERE " + clauses.joined(separator: " AND ")
     let join = (rng.next() % 2 == 0)
       ? " LEFT JOIN roots r ON r.slug = d.framework" : ""

@@ -193,22 +193,26 @@ struct SQLParserStatementTests {
     #expect(d.returning.isEmpty)
   }
 
-  @Test func createTableFull() throws {
-    guard case .createTable(let ct) = try parse("""
-      CREATE TABLE IF NOT EXISTS documents (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        key TEXT NOT NULL UNIQUE,
-        title TEXT NOT NULL COLLATE NOCASE,
-        framework TEXT,
-        is_deprecated INTEGER DEFAULT 0,
-        score REAL DEFAULT -1.5,
-        created_at TEXT DEFAULT (datetime('now')),
-        root_id INTEGER REFERENCES roots(id) ON DELETE CASCADE,
-        CHECK (id > 0),
-        UNIQUE (framework, key),
-        FOREIGN KEY (root_id) REFERENCES roots(id) ON DELETE RESTRICT
-      ) STRICT
-      """)
+  // Split into columns/defaults and constraints/indexes halves (sharing one DDL)
+  // so each @Test body stays under the long-function-body timing limit.
+  static let documentsFullDDL = """
+    CREATE TABLE IF NOT EXISTS documents (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      key TEXT NOT NULL UNIQUE,
+      title TEXT NOT NULL COLLATE NOCASE,
+      framework TEXT,
+      is_deprecated INTEGER DEFAULT 0,
+      score REAL DEFAULT -1.5,
+      created_at TEXT DEFAULT (datetime('now')),
+      root_id INTEGER REFERENCES roots(id) ON DELETE CASCADE,
+      CHECK (id > 0),
+      UNIQUE (framework, key),
+      FOREIGN KEY (root_id) REFERENCES roots(id) ON DELETE RESTRICT
+    ) STRICT
+    """
+
+  @Test func createTableFullColumns() throws {
+    guard case .createTable(let ct) = try parse(Self.documentsFullDDL)
     else { Issue.record("not createTable"); return }
     let def = ct.definition
     #expect(ct.ifNotExists)
@@ -219,11 +223,18 @@ struct SQLParserStatementTests {
     #expect(def.columns[4].defaultValue == .value(.integer(0)))
     #expect(def.columns[5].defaultValue == .value(.real(-1.5)))
     #expect(def.columns[6].defaultValue == .datetimeNow)
+  }
+
+  @Test func createTableFullConstraints() throws {
+    guard case .createTable(let ct) = try parse(Self.documentsFullDDL)
+    else { Issue.record("not createTable"); return }
+    let def = ct.definition
     #expect(def.foreignKeys.count == 2)
     #expect(def.foreignKeys[0].onDelete == .cascade)
     #expect(def.foreignKeys[1].onDelete == .restrict)
     // Implied unique indexes: column UNIQUE + table UNIQUE.
-    #expect(ct.impliedIndexes.map(\.columns) == [["key"], ["framework", "key"]])
+    let expectedIndexCols: [[String]] = [["key"], ["framework", "key"]]
+    #expect(ct.impliedIndexes.map(\.columns) == expectedIndexCols)
     let allUnique = ct.impliedIndexes.allSatisfy(\.unique)
     #expect(allUnique)
     #expect(ct.impliedIndexes[0].name == "sqlite_autoindex_documents_1")

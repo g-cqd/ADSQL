@@ -11,7 +11,7 @@ private func parse(_ sql: String) throws -> SQLStatementAST {
 /// indexing yet — those arrive in F1–F4.
 @Suite("FTS5 — F0 (parse + catalog record)")
 struct FTSCatalogTests {
-  @Test func parsesTheFourAppleDocsShapes() throws {
+  @Test func parsesSelfContainedAndExternalShapes() throws {
     // self-contained + `porter unicode61` + a column named `key` (a keyword).
     guard case .createVirtualTable(let docs) = try parse("""
       CREATE VIRTUAL TABLE documents_fts USING fts5(
@@ -31,7 +31,9 @@ struct FTSCatalogTests {
     #expect(trig.definition.columns == ["title"])
     #expect(trig.definition.tokenize == ["trigram", "case_sensitive", "0"])
     #expect(trig.definition.content == .external(table: "documents", rowid: "id"))
+  }
 
+  @Test func parsesContentlessAndPrefixShapes() throws {
     // contentless + contentless_delete.
     guard case .createVirtualTable(let body) = try parse("""
       CREATE VIRTUAL TABLE documents_body_fts USING fts5(

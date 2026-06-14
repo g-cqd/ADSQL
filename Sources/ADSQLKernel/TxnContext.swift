@@ -69,7 +69,7 @@ package struct PageAllocator {
 /// Mutable state of one write transaction. Single-threaded by construction:
 /// only the writer loop touches it.
 package final class TxnContext: PageResolver, OverflowPager {
-  package let source: PageSource
+  package let source: any PageSource
   package var meta: Meta
   package var allocator: PageAllocator
   /// Pages written this transaction (always includes every allocated page).
@@ -127,7 +127,7 @@ package final class TxnContext: PageResolver, OverflowPager {
   var undoAllocated: [UInt64] = []
   var undoFreedOwned: [(pageNo: UInt64, buf: PageBuf)] = []
 
-  package init(source: PageSource, meta: Meta, pool: [UInt64] = []) {
+  package init(source: any PageSource, meta: Meta, pool: [UInt64] = []) {
     self.source = source
     self.meta = meta
     self.allocator = PageAllocator(highWater: meta.pageCount, pool: pool)
@@ -238,7 +238,7 @@ package final class TxnContext: PageResolver, OverflowPager {
 
 /// Read-side resolver over committed pages only.
 package struct CommittedResolver: PageResolver {
-  package let source: PageSource
+  package let source: any PageSource
   /// Snapshot's committed high-water: a committed tree never references a page
   /// number ≥ pageCount, so anything beyond it is a corrupt in-page pointer
   /// (which would read mapped-but-uncommitted space without faulting). `.max`
@@ -249,7 +249,7 @@ package struct CommittedResolver: PageResolver {
   /// changes the page bytes, so the stored XXH64 no longer matches.
   package let verifyChecksums: Bool
 
-  package init(source: PageSource, pageCount: UInt64 = .max, verifyChecksums: Bool = false) {
+  package init(source: any PageSource, pageCount: UInt64 = .max, verifyChecksums: Bool = false) {
     self.source = source
     self.pageCount = pageCount
     self.verifyChecksums = verifyChecksums
