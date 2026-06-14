@@ -1,140 +1,206 @@
-# ADSQL Roadmap
+# ADSQL
 
-A pure-Swift, SQLite-compatible embedded database engine for macOS. This file
-is the single source of truth for milestone status, performance headroom, the
-deferred-SQL registry, and the consumer (apple-docs) dependency. Design
-rationale lives in `docs/rfcs/`; active multi-milestone execution (M5 → M7) is
-scheduled in `docs/rfcs/0008-execution-schedule.md` — the live program tracker. The
-cross-cutting **codebase health check + performance-maturity program** is consolidated in
-`docs/reviews/0003-codebase-health-and-perf.md` (findings, designs, unified SQL+FTS scorecard,
-waste catalog) and scheduled in `docs/rfcs/0009-health-and-perf-execution-program.md` (the live
-health+perf tracker).
+A from-scratch, **pure-Swift, SQLite-compatible embedded database** for Apple platforms.
+Copy-on-write B+tree over `mmap`, single-writer / wait-free-reader MVCC, crash-safe by
+construction. Swift 6.2, module-wide `.strictMemorySafety()` (SE-0458) + experimental Lifetimes,
+macOS 26, Apple-Silicon-first (16 KiB native pages), **zero runtime dependencies**.
 
-## Milestone suite
+> **This file is the single source of truth** — architecture, current status, the vs-SQLite
+> scorecard, and the prioritized backlog. It consolidates what were nine RFCs + three design
+> reviews (now folded in here; the originals remain in git history). Code comments that cite
+> `RFC 000x` / `Review 000x` / `F6x` refer to that history — they are kept as provenance.
+
+**Modules:** `ADSQLKernel` (engine) · `ADSQL` (public façade, `@_exported`) · `ADSQLTool` (CLI) ·
+`ADSQLBench` (benchmarks vs system SQLite + FTS5) · `ADSQLTestSupport` (reference model store,
+seeded op generator, simulated disk for crash injection). Tests in `ADSQLKernelTests`.
+
+---
+
+## 1. Architecture & design
+
+### Storage engine
+- **COW B+tree over `mmap`** — 16 KiB pages, **XXH64** per-page checksums, overflow-page chains for
+  large values, a page allocator + free-list that reclaims pages once no reader can still see them.
+- Committed pages are **immutable**; a write transaction copies-on-write the pages it touches.
+
+### Durability & concurrency
+- **Single-writer / wait-free-reader MVCC.** Readers run lock-free against an immutable committed
+  snapshot; one writer at a time mutates via a dedicated writer thread. A cross-process reader table +
+  writer lock coordinate multiple processes.
+- **Group commit** batches concurrent write requests; per-request undo lets one request roll back
+  without aborting the batch.
+- **Crash-safe by construction** — recovery is simply *picking the newest checksum-valid meta page*
+  (meta ping-pong + one barrier). No WAL replay.
+- **Durability profiles:** `.barrier` (`F_BARRIERFSYNC`, default), `.full` (`F_FULLFSYNC`), `.none`
+  (bench). O(1) atomic snapshots via APFS `clonefile(2)`.
+
+### SQL engine
+- Pipeline: **lexer → parser → binder → heuristic planner → row-at-a-time executor → writer.**
+- Surface: single-table & joined `SELECT` (INNER/LEFT), `WHERE` / projection / `ORDER BY` / `LIMIT` /
+  `OFFSET` / `DISTINCT`, `GROUP BY` + `COUNT`/`SUM` + `HAVING`, `UNION`/`UNION ALL`,
+  `INSERT`/`UPDATE`/`DELETE` + `RETURNING`, full DDL, `PRAGMA` compatibility, `BETWEEN`,
+  `INSERT … SELECT`, `ON CONFLICT DO UPDATE` (upsert), correlated scalar subqueries,
+  `db.transaction { }`, `CREATE TRIGGER`. Column refs are bound to `(table, column)` slots at bind
+  time (no per-row string resolution). Differential-tested against system SQLite (CSQLite).
+- The bound AST (`SQLExpr` / `SQLSelect` / `SQLStatementAST`) is public — the seam a future query DSL
+  lowers into via `prepare(ast:)`.
+
+### Execution-strategy framework
+- `ExecutionOptions` selects, per database or per statement, an **evaluator** (`treeWalk` /
+  `compiledClosures` / `vdbe`), a **join** strategy (`nestedLoop` / `hash` / `merge` / `auto`), and an
+  **insert** path (`standard` / `hoisted` / `appendCursor`). **Defaults: `join=.auto`,
+  `evaluator=.compiledClosures`, `insert=.standard`.**
+- **Strategy-beside discipline:** a new strategy lands *beside* the reference path and only becomes a
+  default once it wins on all **seven criteria** — accuracy, performance, concurrency, parallelism,
+  reliability, consistency, integrity. Equivalence is locked by `SQLStrategyMatrixTests` (every
+  strategy ≡ reference ≡ SQLite) and measured by `ADSQLBench`'s `StrategyBench` matrix. Nothing is
+  retired while the program runs; a superseded path stays selectable one release.
+
+### FTS5
+- `CREATE VIRTUAL TABLE … USING fts5`, the `MATCH` operator, `bm25()` / **bm25f** per-column weights.
+- Tokenizers: `unicode61`, `porter`, `trigram`. Postings codec uses frame-of-reference bit-packing,
+  one block per key (O(n) incremental build). Ranked top-k uses **block-max WAND**. A transaction-
+  scoped postings memtable coalesces a transaction's documents before flush.
+
+### Safety model
+- **Module-wide strict memory safety** (SE-0458): ~620 unsafe constructs each explicitly `unsafe` or
+  encapsulated by a `@safe` type, so any *new* unsafe use is compiler-flagged.
+- `~Escapable` / `~Copyable` + `RawSpan` lifetime dependencies bind page views to their snapshot
+  (`Cursor`, `ReadTxn`/`WriteTxn`, `RowView`, `ValueRef`) — they cannot outlive it.
+- **Typed throws** (`throws(DBError)`) below the façade; `Synchronization` `Mutex`/`Atomic` for
+  in-process state; thread-safe libc (`strerror_r`).
+
+### Public API & code structure
+- Public surface (post-encapsulation): `Database`, `ReadTxn`/`WriteTxn`, `Statement`, `SQLParameters`,
+  `SQLRow`/`Row`/`SQLColumnHeader`/`RunResult`, `Value`/`ColumnType`/`Collation`, `DBError`, the
+  `Definitions` (table/column/index), `DatabaseOptions`/`ExecutionOptions`/`DurabilityProfile`,
+  `IntegrityReport` + `verifyIntegrity`. The **entire storage engine is `package`** (B-tree, pager,
+  cursors, codecs, catalog, txn context) — invisible to external consumers, reachable in-package.
+- No `ADSQLKernel` source file exceeds ~600 lines (the executor/parser/binder/storage layers are split
+  into concern-scoped files).
+
+---
+
+## 2. Status
 
 | Milestone | Status | Scope |
 |---|---|---|
-| **M0–M2 — Storage kernel** | ✅ done | COW B+tree over reserve-max mmap (16 KiB pages, XXH64-checksummed); single-writer / wait-free-reader MVCC; free-list reclamation; commit protocol (one F_BARRIERFSYNC + meta ping-pong) with crash-injection recovery; cross-process reader table + writer lock; group commit. |
-| **M3 — Relational layer** | ✅ done | Strict typed `Value`/columns; order-preserving `KeyCodec`; `RecordCodec`; catalog + transactional DDL; DML with conflict policies and secondary-index maintenance; FK `ON DELETE CASCADE/RESTRICT`; deep integrity (index ⇄ row bijection). |
-| **M4 — SQL front end** | ✅ done | Lexer → parser → binder → heuristic planner → row-at-a-time executor → writer. Single-table & joined SELECT, WHERE/projection/ORDER BY/LIMIT/OFFSET/DISTINCT, INNER/LEFT joins, GROUP BY + COUNT/SUM + HAVING, UNION/UNION ALL, INSERT/UPDATE/DELETE + RETURNING, DDL. Differential-tested vs CSQLite. See `docs/rfcs/0001-sql-engine.md`. |
-| **M4.5 — SQL completeness** | ✅ done | PRAGMA compatibility, BETWEEN, INSERT…SELECT, `ON CONFLICT DO UPDATE` (upsert), correlated scalar subqueries, `db.transaction { }`. |
-| **M4.6 — Scan-engine performance** | ✅ done | Zero-copy row decode (no per-row record copy) + bounded top-N + drop residual conjuncts an exact index probe already covers. Took `sql search` 14.3 → 5.34 ms. See `docs/rfcs/0002-scan-engine-performance.md`. |
-| **M4.7 — Perf + memory-safety pass** | ✅ done | Perf: B7 ordered rowid fetch (warm `Cursor.seekForward`, 5.34 → ~5.0 ms), B1 incremental decode, B3 positional `insertAssembled`, A4 relational lazy `RowView` scan (index scan ~2×). Safety: **`-strict-memory-safety` enabled module-wide** (SE-0458) — every unsafe construct marked `unsafe` or `@safe`-encapsulated, perf-neutral. See `docs/rfcs/0003-…`. |
-| **M4.8 — Query-engine performance** | ✅ done | `SELECT DISTINCT` O(n²)→O(n) (GroupKey); index-nested-loop join (the O(M·N) S1 bug → O(M·logN)); write-path `Array(s.utf8)` allocs dropped; **column references bound to `(table,column)` slots at bind time** — removes the per-row `binding.resolve` `lowercased()` string resolution the profiling fingered (`sql search` ~10%, `distinct` ~17%, `join` ~20%). Profiling re-attributed gap (b): the descent/fetch is competitive; the residual is the per-row tree-walk interpreter (a future VDBE-style flat loop). Hash join + persisted `ANALYZE` deferred (low value for an FK-indexed search DB). See `docs/reviews/0002-…`, `docs/rfcs/0004-…`. |
-| **M5 — FTS + bm25/bm25f** | 🚧 in progress | First-class full-text search: `CREATE VIRTUAL TABLE … USING fts5`, `MATCH`, `bm25()`/**bm25f** custom weights, porter/unicode61 + trigram tokenizers, block-max WAND top-k, general `CREATE TRIGGER` sync. Same on-disk format (version-bumped). **The apple-docs migration blocker.** Act I of the two-act program (RFC 0008); phases F0–F6. See `docs/rfcs/0007-fts-and-ranking.md`. (Vector search is app-side — see below — so M5 is effectively FTS5.) |
-| **M6 — Hardening + importer** | ⏳ queued | Expanded fuzz/crash-injection coverage, a SQLite-file importer (loose→strict type coercion), and operational polish. Not part of the M5→M7 program (RFC 0008); the FTS format-version bump + crash-injection feed it. |
-| **M7 — Query DSL & metaprogramming** | ⏳ planned | Type-safe, injection-safe query DSL lowering to the public AST via a `prepare(ast:)` seam (result builder + operators, dependency-free); macro tier (`#SQL`, `@Table`, `@dynamicMemberLookup`, `@FixedLayout`) on a **scoped** `swift-syntax` `.macro` plugin (kernel stays zero-dep). Act II of the two-act program (RFC 0008); phases P0–P2, gated on M5/F5. See `docs/rfcs/0006-swift-metaprogramming-and-dsl.md`. |
+| **M0–M2 — Storage kernel** | ✅ done | COW B+tree over mmap; MVCC; free-list; commit protocol + crash-injection recovery; cross-process readers + writer lock; group commit. |
+| **M3 — Relational layer** | ✅ done | Strict typed `Value`/columns; order-preserving `KeyCodec`; `RecordCodec`; catalog + transactional DDL; DML with conflict policies + secondary-index maintenance; FK `ON DELETE CASCADE/RESTRICT`; deep integrity (index ⇄ row bijection). |
+| **M4 / M4.5 — SQL front end** | ✅ done | The full SQL pipeline + completeness (PRAGMA, BETWEEN, INSERT…SELECT, upsert, correlated scalar subqueries, transactions). Differential-tested vs CSQLite. |
+| **M4.6–M4.8 — Scan/query perf** | ✅ done | Zero-copy row decode, bounded top-N, residual-conjunct elimination, ordered rowid fetch, lazy `RowView` scans, `DISTINCT` O(n²)→O(n), index-nested-loop join, slot-bound columns. Strict memory safety enabled module-wide. |
+| **M5 — FTS + bm25/bm25f** | ✅ mostly done | FTS5 virtual tables, `MATCH`, `bm25`/`bm25f`, unicode61/porter/trigram, block-max WAND, trigger sync. **ADSQL beats SQLite FTS5 on ranked top-k.** Small F6 tail remains (see backlog B). |
+| **Health + perf program (R1–R7)** | ✅ done | General 2-table merge join + `.auto` cost model (**JOIN now ~2.1× faster than SQLite**); hoisted insert + a `sample`-profiled, evidence-based closure of the INSERT gap as inherent; compiled-evaluator default flip; god-file splits (no file > ~600 lines); `public`→`package` storage encapsulation (external surface −35%); seven-criteria `StrategyBench`; FTS bench breadth. |
+| **M6 — Hardening + importer** | ⏳ future | Expanded fuzz / crash-injection; SQLite-file importer (loose→strict coercion); ops polish. |
+| **M7 — Query DSL & metaprogramming** | ⏳ future | Type-safe, injection-safe query DSL + a scoped `swift-syntax` macro tier (kernel stays zero-dep). |
 
-## Performance headroom
+### Scorecard vs system SQLite (apple-docs shapes, M-series, 200k rows / 2k FTS docs)
 
-Benchmarks (`swift run -c release ADSQLBench`, 100k rows, M-series, vs system
-SQLite in WAL with apple-docs pragmas). The **health + performance program
-(`docs/rfcs/0009`) is complete (R1–R7)**: ADSQL now **leads or ties SQLite on every
-path except the inherent INSERT** — JOIN beats SQLite ~2.1× (merge fast path + the
-`.auto` default), DISTINCT ~2×, SEARCH ≈ parity, FTS ranked ~2.3×; the evaluator
-graduated to compiled closures (the default), the storage layer is encapsulated
-(`public`→`package`, external surface −35%), and every `ADSQLKernel` file is now
-< ~600 lines. INSERT (~0.8×) is the one path still short — characterized (with a
-`sample` profile) as the inherent Swift-runtime-vs-C per-op tax over a shared B+tree
-algorithm, with the safe relational-layer waste already cleared. The **current**
-unified SQL + FTS scorecard (incl. FTS5/bm25 vs SQLite FTS5) + the prioritized
-**waste catalog** live in `docs/reviews/0003-codebase-health-and-perf.md` §4–§5.
-*(The table below is the earlier M4.x snapshot — see review 0003 for current
-numbers, e.g. JOIN/DISTINCT are now wins.)*
+| Path | Standing | Notes |
+|---|---|---|
+| cold open → first get | **~5–13× faster** ✅ | newest-meta recovery, no WAL |
+| point / rowid get (p50) | **~3–4× faster** ✅ | |
+| full scan throughput | **≈ parity** ✅ | ~4.3 GB/s |
+| 16 concurrent readers under write churn | **~2–3× faster, ½ tail** ✅ | wait-free MVCC |
+| `SELECT DISTINCT` (dup-heavy) | **~2× faster** ✅ | O(n) GroupKey + slot binding |
+| `sql search` (filter + ORDER BY/LIMIT) | **≈ parity** ✅ | zero-copy top-N + compiled eval |
+| **JOIN** (indexed equi-join) | **~2.1× faster** ✅ | merge fast path via `.auto` default |
+| **FTS ranked top-k** | **~2.3× faster** ✅ | block-max WAND + zero-copy docLength |
+| **INSERT** (batch, 3-index) | **~0.8×** ⚠️ | residual is the inherent Swift-vs-C per-op tax over a shared B+tree algorithm (profiled); safe relational waste already cleared |
+| **FTS MATCH** (membership) | **~3.3× slower** ⚠️ | rides the general per-row path |
+| **FTS index build** | **~7× slower** ⚠️ | constant factor vs FTS5 segments |
+| **FTS delete / churn** | **~390× slower** ⚠️ | re-encodes postings per doc → O(corpus); the standout gap |
 
-| Scenario | ADSQL | SQLite | Δ | Status |
-|---|---|---|---|---|
-| cold open → first get | 49 µs | 245 µs | **5×** | ✓ |
-| point get (p50) | 0.8 µs | 2.9 µs | **3.6×** | ✓ |
-| raw KV scan | 4935 MB/s | 4039 MB/s | **1.2×** | ✓ |
-| 16 concurrent readers | 1.07 M/s | 0.47 M/s | **2.3×** | ✓ |
-| rowid get (p50) | 0.8 µs | 2.2 µs | **2.75×** | ✓ |
-| **`sql search` (filter + ORDER BY/LIMIT)** | ~~14.3~~ → ~~5.34~~ → ~~5.0~~ → **~4.6 ms** | 1.76 ms | ~~0.12×~~ → **~0.38×** | M4.6 + M4.7/B7 + M4.8 (slot binding) |
-| **relational index scan** | ~~1.23~~ → **~2.2 M/s** | ~3.1 M/s | ~~0.35×~~ → **~0.69×** | M4.7/A4 ✓ (lazy `RowView`, ~2×) |
-| **batch insert (SQL / 3-index)** | ~138 → ~143 → **~147 k/s** | ~224 k/s | **~0.66×** | M4.7/B3 + M4.8 (utf8 alloc dropped) |
-| batch insert (relational / 5-index) | ~118 → **~125 k/s** | 159 k/s | **~0.79×** | M4.8 (NOCASE double-copy removed) |
-| **`SELECT DISTINCT` (dup-heavy)** | ~~O(n²) (unrunnable)~~ → ~~74~~ → **~61 ms** | 4.6 ms | **0.08×** | M4.8 (O(n) GroupKey + slot binding; residual = full materialize + no index-distinct) |
-| **`sql join` (indexed equi-join)** | ~~O(M·N) (unrunnable)~~ → ~~240~~ → **~178 ms** | 21.7 ms | **0.12×** | M4.8/INLJ + slot binding (residual = per-row tree-walk interpreter) |
-| **filtered scan / index scan / join residual** | — | — | — | gap (b) re-attributed → per-row column re-resolution + tree-walk; lever = bind columns to slots (M4.8 next) |
+---
 
-What closes each gap:
+## 3. Future work (prioritized backlog)
 
-- **Filtered scan / search (M4.6 ✓).** Three executor changes took it from
-  14.3 ms to 5.34 ms: (1) **zero-copy decode** — `RowSlot` reads columns
-  straight from the mapped page span (`BTree.ValueRef.inline`) instead of
-  copying the whole record per row; (2) **bounded top-N** — an unordered
-  ORDER BY + small LIMIT keeps only `offset+limit` rows instead of
-  materializing and sorting every match; (3) **residual elimination** — the
-  conjuncts an exact index/rowid probe already guarantees are dropped from the
-  WHERE residual. The residual ~3× gap that remains is the per-row
-  index→table descent (shared with SQLite) plus `RecordCodec.cellOffsets`
-  walking/allocating the full offset table to read one sort-key column — a
-  candidate for incremental single-column decode.
-- **Relational index scan (M4.7/A4 ✓).** Added `RowView` (noncopyable, lazy)
-  + `RowCursor.forEachRow`, layered on the zero-copy `forEachRecordSpan`, so a
-  scan decodes only the columns it touches — no per-row `Row` + names array.
-  ~0.35× → ~0.69× (≈2×). The eager `next()`/`Row` API stays.
-- **Insert (M4.7/B3, partial).** `Relation.insertAssembled` (ordered `[Value]`,
-  no per-row dict) is built and used by `Writer.insert`. Removed the string
-  hashing, but `sql insert` barely moved (~0.64×): the four B+tree COW inserts
-  per row (table + 3 indexes) dominate, not row assembly. The real lever is the
-  **B+tree write path** (page COW / split / free-list) — a future perf item.
-- **Joins / correlated subqueries (deferred).** Inner/sub table is full-scanned
-  per outer row (nested loop, no index probe). Fix: push the ON-equality /
-  correlated predicate into an index probe (O(M·N) → O(M·log N)).
-- **Memory safety (M4.7 ✓).** `-strict-memory-safety` is on for the kernel: the
-  compiler now flags any new unsafe construct that isn't marked `unsafe` or
-  encapsulated by a `@safe` type. Perf-neutral. A future refinement is the
-  `@safe` Page-wrapper refactor (threading a safe page type through the B+tree
-  core to shrink the marked surface) — see RFC 0003.
+### A. Performance levers (open)
+- **VDBE register machine** — a flat opcode loop over a `[Value]` register file (the deep evaluator
+  lever). Deferred on evidence that read paths are **access-path-bound** (the compiled closures are
+  already ≈ tree-walk on realistic queries); revisit only if an eval-heavy workload justifies it.
+  Multi-week.
+- **`ANALYZE` + statistics + real cost model** — replace the heuristic access-path/join scoring with
+  per-index selectivity so the planner picks scan-vs-seek and the right join strategy on cost.
+- **Covering / `INCLUDE`-index serving** — answer queries straight off the index cursor with no table
+  descent (verify the current `INCLUDE`-column support, then extend).
+- **Ordered/batched rowid sweep + `madvise` prefetch** (bitmap-heap-scan style); **per-page zone maps
+  (min/max)** to skip leaf pages on filtered scans; **batch-at-a-time filter evaluation**;
+  **correlated-subquery decorrelation / index-probe.**
+- **Zero-copy reads on UPDATE/DELETE/`materializeRow`**; drop the residual write-path `Array(s.utf8)`
+  copies (trivial).
+- **FTS:** the **delete/churn re-index path** (the ~390× gap — re-encodes postings per doc);
+  **raw-segment postings** for build throughput (architectural); MATCH membership rides the general
+  row path.
+- **Deferred (documented, unscheduled):** spillable external merge-sort (removes the top-N cliff and
+  unblocks sort-merge join); morsel-parallel scans (natural under multi-reader MVCC); COW write-path
+  page-copy tuning.
 
-## Deferred SQL constructs
+### B. FTS completion (M5 tail)
+- Finish the prefix-union / zero-copy key-read path; `snippet()` / `highlight()` SQL functions (**not
+  yet supported**); remaining bench shapes (contentless `documents_body_fts`, prefix/`columnsize=0`
+  `sf_symbols_fts`); a concurrent-FTS-reader bench arm.
 
-Parsed-and-rejected today with named `sqlUnsupported` errors (not bugs —
-explicit scope boundaries):
+### C. M6 — hardening + importer
+- Expanded fuzz / crash-injection coverage; a **SQLite-file importer** (loose→strict type coercion);
+  operational polish.
 
-- **M5 (FTS) — 🚧 in progress (RFC 0007, scheduled by RFC 0008):**
-  `CREATE VIRTUAL TABLE`, `MATCH`, `bm25()`, and general `CREATE TRIGGER` (the FTS
-  sync mechanism) are being un-rejected phase-by-phase (F0–F6). Live state: the
-  status table in `docs/rfcs/0008-execution-schedule.md`.
-- **Subqueries:** `EXISTS`, FROM-clause subqueries, `IN (SELECT …)` beyond the
-  `json_each` shape, compound scalar subqueries.
-- **Aggregates:** `AVG`/`MIN`/`MAX`/`TOTAL`/`GROUP_CONCAT`, `COUNT(DISTINCT …)`.
-- **Query:** CTEs (`WITH`), window functions, `EXCEPT`/`INTERSECT`,
-  `NATURAL`/`RIGHT`/`FULL`/`CROSS`/comma joins, `JOIN … USING`,
-  `SELECT` without `FROM`.
-- **Operators:** `GLOB`/`REGEXP`, `LIKE … ESCAPE`, `IS` beyond `IS [NOT] NULL`.
-- **DDL/DML:** `ALTER TABLE`, `CREATE VIEW` (general `CREATE TRIGGER` → M5/F5), partial indexes, `DESC`
-  index columns, `WITHOUT ROWID`, `PRIMARY KEY DESC`, `ON DELETE` actions
-  beyond `CASCADE`/`RESTRICT`, `DEFAULT` exprs other than `datetime('now')`,
-  `ON CONFLICT … DO UPDATE … WHERE`.
-- **Other:** `PRAGMA` is accepted-but-mostly-no-op (durability is governed by
-  `DatabaseOptions`); `EXPLAIN`/`VACUUM` rejected.
+### D. M7 — Query DSL & metaprogramming (gated on the AST seam, which is ready)
+- **P0 (dependency-free core):** a result-builder query/DDL DSL + operator-overload expression DSL that
+  lowers to the public AST via `prepare(ast:)` (injection-safe, non-`Equatable` expression wrapper).
+- **P1 (macro tier):** an isolated `ADSQLMacros` `swift-syntax` plugin (kernel + façade stay zero-dep)
+  providing `#SQL`, `@Table`, and `@dynamicMemberLookup` on eager `SQLRow`/`Row`.
+- **P2 (internal codegen):** `@FixedLayout` (Meta / PageHeader), an `SQLExpr.mapChildren` walk
+  refactor, `callAsFunction` on a typed `Query<Output>`.
 
-## Non-goals
+### E. Deferred SQL features (parsed-and-rejected today; the compatibility registry)
+- **Subqueries:** `EXISTS`, FROM-clause subqueries, `IN (SELECT …)` (beyond the `json_each` shape),
+  compound scalar subqueries.
+- **Aggregates:** `AVG`, `MIN`, `MAX`, `TOTAL`, `GROUP_CONCAT`, `COUNT(DISTINCT …)`.
+- **Query:** CTEs (`WITH`), window functions, `EXCEPT` / `INTERSECT`,
+  `NATURAL`/`RIGHT`/`FULL`/`CROSS`/comma joins, `JOIN … USING`, `SELECT` without `FROM`.
+- **Operators:** `GLOB`, `REGEXP`, `LIKE … ESCAPE`, `IS` beyond `IS [NOT] NULL`.
+- **DDL/DML:** `ALTER TABLE`, `CREATE VIEW`, partial indexes, `DESC` index columns, `WITHOUT ROWID`,
+  `PRIMARY KEY DESC`, `ON DELETE` actions beyond `CASCADE`/`RESTRICT`, `DEFAULT` exprs beyond
+  `datetime('now')`, `ON CONFLICT … DO UPDATE … WHERE`.
 
-- SQLite's loose/dynamic typing — ADSQL columns are STRICT; coercion happens
-  only at explicit boundaries (`CAST`, the M6 importer).
-- `EXPLAIN`, `VACUUM`, views, `ALTER TABLE` (beyond what the importer needs).
-  (General `CREATE TRIGGER` is **in scope** as M5's FTS-sync mechanism — RFC 0007 F5.)
-- Non-macOS platforms (Apple Silicon first; 16 KiB native pages).
-- Third-party **runtime** dependencies (zero). Amended (RFC 0008 D2): the M7 macro
-  tier adopts `swift-syntax`, **scoped to a compile-time-only `.macro` plugin target**
-  (`ADSQLMacros`); `ADSQLKernel` and every shipping artifact stay zero-dep.
+### F. Swift-API adoptions (benchmark-gated where noted)
+- **swift-collections:** `Deque` (writer queue), `OrderedDictionary` (statement cache + GROUP BY),
+  `Heap` (bounded top-N), `BitSet` (rowid dedup), `OrderedSet` (DISTINCT).
+- **Memory-safe primitives:** `RawSpan`/`MutableSpan` in the codecs + page writers, `InlineArray` for
+  fixed-width scratch, `UTF8Span` allocation-free compare, `@inlinable` decode primitives, SIMD byte
+  scanning.
+- **Instrumentation/system:** `OSSignposter` + `os.Logger`; `import System` for fd/errno; Accelerate /
+  vDSP + the Compression framework (both gated on `ADSQLBench`).
+- **Audits:** explicit atomic memory orderings; complete typed-throws adoption; `Sendable`.
 
-## Consumer dependency (apple-docs / RFC 0001 P5)
+### Explicitly declined (recorded so they aren't re-litigated)
+`EXPLAIN`, `VACUUM`; `vm_copy` COW (full memcpy is faster); Point-Free packages
+(structured-queries / sqlite-data / parsing); novel custom operator symbols (named methods instead);
+`@dynamicCallable` (stringly-typed); property-wrapper schema markers (peer macros instead);
+Codable-style codec macros (the byte format is deliberately hand-tuned); a `DBError.description`
+macro; strong-ID typedefs `PageNumber`/`Generation` (page arithmetic is pervasive `UInt64`, so
+wrappers add `.rawValue` noise without catching bugs at that layer).
 
-ADSQL exists to replace the `bun:sqlite` layer of the apple-docs offline index.
-Its migration step (P5) is search-centric:
+---
 
-- The runtime search is a 4-tier cascade — **FTS5 `bm25`** (custom weights),
-  case-insensitive title-exact, **trigram** fuzzy, and an opt-in body FTS — so
-  **FTS5 + the trigram tokenizer are the hard blocker (M5).**
-- **Vector search is not a SQL feature:** embeddings are `BLOB` columns
-  (`document_chunks.vec_bin`/`vec_i8`); the Hamming shortlist + int8 rescore run
-  in application code over those bytes. ADSQL needs fast BLOB scans + batched
-  `IN` fetches (already supported), not a native vector index — which is why M5
-  is effectively just FTS5.
-- The connection-setup pragmas, `json_each`/`json_extract`, `NOCASE`, and the
-  search/listing/facet query shapes are already covered and differential-tested
-  (`Tests/ADSQLKernelTests/SQLAcceptanceTests.swift`).
+## 4. Engineering disciplines
+
+- **Standing gate (every change):** `swift build` clean (0 warnings, 0 strict-MS over-marks) ·
+  `swift test` green · `swift test --sanitize=thread` on changed read/write/scan paths (the full-suite
+  TSan exceeds the tool budget → the concurrency-relevant subset is run) · crash-injection on write
+  paths · `ADSQLBench` perf-neutral-or-better · **one concern per commit.**
+- **Evidence-driven:** every performance claim sits behind an `ADSQLBench` number; diagnoses come from
+  a profile, not a guess.
+- **Strategy-beside + selection/retirement:** alternative execution strategies are added beside the
+  reference path and graduate to a default only on a **seven-criteria** win, validated by the
+  differential matrix + `Integrity.deepCheck`; the superseded path stays selectable one release.
+
+## Develop
+
+```sh
+swift build
+swift test
+swift test --sanitize=thread          # concurrency lane (run a relevant subset)
+swift run -c release ADSQLBench        # vs system SQLite (+ FTS5)
+```

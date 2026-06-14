@@ -8,9 +8,8 @@ checksum-valid meta page).
 Status: storage kernel, relational layer, and the SQL front end (M4/M4.5)
 complete; a scan-engine performance pass (M4.6) is active, with first-class
 FTS/vector indexes (M5) next, on the same on-disk format. See
-[`ROADMAP.md`](ROADMAP.md) for the full milestone suite, performance headroom,
-and the deferred-SQL registry, and [`docs/rfcs/`](docs/rfcs/) for design
-records.
+[`ROADMAP.md`](ROADMAP.md) — the single source of truth for the architecture,
+milestone status, the vs-SQLite scorecard, and the prioritized backlog.
 
 - Platform: macOS 26+, Apple Silicon first (16 KiB native pages)
 - Toolchain: pinned via `.swift-version`; Swift 6 language mode, strict concurrency
