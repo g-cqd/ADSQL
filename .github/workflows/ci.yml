@@ -12,10 +12,10 @@ jobs:
       - name: Build
         run: swift build
       - name: Test
-        run: swift test --skip-tag soak
+        run: swift test
   tsan:
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
       - name: Thread sanitizer
-        run: swift test --sanitize=thread --skip-tag soak
+        run: swift test --sanitize=thread
