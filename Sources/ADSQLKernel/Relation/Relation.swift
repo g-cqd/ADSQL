@@ -37,6 +37,13 @@ public struct RelationState: Sendable {
   /// AUTOINCREMENT high-water marks touched this transaction.
   var sequences: [UInt32: UInt64] = [:]
   var sequenceBaselines: [UInt32: UInt64] = [:]
+  /// Transient per-transaction cache of the largest rowid for a plain
+  /// (non-AUTOINCREMENT) rowid table, so an ascending insert run allocates
+  /// `cached + 1` instead of an O(depth) `move(.last)` probe every row. NOT
+  /// serialized — re-derived from the tree on first use each transaction;
+  /// value-typed, so `TxnRestorePoint` restores it for free on a group-commit
+  /// rollback. Invalidated on delete (the max may be gone → reuse, matching SQLite).
+  var maxRowidCache: [UInt32: Int64] = [:]
   /// Set by DDL: bump catalogVersion at serialization.
   var schemaDirty = false
 
@@ -388,6 +395,7 @@ enum Relation {
     state.handleBaselines.removeValue(forKey: .table(record.tableId))
     state.sequences.removeValue(forKey: record.tableId)
     state.sequenceBaselines.removeValue(forKey: record.tableId)
+    state.maxRowidCache.removeValue(forKey: record.tableId)
     // Triggers on this table go with it (SQLite drops dependent triggers).
     for triggerName in state.triggerRecords.keys.sorted()
     where state.triggerRecords[triggerName]!.table == name {

@@ -265,21 +265,29 @@ extension Relation {
       return Int64(sequence + 1)
     }
 
-    // Plain rowid tables: SQLite's max(rowid)+1, including reuse after the
-    // max row is deleted — so probe every time (mmap-hot, O(depth)).
-    var cursor = Cursor(resolver: ctx, tree: table.handle)
-    var next: Int64 = 1
-    if try cursor.move(to: .last) {
-      let last: Int64?? = unsafe try cursor.withCurrent { (key, _) throws(DBError) in
-        unsafe KeyCodec.rowid(fromSuffixOf: key)
-      }
-      if let maxRowid = last ?? nil {
-        guard maxRowid < Int64.max else {
-          throw DBError.invalidDefinition("rowid space exhausted for \(table.definition.name)")
+    // Plain rowid tables: SQLite's max(rowid)+1, including reuse after the max row
+    // is deleted. The largest rowid is cached per transaction (set below, cleared on
+    // delete), so an ascending run allocates cached+1 without re-probing; the first
+    // allocation (and the first after a delete) pays the O(depth) `move(.last)`.
+    let maxRowid: Int64
+    if let cached = state.maxRowidCache[table.tableId] {
+      maxRowid = cached
+    } else {
+      var cursor = Cursor(resolver: ctx, tree: table.handle)
+      var probed: Int64 = 0
+      if try cursor.move(to: .last) {
+        let last: Int64?? = unsafe try cursor.withCurrent { (key, _) throws(DBError) in
+          unsafe KeyCodec.rowid(fromSuffixOf: key)
         }
-        next = maxRowid + 1
+        if let m = last ?? nil { probed = m }
       }
+      maxRowid = probed
     }
+    guard maxRowid < Int64.max else {
+      throw DBError.invalidDefinition("rowid space exhausted for \(table.definition.name)")
+    }
+    let next = maxRowid + 1
+    state.maxRowidCache[table.tableId] = next  // `next` is the table's new max
     return next
   }
 
@@ -352,6 +360,12 @@ extension Relation {
     }
     if let aliasIndex = table.definition.rowidAliasIndex {
       row[aliasIndex] = .integer(rowid)
+    }
+    // Keep the plain-rowid max cache consistent with an explicit rowid above it —
+    // but only when already established this txn (else the next allocation re-probes
+    // and observes this row anyway, so leaving it nil is correct and avoids a probe).
+    if explicitRowid != nil, let existing = state.maxRowidCache[table.tableId], rowid > existing {
+      state.maxRowidCache[table.tableId] = rowid
     }
 
     // Conflict scan: explicit rowid collision + every unique index.
@@ -454,6 +468,9 @@ extension Relation {
     _ = try deleteBytes(ctx, &handle, key: KeyCodec.rowKey(rowid))
     table.handle = handle
     state.tableRecords[tableName] = table
+    // The deleted row may have been the max rowid; a plain rowid table reuses it,
+    // so drop the cache and let the next allocation re-probe (matches SQLite).
+    state.maxRowidCache[table.tableId] = nil
     ctx.relation = state
     // AFTER DELETE row triggers: OLD = the removed row. Fires for direct
     // deletes, FK cascades, and OR REPLACE victims (all route through here),
