@@ -1,21 +1,180 @@
+# Single workflow: lint → build → test (chained in one job), plus a cross-platform build matrix
+# and a docs build+deploy — all gated on the main job so nothing runs if lint/build/test fails.
+#
+# Why one workflow / few jobs: chaining lint+build+test into a single job pays setup (checkout,
+# Xcode select, dependency resolve, cache restore) once and reuses the warm `.build` across the
+# steps. The matrix and docs jobs fan out only after the gate, and only when relevant.
 name: CI
+
 on:
   push:
     branches: [main]
+    paths-ignore: ["README.md", "CONTRIBUTING.md", "ROADMAP.md", ".gitignore", ".githooks/**"]
   pull_request:
+    paths-ignore: ["README.md", "CONTRIBUTING.md", "ROADMAP.md", ".gitignore", ".githooks/**"]
+  # On-demand trigger for the slow sanitizer passes (and a full platform/docs run when wanted).
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# Cancel superseded runs on branches/PRs; never cancel an in-progress run on main.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 jobs:
-  test:
-    runs-on: macos-latest
+  build-test:
+    name: Lint, build & test (macOS)
+    runs-on: macos-26
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
+      - name: Select latest Xcode
+        run: sudo xcode-select -s "$(ls -d /Applications/Xcode_*.app | sort -V | tail -1)"
+      - name: Show toolchain
+        run: swift --version
+      - name: Cache SwiftPM
+        uses: actions/cache@v5
+        with:
+          path: |
+            .build
+            ~/Library/Caches/org.swift.swiftpm
+          key: spm-${{ runner.os }}-${{ hashFiles('Package.swift') }}-${{ hashFiles('Sources/**', 'Tests/**', 'Plugins/**') }}
+          restore-keys: |
+            spm-${{ runner.os }}-${{ hashFiles('Package.swift') }}-
+            spm-${{ runner.os }}-
+      - name: Lint (formatting gate)
+        run: swift package lint
       - name: Build
         run: swift build
-      - name: Test
+      - name: Test (SQLite-differential suite)
         run: swift test
-  tsan:
-    runs-on: macos-latest
+
+  platforms:
+    name: Build (${{ matrix.platform }})
+    needs: build-test
+    # Cross-platform compile is broad but costly: run it on main / on demand, not on every PR
+    # (the macOS job above already covers compilation for PRs).
+    if: github.event_name != 'pull_request'
+    runs-on: macos-26
+    strategy:
+      fail-fast: false
+      matrix:
+        platform: [iOS, tvOS, watchOS, visionOS]
     steps:
-      - uses: actions/checkout@v4
-      - name: Thread sanitizer
-        run: swift test --sanitize=thread
+      - uses: actions/checkout@v6
+      - name: Select latest Xcode
+        run: sudo xcode-select -s "$(ls -d /Applications/Xcode_*.app | sort -V | tail -1)"
+      - name: Cache SwiftPM + DerivedData
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/Library/Caches/org.swift.swiftpm
+            .derivedData
+          key: spm-${{ runner.os }}-${{ matrix.platform }}-${{ hashFiles('Package.swift') }}-${{ hashFiles('Sources/**') }}
+          restore-keys: |
+            spm-${{ runner.os }}-${{ matrix.platform }}-${{ hashFiles('Package.swift') }}-
+            spm-${{ runner.os }}-${{ matrix.platform }}-
+      - name: Build for ${{ matrix.platform }}
+        run: >-
+          xcodebuild build
+          -scheme ADSQL
+          -destination "generic/platform=${{ matrix.platform }}"
+          -derivedDataPath .derivedData
+          -skipMacroValidation
+          -skipPackagePluginValidation
+
+  sanitizers:
+    name: Sanitize (${{ matrix.name }})
+    needs: build-test
+    # Sanitizers are slow (TSan ~5-15x, ASan ~2x) and rebuild the whole graph under instrumentation,
+    # so run them on main / on demand — never on every PR. The differential + property suites double
+    # as the stress input that trips data races (TSan) in the single-writer / wait-free-reader and
+    # group-commit layers, and OOB / use-after-free (ASan) in the mmap'd page views and record
+    # codecs. These find what `-enable-actor-data-race-checks` (actor-isolation only) cannot. TSan
+    # and ASan are mutually exclusive, hence two passes.
+    if: github.event_name != 'pull_request'
+    runs-on: macos-26
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: thread, flags: "--sanitize=thread" }
+          - { name: address, flags: "--sanitize=address --sanitize=undefined" }
+    steps:
+      - uses: actions/checkout@v6
+      - name: Select latest Xcode
+        run: sudo xcode-select -s "$(ls -d /Applications/Xcode_*.app | sort -V | tail -1)"
+      - name: Show toolchain
+        run: swift --version
+      - name: Cache SwiftPM
+        uses: actions/cache@v5
+        with:
+          path: |
+            .build
+            ~/Library/Caches/org.swift.swiftpm
+          key: spm-${{ runner.os }}-san-${{ matrix.name }}-${{ hashFiles('Package.swift') }}-${{ hashFiles('Sources/**', 'Tests/**', 'Plugins/**') }}
+          restore-keys: |
+            spm-${{ runner.os }}-san-${{ matrix.name }}-${{ hashFiles('Package.swift') }}-
+            spm-${{ runner.os }}-san-${{ matrix.name }}-
+      - name: Test under ${{ matrix.name }} sanitizer
+        run: swift test ${{ matrix.flags }}
+
+  docs:
+    name: Build & deploy docs (Pages)
+    needs: build-test
+    if: github.ref == 'refs/heads/main'
+    runs-on: macos-26
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    # Serialize Pages deploys without cancelling an in-flight publish.
+    concurrency:
+      group: pages
+      cancel-in-progress: false
+    env:
+      ADSQL_DEV: "1"
+    steps:
+      - uses: actions/checkout@v6
+      - name: Select latest Xcode
+        run: sudo xcode-select -s "$(ls -d /Applications/Xcode_*.app | sort -V | tail -1)"
+      - name: Cache SwiftPM
+        uses: actions/cache@v5
+        with:
+          path: |
+            .build
+            ~/Library/Caches/org.swift.swiftpm
+          key: spm-${{ runner.os }}-docs-${{ hashFiles('Package.swift') }}-${{ hashFiles('Sources/**') }}
+          restore-keys: |
+            spm-${{ runner.os }}-docs-${{ hashFiles('Package.swift') }}-
+            spm-${{ runner.os }}-docs-
+      - name: Build DocC site (static hosting)
+        run: |
+          swift package --allow-writing-to-directory "$PWD/_site" \
+            generate-documentation --target ADSQL \
+            --disable-indexing \
+            --transform-for-static-hosting \
+            --hosting-base-path ADSQL \
+            --output-path "$PWD/_site"
+      - name: Add root redirect to the documentation landing page
+        run: |
+          cat > _site/index.html <<'HTML'
+          <!doctype html>
+          <meta charset="utf-8">
+          <meta http-equiv="refresh" content="0; url=documentation/adsql/">
+          <link rel="canonical" href="documentation/adsql/">
+          <title>ADSQL</title>
+          <a href="documentation/adsql/">ADSQL documentation</a>
+          HTML
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v5
+        with:
+          path: _site
+      - name: Deploy to GitHub Pages
+        id: deploy
+        uses: actions/deploy-pages@v5
