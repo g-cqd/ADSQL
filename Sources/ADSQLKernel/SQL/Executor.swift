@@ -719,10 +719,13 @@ enum SelectExecutor {
       return
     }
 
-    // Merge join (existence/COUNT fast path): a 2-table INNER existence
-    // self-equi-join on a UNIQUE NOT-NULL single-column index needs no per-outer
-    // inner probe. Returns false when ineligible, falling through below.
-    if execution.join == .merge,
+    // Merge join (existence/COUNT fast path), and the plan `.auto` chooses when
+    // eligible: it is unconditionally cheaper than the nested loop here (one ordered
+    // index pass vs M per-outer probes), so the cost choice is just "merge if
+    // eligible". `.auto` falls through to the nested loop when ineligible; hash is
+    // not auto-selected (it loses on the symmetric self-join — finding #1 — pending
+    // a build-side cost estimate). Returns false when ineligible.
+    if execution.join == .merge || execution.join == .auto,
       try runMergeJoin(
         plan, tables: tables, joinIndexes: joinIndexes, resolver: resolver, context: context,
         emit: { () throws(DBError) in if try passesWhere() { try body() } })

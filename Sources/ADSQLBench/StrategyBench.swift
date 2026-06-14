@@ -19,6 +19,7 @@ enum StrategyBench {
     ("nestedLoop", .nestedLoop),
     ("hash", .hash),
     ("merge", .merge),
+    ("auto", .auto),
   ]
   /// Implemented evaluator strategies to sweep (extend with `.vdbe` in H6).
   static let evaluators: [(label: String, value: ExecutionOptions.Evaluator)] = [
