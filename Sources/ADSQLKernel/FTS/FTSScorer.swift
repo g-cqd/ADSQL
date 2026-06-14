@@ -65,78 +65,138 @@ enum FTSScorer {
   /// The (negated) bm25f score of `docid` for `query`. `weights` is per-column
   /// (length == the FTS table's column count; the caller pads with 1.0). `global`
   /// is the corpus aggregate, fetched once by the caller and reused per docid.
+  ///
+  /// A single-document convenience over `PreparedScorer`: it builds the query-
+  /// scoped scorer and scores the one document. The executor's score-all path
+  /// builds a `PreparedScorer` ONCE per query and scores every candidate through
+  /// it, so the per-query resolution (each leaf's df/idf and per-document
+  /// frequencies) is hoisted out of the per-document loop — a ranked scan no
+  /// longer re-decodes a term's posting list, nor re-enumerates a `foo*` prefix's
+  /// document frequency, per matching document. The result is bit-identical.
   static func score(
     _ query: FTSQuery, record: Catalog.FTSRecord, resolver: some PageResolver,
     docid: Int64, weights: [Double], global: FTSGlobalStats
   ) throws(DBError) -> Double {
-    let columns = record.definition.columns.count
-    guard global.docCount > 0 else { return 0 }
-    guard let docStats = try FTSIndex.docStats(resolver, record, docid: docid) else { return 0 }
-
-    // D = the document's total length across all columns; avgdl = the corpus
-    // average of that total. Guard a zero avgdl (degenerate empty corpus).
-    let docLength = docStats.fieldLengths.reduce(0.0) { $0 + Double($1) }
-    let totalLength = global.totalFieldLengths.reduce(0.0) { $0 + Double($1) }
-    let avgdl = totalLength / Double(global.docCount)
-    guard avgdl > 0 else { return 0 }
-    let lengthNorm = lengthNorm(docLength: docLength, avgdl: avgdl)
-
-    let scorer = try Scorer(record: record, resolver: resolver, columns: columns)
-    var total = 0.0
-    // `allowed == nil` means every column may contribute weight; a `col:` filter
-    // narrows it. The intersection mirrors F3b's column restriction.
-    try scorer.collectLeaves(query, columns: nil) { leaf, allowed throws(DBError) in
-      let df = try scorer.documentFrequency(leaf)
-      let idf = idf(df: df, n: Double(global.docCount))
-      var weightedFreq = 0.0
-      let perColumn = try scorer.frequencies(leaf, docid: docid)
-      for column in 0..<columns where allowed?.contains(column) ?? true {
-        weightedFreq += weights[column] * Double(perColumn[column])
-      }
-      guard weightedFreq > 0 else { return }
-      total += contribution(idf: idf, weightedFreq: weightedFreq, lengthNorm: lengthNorm)
-    }
-    return -total
+    let prepared = try PreparedScorer(
+      query: query, record: record, resolver: resolver, weights: weights, global: global)
+    return try prepared.score(docid: docid)
   }
 
-  /// Walks the query collecting positive leaf phrases with the set of columns
-  /// each may score in. Owns a tokenizer so a leaf's text resolves to the same
-  /// stems the index stored (mirrors `FTSMatch.Matcher`).
-  private struct Scorer<R: PageResolver> {
-    let record: Catalog.FTSRecord
-    let resolver: R
-    let columns: Int
-    let tokenizer: any FTSTokenizer
+  // MARK: - Query-scoped scorer
 
-    init(record: Catalog.FTSRecord, resolver: R, columns: Int) throws(DBError) {
-      self.record = record
-      self.resolver = resolver
-      self.columns = columns
-      self.tokenizer = try FTSTokenizerFactory.make(record.definition.tokenize)
+  /// A bm25f scorer resolved for ONE query: it reads each positive leaf's corpus
+  /// statistics (df → IDF) and the per-document term/phrase frequencies it needs
+  /// ONCE at construction, then scores any matching document by table lookup.
+  ///
+  /// This replaces the previous per-document leaf resolution, which re-decoded a
+  /// term's whole posting list — and, for a `foo*` prefix or a phrase leaf, re-
+  /// enumerated its expansion and rebuilt its document-frequency set — for every
+  /// candidate document (the score-all path's dominant cost). The resolution is
+  /// identical work done once: same leaf traversal order, same df / IDF, same per-
+  /// column frequencies, summed with the same `contribution` arithmetic, so a
+  /// score is bit-for-bit what the per-document path produced.
+  struct PreparedScorer<R: PageResolver> {
+    private let record: Catalog.FTSRecord
+    private let resolver: R
+    private let columns: Int
+    private let weights: [Double]
+    private let avgdl: Double
+    /// A degenerate corpus (no documents, or a zero average length) scores every
+    /// document 0, mirroring the per-document path's top guards.
+    private let degenerate: Bool
+    private let leaves: [PreparedLeaf]
+
+    /// One positive query leaf, resolved for the whole query.
+    private struct PreparedLeaf {
+      /// IDF(leaf) — the corpus-wide discriminating weight (docid-independent).
+      let idf: Double
+      /// `col:` restriction (nil == every column may contribute).
+      let allowed: Set<Int>?
+      /// docid → per-column frequency (a term's per-field tf, or a phrase's per-
+      /// field adjacency count). A docid absent here contributes nothing — exactly
+      /// the per-document path's zero-frequency skip.
+      let perDocFreq: [Int64: [UInt32]]
     }
 
-    /// Invokes `visit(leaf, allowedColumns)` for every positive leaf phrase.
-    /// `NOT` right operands are skipped; `col:` restrictions intersect into the
-    /// allowed-column set passed down. A nil set means "all columns".
-    func collectLeaves(
-      _ query: FTSQuery, columns allowed: Set<Int>?,
+    init(
+      query: FTSQuery, record: Catalog.FTSRecord, resolver: R, weights: [Double],
+      global: FTSGlobalStats
+    ) throws(DBError) {
+      self.record = record
+      self.resolver = resolver
+      let columns = record.definition.columns.count
+      self.columns = columns
+      self.weights = weights
+      let totalLength = global.totalFieldLengths.reduce(0.0) { $0 + Double($1) }
+      let avgdl = global.docCount > 0 ? totalLength / Double(global.docCount) : 0
+      self.avgdl = avgdl
+      self.degenerate = global.docCount == 0 || avgdl <= 0
+
+      // Resolve every positive leaf once, in the query's left-to-right traversal
+      // order (so the per-document score sum matches the previous path exactly).
+      let tokenizer = try FTSTokenizerFactory.make(record.definition.tokenize)
+      let n = Double(global.docCount)
+      var resolved: [PreparedLeaf] = []
+      try Self.collectLeaves(query, columns: nil, record: record) {
+        (leaf, allowed) throws(DBError) in
+        resolved.append(
+          try Self.prepareLeaf(
+            leaf, allowed: allowed, record: record, resolver: resolver, columns: columns,
+            tokenizer: tokenizer, n: n))
+      }
+      self.leaves = resolved
+    }
+
+    /// The (negated) bm25f score of `docid` for the prepared query — a lookup per
+    /// resolved leaf, no posting decode. Bit-identical to the per-document path:
+    /// same leaf order, same `wf = Σ_c weight_c·freq_c` (over allowed columns),
+    /// same zero-frequency skip, same `contribution`, same negation.
+    func score(docid: Int64) throws(DBError) -> Double {
+      guard !degenerate else { return 0 }
+      guard let docStats = try FTSIndex.docStats(resolver, record, docid: docid) else { return 0 }
+      let docLength = docStats.fieldLengths.reduce(0.0) { $0 + Double($1) }
+      let lengthNorm = FTSScorer.lengthNorm(docLength: docLength, avgdl: avgdl)
+      var total = 0.0
+      for leaf in leaves {
+        guard let perColumn = leaf.perDocFreq[docid] else { continue }
+        var weightedFreq = 0.0
+        for column in 0..<columns where leaf.allowed?.contains(column) ?? true {
+          weightedFreq += weights[column] * Double(perColumn[column])
+        }
+        guard weightedFreq > 0 else { continue }
+        total += FTSScorer.contribution(
+          idf: leaf.idf, weightedFreq: weightedFreq, lengthNorm: lengthNorm)
+      }
+      return -total
+    }
+
+    // MARK: Leaf resolution (once per query)
+
+    /// Walks the query collecting positive leaf phrases with the columns each may
+    /// score in. `NOT` right operands are skipped; `col:` restrictions intersect
+    /// into the allowed-column set passed down (nil == all columns). Mirrors the
+    /// previous `Scorer.collectLeaves` traversal exactly.
+    private static func collectLeaves(
+      _ query: FTSQuery, columns allowed: Set<Int>?, record: Catalog.FTSRecord,
       _ visit: (FTSQuery, Set<Int>?) throws(DBError) -> Void
     ) throws(DBError) {
       switch query {
       case .phrase:
         try visit(query, allowed)
       case .and(let lhs, let rhs), .or(let lhs, let rhs):
-        try collectLeaves(lhs, columns: allowed, visit)
-        try collectLeaves(rhs, columns: allowed, visit)
+        try collectLeaves(lhs, columns: allowed, record: record, visit)
+        try collectLeaves(rhs, columns: allowed, record: record, visit)
       case .not(let lhs, _):
-        // The excluded side never scores; only the positive operand does.
-        try collectLeaves(lhs, columns: allowed, visit)
+        try collectLeaves(lhs, columns: allowed, record: record, visit)
       case .column(let names, let inner):
-        try collectLeaves(inner, columns: try restrict(allowed, to: names), visit)
+        try collectLeaves(
+          inner, columns: try restrict(allowed, to: names, record: record), record: record, visit)
       }
     }
 
-    private func restrict(_ current: Set<Int>?, to names: [String]) throws(DBError) -> Set<Int> {
+    private static func restrict(
+      _ current: Set<Int>?, to names: [String], record: Catalog.FTSRecord
+    ) throws(DBError) -> Set<Int> {
       var resolved = Set<Int>()
       for name in names {
         guard let index = record.definition.columns.firstIndex(of: name) else {
@@ -147,103 +207,111 @@ enum FTSScorer {
       return current.map { $0.intersection(resolved) } ?? resolved
     }
 
-    /// Document frequency of a leaf phrase: a single term reads the dict df
-    /// directly; a multi-term phrase counts the documents whose postings hold the
-    /// phrase as an adjacency (so IDF reflects the phrase, not its rarest term).
-    func documentFrequency(_ leaf: FTSQuery) throws(DBError) -> UInt64 {
-      guard case .phrase(let text, let prefix) = leaf else { return 0 }
-      let tokens = try tokenizer.allTokens(Array(text.utf8)).map(\.term)
-      if tokens.isEmpty { return 0 }
-      if tokens.count == 1 {
-        return try termDocumentFrequency(tokens[0], prefix: prefix)
+    /// Resolves one positive leaf: its IDF (from the leaf's document frequency)
+    /// and a `docid → per-column frequency` table, decoding each posting list
+    /// ONCE. Combines what the per-document path computed separately as
+    /// `documentFrequency` (df) and `frequencies(docid)` (per-doc tf), so the two
+    /// stay consistent and neither re-reads postings per document.
+    private static func prepareLeaf(
+      _ leaf: FTSQuery, allowed: Set<Int>?, record: Catalog.FTSRecord, resolver: R,
+      columns: Int, tokenizer: any FTSTokenizer, n: Double
+    ) throws(DBError) -> PreparedLeaf {
+      guard case .phrase(let text, let prefix) = leaf else {
+        return PreparedLeaf(idf: FTSScorer.idf(df: 0, n: n), allowed: allowed, perDocFreq: [:])
       }
-      // Phrase df: documents where the tokens occur adjacently (any column).
-      return UInt64(try phraseDocs(tokens, prefix: prefix).count)
+      let tokens = try tokenizer.allTokens(Array(text.utf8)).map(\.term)
+      if tokens.isEmpty {
+        return PreparedLeaf(idf: FTSScorer.idf(df: 0, n: n), allowed: allowed, perDocFreq: [:])
+      }
+      if tokens.count == 1 {
+        return try prepareTerm(
+          tokens[0], prefix: prefix, allowed: allowed, record: record, resolver: resolver,
+          columns: columns, n: n)
+      }
+      return try preparePhrase(
+        tokens, prefix: prefix, allowed: allowed, record: record, resolver: resolver,
+        columns: columns, n: n)
     }
 
-    /// df of a single term; a trailing `*` sums the postings across the prefix
-    /// expansion's distinct documents (union, not double-counting a doc).
-    private func termDocumentFrequency(_ term: [UInt8], prefix: Bool) throws(DBError) -> UInt64 {
-      if !prefix { return try FTSIndex.documentFrequency(resolver, record, term: term) }
+    /// A single-term leaf: df from the dictionary (no prefix) or the prefix
+    /// expansion's distinct documents; per-column tf summed across the expansion.
+    /// Mirrors `termDocumentFrequency` + `termFrequencies`.
+    private static func prepareTerm(
+      _ term: [UInt8], prefix: Bool, allowed: Set<Int>?, record: Catalog.FTSRecord, resolver: R,
+      columns: Int, n: Double
+    ) throws(DBError) -> PreparedLeaf {
+      var perDoc: [Int64: [UInt32]] = [:]
+      if !prefix {
+        let df = try FTSIndex.documentFrequency(resolver, record, term: term)
+        if let postings = try FTSIndex.postings(resolver, record, term: term) {
+          perDoc.reserveCapacity(postings.count)
+          for posting in postings {
+            var freq = [UInt32](repeating: 0, count: columns)
+            for column in 0..<min(columns, posting.fieldTFs.count) {
+              freq[column] = posting.fieldTFs[column]
+            }
+            perDoc[posting.docid] = freq
+          }
+        }
+        return PreparedLeaf(idf: FTSScorer.idf(df: df, n: n), allowed: allowed, perDocFreq: perDoc)
+      }
+      // Trailing `*`: union the prefix expansion's documents for df, summing each
+      // expanded term's per-column tf into the document's frequency (a doc that
+      // holds several expansions accumulates, matching `termFrequencies`).
       var docs = Set<Int64>()
       for expansion in try FTSIndex.termsMatchingPrefix(resolver, record, prefix: term) {
-        if let postings = try FTSIndex.postings(resolver, record, term: expansion) {
-          for posting in postings { docs.insert(posting.docid) }
-        }
-      }
-      return UInt64(docs.count)
-    }
-
-    /// Per-column frequency of a leaf phrase in `docid`: the per-field tf for a
-    /// term, or the per-field adjacency count for a multi-term phrase.
-    func frequencies(_ leaf: FTSQuery, docid: Int64) throws(DBError) -> [UInt32] {
-      guard case .phrase(let text, let prefix) = leaf else {
-        return [UInt32](repeating: 0, count: columns)
-      }
-      let tokens = try tokenizer.allTokens(Array(text.utf8)).map(\.term)
-      if tokens.isEmpty { return [UInt32](repeating: 0, count: columns) }
-      if tokens.count == 1 {
-        return try termFrequencies(tokens[0], prefix: prefix, docid: docid)
-      }
-      return try phraseFrequencies(tokens, prefix: prefix, docid: docid)
-    }
-
-    /// Per-column tf of a term in `docid`; a trailing `*` sums the per-column tf
-    /// over the prefix expansion (each expanded term is a distinct occurrence).
-    private func termFrequencies(
-      _ term: [UInt8], prefix: Bool, docid: Int64
-    ) throws(DBError) -> [UInt32] {
-      var freqs = [UInt32](repeating: 0, count: columns)
-      let terms = prefix
-        ? try FTSIndex.termsMatchingPrefix(resolver, record, prefix: term) : [term]
-      for expansion in terms {
         guard let postings = try FTSIndex.postings(resolver, record, term: expansion) else { continue }
-        guard let posting = postings.first(where: { $0.docid == docid }) else { continue }
-        for column in 0..<min(columns, posting.fieldTFs.count) {
-          freqs[column] &+= posting.fieldTFs[column]
+        for posting in postings {
+          docs.insert(posting.docid)
+          var freq = perDoc[posting.docid] ?? [UInt32](repeating: 0, count: columns)
+          for column in 0..<min(columns, posting.fieldTFs.count) {
+            freq[column] &+= posting.fieldTFs[column]
+          }
+          perDoc[posting.docid] = freq
         }
       }
-      return freqs
+      return PreparedLeaf(
+        idf: FTSScorer.idf(df: UInt64(docs.count), n: n), allowed: allowed, perDocFreq: perDoc)
     }
 
-    /// Per-column adjacency count of a multi-term phrase in `docid`. A position
-    /// in column `c` counts when the tokens appear at consecutive positions
-    /// (`pos[t] + 1 == pos[t+1]`), the same adjacency F3b tests for membership.
-    private func phraseFrequencies(
-      _ tokens: [[UInt8]], prefix: Bool, docid: Int64
-    ) throws(DBError) -> [UInt32] {
+    /// A multi-term phrase leaf: df is the documents in which the tokens occur
+    /// adjacently (any column); per-column frequency is the adjacency count. Both
+    /// derive from each expansion's per-token `[docid: posting]` maps, decoded
+    /// once. Mirrors `phraseDocs` + `phraseFrequencies`.
+    private static func preparePhrase(
+      _ tokens: [[UInt8]], prefix: Bool, allowed: Set<Int>?, record: Catalog.FTSRecord, resolver: R,
+      columns: Int, n: Double
+    ) throws(DBError) -> PreparedLeaf {
       guard record.definition.detail != .none else {
-        // Without positions the phrase cannot be scored per column; it still
-        // matched (F3b requires positions for phrases), so contribute nothing.
-        return [UInt32](repeating: 0, count: columns)
+        // Without positions a phrase cannot be scored per column; it still matched
+        // (F3b requires positions for phrases), so it contributes nothing.
+        return PreparedLeaf(idf: FTSScorer.idf(df: 0, n: n), allowed: allowed, perDocFreq: [:])
       }
-      var freqs = [UInt32](repeating: 0, count: columns)
-      for expanded in try expand(tokens, prefix: prefix) {
-        let perColumn = try adjacencyCounts(expanded, docid: docid)
-        for column in 0..<columns { freqs[column] &+= perColumn[column] }
-      }
-      return freqs
-    }
-
-    /// Documents where the phrase occurs adjacently in any column.
-    private func phraseDocs(_ tokens: [[UInt8]], prefix: Bool) throws(DBError) -> Set<Int64> {
-      guard record.definition.detail != .none else { return [] }
       var docs = Set<Int64>()
-      for expanded in try expand(tokens, prefix: prefix) {
-        let byToken = try postingsByDoc(expanded)
+      var perDoc: [Int64: [UInt32]] = [:]
+      for expanded in try expand(tokens, prefix: prefix, record: record, resolver: resolver) {
+        let byToken = try postingsByDoc(expanded, record: record, resolver: resolver)
         guard let first = byToken.first else { continue }
         var candidates = Set(first.keys)
         for map in byToken.dropFirst() { candidates.formIntersection(map.keys) }
-        for docid in candidates where adjacencyCounts(byToken, docid: docid).contains(where: { $0 > 0 }) {
+        for docid in candidates {
+          let perColumn = adjacencyCounts(byToken, docid: docid, columns: columns)
+          guard perColumn.contains(where: { $0 > 0 }) else { continue }
           docs.insert(docid)
+          var freq = perDoc[docid] ?? [UInt32](repeating: 0, count: columns)
+          for column in 0..<columns { freq[column] &+= perColumn[column] }
+          perDoc[docid] = freq
         }
       }
-      return docs
+      return PreparedLeaf(
+        idf: FTSScorer.idf(df: UInt64(docs.count), n: n), allowed: allowed, perDocFreq: perDoc)
     }
 
     /// Trailing `*` expands the last token over its prefix terms, yielding one
     /// concrete token sequence per expansion; no `*` yields the tokens as-is.
-    private func expand(_ tokens: [[UInt8]], prefix: Bool) throws(DBError) -> [[[UInt8]]] {
+    private static func expand(
+      _ tokens: [[UInt8]], prefix: Bool, record: Catalog.FTSRecord, resolver: R
+    ) throws(DBError) -> [[[UInt8]]] {
       guard prefix else { return [tokens] }
       var sequences: [[[UInt8]]] = []
       let last = tokens[tokens.count - 1]
@@ -255,7 +323,11 @@ enum FTSScorer {
       return sequences
     }
 
-    private func postingsByDoc(_ tokens: [[UInt8]]) throws(DBError) -> [[Int64: FTSPosting]] {
+    /// Each token's `docid → posting` map (decoded once). An absent token empties
+    /// the result (no document can hold the phrase).
+    private static func postingsByDoc(
+      _ tokens: [[UInt8]], record: Catalog.FTSRecord, resolver: R
+    ) throws(DBError) -> [[Int64: FTSPosting]] {
       var byToken: [[Int64: FTSPosting]] = []
       for token in tokens {
         guard let postings = try FTSIndex.postings(resolver, record, term: token) else { return [] }
@@ -266,14 +338,13 @@ enum FTSScorer {
       return byToken
     }
 
-    private func adjacencyCounts(_ tokens: [[UInt8]], docid: Int64) throws(DBError) -> [UInt32] {
-      adjacencyCounts(try postingsByDoc(tokens), docid: docid)
-    }
-
     /// Per-column count of consecutive-position phrase hits for `docid`: for each
     /// starting position of the first token in a column, the phrase counts once
-    /// when every later token sits at the next position.
-    private func adjacencyCounts(_ byToken: [[Int64: FTSPosting]], docid: Int64) -> [UInt32] {
+    /// when every later token sits at the next position. Identical to the previous
+    /// `Scorer.adjacencyCounts`.
+    private static func adjacencyCounts(
+      _ byToken: [[Int64: FTSPosting]], docid: Int64, columns: Int
+    ) -> [UInt32] {
       var freqs = [UInt32](repeating: 0, count: columns)
       guard let firstPositions = byToken.first?[docid]?.positions else { return freqs }
       for column in 0..<columns where column < firstPositions.count {

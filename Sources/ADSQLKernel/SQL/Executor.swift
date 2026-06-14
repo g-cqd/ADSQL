@@ -620,16 +620,20 @@ enum SelectExecutor {
       // for `rank`, and never reads the span. The join then descends on
       // `base.id = fts.rowid` exactly as for an ordinary rowid source.
       let docids = try FTSMatch.evaluate(query, record: record, resolver: resolver)
+      // F6i: resolve the query ONCE (each leaf's df/IDF and per-document
+      // frequencies) so the per-document loop is a table lookup, not a re-decode
+      // of the term's posting list — nor, for a `foo*` prefix, a per-document re-
+      // enumeration of its document frequency, which dominated the score-all path.
+      // F6e: a membership-only query (no `rank`/`bm25` referenced) never reads the
+      // score, so skip building the scorer entirely.
+      let scorer: FTSScorer.PreparedScorer<R>? =
+        ftsScoreNeeded
+        ? try FTSScorer.PreparedScorer(
+          query: query, record: record, resolver: resolver, weights: resolvedWeights,
+          global: global)
+        : nil
       for docid in docids {
-        // F6e: a membership-only query (no `rank`/`bm25` referenced) never reads
-        // the score, so skip the per-doc FTSScorer.score — which re-decodes the
-        // term's whole posting list, the score-all O(n²) MATCH cost.
-        let score =
-          ftsScoreNeeded
-          ? try FTSScorer.score(
-            query, record: record, resolver: resolver, docid: docid,
-            weights: resolvedWeights, global: global)
-          : 0
+        let score = try scorer?.score(docid: docid) ?? 0
         if try unsafe !body(docid, empty, score) { return }
       }
     }
