@@ -28,11 +28,19 @@ health+perf tracker).
 ## Performance headroom
 
 Benchmarks (`swift run -c release ADSQLBench`, 100k rows, M-series, vs system
-SQLite in WAL with apple-docs pragmas). ADSQL **leads** on the read-mostly
-paths and trails on filtered scans and inserts. The **unified SQL + FTS scorecard**
-(incl. FTS5/bm25 vs SQLite FTS5) and the prioritized **waste catalog** live in
-`docs/reviews/0003-codebase-health-and-perf.md` §4–§5; the optimization program is
-`docs/rfcs/0009`:
+SQLite in WAL with apple-docs pragmas). The **health + performance program
+(`docs/rfcs/0009`) is complete (R1–R7)**: ADSQL now **leads or ties SQLite on every
+path except the inherent INSERT** — JOIN beats SQLite ~2.1× (merge fast path + the
+`.auto` default), DISTINCT ~2×, SEARCH ≈ parity, FTS ranked ~2.3×; the evaluator
+graduated to compiled closures (the default), the storage layer is encapsulated
+(`public`→`package`, external surface −35%), and every `ADSQLKernel` file is now
+< ~600 lines. INSERT (~0.8×) is the one path still short — characterized (with a
+`sample` profile) as the inherent Swift-runtime-vs-C per-op tax over a shared B+tree
+algorithm, with the safe relational-layer waste already cleared. The **current**
+unified SQL + FTS scorecard (incl. FTS5/bm25 vs SQLite FTS5) + the prioritized
+**waste catalog** live in `docs/reviews/0003-codebase-health-and-perf.md` §4–§5.
+*(The table below is the earlier M4.x snapshot — see review 0003 for current
+numbers, e.g. JOIN/DISTINCT are now wins.)*
 
 | Scenario | ADSQL | SQLite | Δ | Status |
 |---|---|---|---|---|
