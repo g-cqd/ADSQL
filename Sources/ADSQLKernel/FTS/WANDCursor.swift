@@ -78,10 +78,11 @@ struct FTSWANDCursor {
       let docCountInBlock = Int(rawDocCount)
       guard docCountInBlock >= 1 else { return nil }
       let bodyOffset = offset
-      // Step past the (docCount-1) docid gaps to reach the per-doc field-TF
-      // section (recorded so a single doc's TFs can be decoded on demand).
-      for _ in 1..<docCountInBlock {
-        guard Varint.read(bytes, &offset) != nil else { return nil }
+      // Step past the FOR-packed docid gaps (F6g: varint gapBits + byte-aligned
+      // packed fields) to reach the per-doc field-TF section (recorded so a single
+      // doc's TFs can be decoded on demand). Must match FTSPostings exactly.
+      guard ForPacking.skipPackedGaps(bytes, &offset, gapCount: docCountInBlock - 1) else {
+        return nil
       }
       let header = BlockHeader(
         docCount: docCountInBlock,
@@ -121,17 +122,17 @@ struct FTSWANDCursor {
   var currentBlockLast: Int64? { exhausted ? nil : blocks[blockIndex].lastDocId }
 
   /// Decodes the docids of block `index` (lazy; docids only — not field-TFs).
+  /// Reads the FOR-packed gaps (F6g) from `bodyOffset` — identical to
+  /// `FTSPostings.decodeDocids`. The block was structurally validated at `init`
+  /// (header walk via `ForPacking.skipPackedGaps`), so the decode cannot fail
+  /// here; on the impossible truncation it yields just `firstDocId` (safe).
   private mutating func decodeBlock(_ index: Int) {
     let header = blocks[index]
-    var ids: [Int64] = [header.firstDocId]
+    var ids: [Int64] = []
     ids.reserveCapacity(header.docCount)
     var offset = header.bodyOffset
-    var previous = header.firstDocId
-    for _ in 1..<header.docCount {
-      guard let gap = Varint.read(bytes, &offset) else { break }
-      previous += Int64(gap)
-      ids.append(previous)
-    }
+    _ = ForPacking.decodeDocids(
+      bytes, &offset, docCount: header.docCount, firstDocId: header.firstDocId, into: &ids)
     docids = ids
     docPos = 0
     blockIndex = index
