@@ -2,8 +2,8 @@ import ADSQLKernel
 
 /// Seeded generators for typed values, shared by codec property tests and
 /// the relational model tests.
-public enum RandomValues {
-  public static func value(
+package enum RandomValues {
+  package static func value(
     _ rng: inout SplitMix64, type: ColumnType, nullRatio: UInt64 = 10
   ) -> Value {
     if rng.next() % 100 < nullRatio { return .null }
@@ -30,7 +30,7 @@ public enum RandomValues {
     }
   }
 
-  public static func string(_ rng: inout SplitMix64) -> String {
+  package static func string(_ rng: inout SplitMix64) -> String {
     let alphabet = Array("abcXYZ 0\u{0}é🦊".unicodeScalars)
     let length = Int(rng.next() % 12)
     var out = String.UnicodeScalarView()
@@ -40,7 +40,7 @@ public enum RandomValues {
     return String(out)
   }
 
-  public static func bytes(_ rng: inout SplitMix64, maxLength: Int) -> [UInt8] {
+  package static func bytes(_ rng: inout SplitMix64, maxLength: Int) -> [UInt8] {
     let length = Int(rng.next() % UInt64(maxLength + 1))
     // Bias toward 0x00/0xFF edges to stress escaping.
     return (0..<length).map { _ in
@@ -52,7 +52,7 @@ public enum RandomValues {
     }
   }
 
-  public static func anyType(_ rng: inout SplitMix64) -> ColumnType {
+  package static func anyType(_ rng: inout SplitMix64) -> ColumnType {
     [ColumnType.integer, .real, .text, .blob][Int(rng.next() % 4)]
   }
 }

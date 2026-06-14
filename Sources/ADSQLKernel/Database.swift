@@ -392,8 +392,10 @@ public struct ReadTxn: ~Copyable {
     try body(unsafe RawSpan(_unsafeBytes: bytes))
   }
 
-  /// Scoped ordered iteration over the snapshot.
-  public func withCursor<R>(
+  /// Scoped ordered iteration over the snapshot. Low-level (yields a `Cursor`
+  /// over the storage layer); `package` — in-package consumers (tests, bench)
+  /// reach it via `import ADSQLKernel`.
+  package func withCursor<R>(
     _ body: (inout Cursor<CommittedResolver>) throws(DBError) -> R
   ) throws(DBError) -> R {
     var cursor = Cursor(resolver: resolver, meta: meta)

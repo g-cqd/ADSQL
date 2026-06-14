@@ -4,38 +4,38 @@ import ADSQLKernel
 /// orderings, mirroring ADSQL's externally visible semantics (strict types
 /// assumed pre-validated by the caller; conflict policies, NULL-skipping
 /// uniqueness, NaN→NULL, autoincrement monotonicity).
-public struct RelationalModelStore: Sendable {
-  public struct TableModel: Sendable {
-    public var definition: TableDefinition
-    public var rows: [Int64: [Value]] = [:]
-    public var sequence: UInt64 = 0
+package struct RelationalModelStore: Sendable {
+  package struct TableModel: Sendable {
+    package var definition: TableDefinition
+    package var rows: [Int64: [Value]] = [:]
+    package var sequence: UInt64 = 0
 
-    public init(definition: TableDefinition) {
+    package init(definition: TableDefinition) {
       self.definition = definition
     }
   }
 
-  public var tables: [String: TableModel] = [:]
-  public var indexes: [String: IndexDefinition] = [:]
+  package var tables: [String: TableModel] = [:]
+  package var indexes: [String: IndexDefinition] = [:]
 
-  public init() {}
+  package init() {}
 
   // MARK: - DDL mirror
 
-  public mutating func createTable(_ definition: TableDefinition) {
+  package mutating func createTable(_ definition: TableDefinition) {
     tables[definition.name] = TableModel(definition: definition)
   }
 
-  public mutating func dropTable(_ name: String) {
+  package mutating func dropTable(_ name: String) {
     tables.removeValue(forKey: name)
     indexes = indexes.filter { $0.value.table != name }
   }
 
-  public mutating func createIndex(_ definition: IndexDefinition) {
+  package mutating func createIndex(_ definition: IndexDefinition) {
     indexes[definition.name] = definition
   }
 
-  public mutating func dropIndex(_ name: String) {
+  package mutating func dropIndex(_ name: String) {
     indexes.removeValue(forKey: name)
   }
 
@@ -80,7 +80,7 @@ public struct RelationalModelStore: Sendable {
 
   /// Assembles a row exactly as the engine does (no datetimeNow in
   /// property-test schemas; targeted tests cover it).
-  public func assemble(
+  package func assemble(
     table name: String, values: [String: Value]
   ) -> (row: [Value], explicitRowid: Int64?)? {
     guard let table = tables[name] else { return nil }
@@ -110,13 +110,13 @@ public struct RelationalModelStore: Sendable {
 
   // MARK: - DML mirror
 
-  public enum Outcome: Equatable, Sendable {
+  package enum Outcome: Equatable, Sendable {
     case inserted(Int64)
     case ignored
     case uniqueViolation
   }
 
-  public mutating func insert(
+  package mutating func insert(
     into name: String, _ values: [String: Value], onConflict: ConflictPolicy
   ) -> Outcome {
     guard var table = tables[name],
@@ -167,7 +167,7 @@ public struct RelationalModelStore: Sendable {
   }
 
   @discardableResult
-  public mutating func update(
+  package mutating func update(
     _ name: String, rowid: Int64, set: [String: Value]
   ) -> Outcome? {
     guard let table = tables[name], var row = table.rows[rowid] else { return nil }
@@ -184,19 +184,19 @@ public struct RelationalModelStore: Sendable {
   }
 
   @discardableResult
-  public mutating func delete(from name: String, rowid: Int64) -> Bool {
+  package mutating func delete(from name: String, rowid: Int64) -> Bool {
     tables[name]?.rows.removeValue(forKey: rowid) != nil
   }
 
   // MARK: - Expected orderings
 
-  public func sortedRows(_ name: String) -> [(rowid: Int64, values: [Value])] {
+  package func sortedRows(_ name: String) -> [(rowid: Int64, values: [Value])] {
     guard let table = tables[name] else { return [] }
     return table.rows.keys.sorted().map { (rowid: $0, values: table.rows[$0]!) }
   }
 
   /// Rowids in index-key order (column tuple under collations, then rowid).
-  public func indexOrder(_ indexName: String) -> [Int64] {
+  package func indexOrder(_ indexName: String) -> [Int64] {
     guard let index = indexes[indexName], let table = tables[index.table] else { return [] }
     let collations = indexCollations(index, table)
     return table.rows.keys.sorted { a, b in

@@ -3,22 +3,22 @@ import ADSQLKernel
 /// In-memory committed-page store: lets B+tree logic run without the pager /
 /// committer. Freed pages are dropped eagerly so any dangling reference from
 /// a later transaction throws instead of silently reading stale bytes.
-public final class MemKernel: PageSource {
-  public var committed: [UInt64: PageBuf] = [:]
-  public var meta: Meta = .empty
+package final class MemKernel: PageSource {
+  package var committed: [UInt64: PageBuf] = [:]
+  package var meta: Meta = .empty
 
-  public init() {}
+  package init() {}
 
-  public func page(_ pageNo: UInt64) throws(DBError) -> UnsafeRawBufferPointer {
+  package func page(_ pageNo: UInt64) throws(DBError) -> UnsafeRawBufferPointer {
     guard let buf = committed[pageNo] else { throw DBError.corruptPage(pageNo: pageNo) }
     return buf.readOnly
   }
 
-  public func begin() -> TxnContext {
+  package func begin() -> TxnContext {
     TxnContext(source: self, meta: meta)
   }
 
-  public func commit(_ ctx: TxnContext) {
+  package func commit(_ ctx: TxnContext) {
     for (pageNo, buf) in ctx.dirty { committed[pageNo] = buf }
     for pageNo in ctx.pendingFree { committed.removeValue(forKey: pageNo) }
     var next = ctx.meta
@@ -30,13 +30,13 @@ public final class MemKernel: PageSource {
 
 /// Deterministic operation scripts shared by model tests and the crash
 /// harness.
-public enum DBOp: Sendable, Equatable {
+package enum DBOp: Sendable, Equatable {
   case put(key: [UInt8], value: [UInt8])
   case delete(key: [UInt8])
 }
 
-public enum OpScript {
-  public static func generate(
+package enum OpScript {
+  package static func generate(
     seed: UInt64, count: Int, keySpace: UInt64 = 5000,
     deleteRatio: UInt64 = 0, bigValueRatio: UInt64 = 3
   ) -> [DBOp] {

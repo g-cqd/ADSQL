@@ -2,13 +2,13 @@
 /// mapping. Correctness of bounds comes from reading only page numbers
 /// reachable from a committed meta (pages `[0, meta.pageCount)` always lie
 /// within the file).
-public final class Pager: PageSource, @unchecked Sendable {
-  public let channel: any StorageChannel
-  public let map: MMap
+package final class Pager: PageSource, @unchecked Sendable {
+  package let channel: any StorageChannel
+  package let map: MMap
   /// Forward-scan readahead window in pages (from `DatabaseOptions`; 0 disables).
-  public let prefetchWindow: Int
+  package let prefetchWindow: Int
 
-  public init(
+  package init(
     channel: any StorageChannel, maxMapSize: Int, readaheadBytes: Int = 0
   ) throws(DBError) {
     self.channel = channel
@@ -17,14 +17,14 @@ public final class Pager: PageSource, @unchecked Sendable {
   }
 
   @inline(__always)
-  public func page(_ pageNo: UInt64) throws(DBError) -> UnsafeRawBufferPointer {
+  package func page(_ pageNo: UInt64) throws(DBError) -> UnsafeRawBufferPointer {
     let end = (Int(pageNo) + 1) * Format.pageSize
     guard end <= map.capacity else { throw DBError.mapFull }
     return unsafe map.pageBytes(pageNo)
   }
 
   @inline(__always)
-  public func prefetch(fromPage: UInt64, count: Int) {
+  package func prefetch(fromPage: UInt64, count: Int) {
     map.prefetch(fromPage: fromPage, count: count)
   }
 }

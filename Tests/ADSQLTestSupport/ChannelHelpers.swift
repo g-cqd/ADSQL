@@ -4,7 +4,7 @@ import ADSQLKernel
 /// the gather path of `pwritev` is exercised without escaping `withUnsafeBytes`
 /// pointers (and without typed-throws closures, which crash the 6.4 frontend
 /// when reabstracted — see StorageChannel.pwrite(_:at:)).
-public func pwritevCopied(
+package func pwritevCopied(
   _ channel: some StorageChannel, _ chunks: [[UInt8]], at offset: Int
 ) throws(DBError) {
   var buffers: [UnsafeMutableRawBufferPointer] = []

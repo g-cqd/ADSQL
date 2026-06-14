@@ -19,7 +19,7 @@ public struct IntegrityReport: Sendable {
 /// ∪ free-listed pages == [0, pageCount), pairwise disjoint. Any deviation
 /// (corruption, leak, double-use) throws.
 public enum Integrity {
-  public static func check(
+  package static func check(
     resolver: some PageResolver, meta: Meta, verifyChecksums: Bool = true,
     deep: Bool = false
   ) throws(DBError) -> IntegrityReport {

@@ -12,10 +12,10 @@
 /// checksum-valid one wins; a torn in-flight meta falls back one generation.
 /// With `.barrier`, ordering (not durability) is guaranteed: a power cut
 /// recovers *some* committed generation, at least the last fully-synced one.
-public enum Committer {
+package enum Committer {
   /// Applies `ctx` to storage. Returns the committed meta (generation + 1),
   /// or the unchanged base meta for a no-op transaction.
-  public static func commit(
+  package static func commit(
     ctx: TxnContext, channel: any StorageChannel, durability: DurabilityProfile
   ) throws(DBError) -> Meta {
     var newMeta = ctx.meta
@@ -68,10 +68,10 @@ public enum Committer {
 }
 
 /// Opening and creating database files.
-public enum Recovery {
+package enum Recovery {
   /// Opens an existing database (recovering the newest valid meta) or
   /// initializes a fresh one.
-  public static func openOrCreate(
+  package static func openOrCreate(
     channel: any StorageChannel, createIfMissing: Bool = true
   ) throws(DBError) -> Meta {
     let size = try channel.fileSize()

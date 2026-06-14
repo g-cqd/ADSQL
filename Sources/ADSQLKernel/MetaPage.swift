@@ -4,27 +4,27 @@ import Darwin
 /// (page 0 and page 1). Commit N+1 writes to page `(N+1) % 2`; recovery
 /// takes the newest checksum-valid meta, so one torn meta page is expected
 /// and harmless.
-public struct Meta: Equatable, Sendable {
-  public var generation: UInt64
+package struct Meta: Equatable, Sendable {
+  package var generation: UInt64
   /// Root of the main B+tree; 0 means the tree is empty.
-  public var rootPage: UInt64
+  package var rootPage: UInt64
   /// Root of the free-list B+tree; 0 means no free-list.
-  public var freeRootPage: UInt64
+  package var freeRootPage: UInt64
   /// High-water page count: pages `[0, pageCount)` are owned by the file.
-  public var pageCount: UInt64
-  public var kvCount: UInt64
-  public var treeDepth: UInt16
-  public var flags: UInt16
-  public var freeDepth: UInt16
-  public var freeEntryCount: UInt64
+  package var pageCount: UInt64
+  package var kvCount: UInt64
+  package var treeDepth: UInt16
+  package var flags: UInt16
+  package var freeDepth: UInt16
+  package var freeEntryCount: UInt64
 
-  public static let empty = Meta(
+  package static let empty = Meta(
     generation: 0, rootPage: 0, freeRootPage: 0,
     pageCount: Format.firstDataPage, kvCount: 0, treeDepth: 0, flags: 0,
     freeDepth: 0, freeEntryCount: 0)
 
   /// The user-visible key/value tree.
-  public var mainTree: TreeHandle {
+  package var mainTree: TreeHandle {
     get { TreeHandle(rootPage: rootPage, depth: treeDepth, count: kvCount) }
     set {
       rootPage = newValue.rootPage
@@ -34,7 +34,7 @@ public struct Meta: Equatable, Sendable {
   }
 
   /// The free-list tree (page reclamation bookkeeping).
-  public var freeTree: TreeHandle {
+  package var freeTree: TreeHandle {
     get { TreeHandle(rootPage: freeRootPage, depth: freeDepth, count: freeEntryCount) }
     set {
       freeRootPage = newValue.rootPage
@@ -45,7 +45,7 @@ public struct Meta: Equatable, Sendable {
 
   /// Which meta page the *next* commit (this meta's generation) writes to.
   @inline(__always)
-  public var pageNo: UInt64 { generation % 2 }
+  package var pageNo: UInt64 { generation % 2 }
 
   /// The newest generation whose freed pages the next transaction may
   /// reuse. One generation of lag is what lets `.barrier` commits issue a
@@ -53,7 +53,7 @@ public struct Meta: Equatable, Sendable {
   /// an ordering window, so recovery can land on N-1 — pages freed at
   /// gens ≤ N-1 are absent from tree N-1 and safe to overwrite.
   @inline(__always)
-  public func reclaimLimit(minReader: UInt64) -> UInt64 {
+  package func reclaimLimit(minReader: UInt64) -> UInt64 {
     min(minReader, generation > 0 ? generation - 1 : 0)
   }
 
@@ -76,7 +76,7 @@ public struct Meta: Equatable, Sendable {
 
   /// Serializes into a full page buffer (only the first 128 bytes are
   /// meaningful; the rest stays as-is, normally zero).
-  public func encode(into buffer: UnsafeMutableRawBufferPointer, pageNo: UInt64) {
+  package func encode(into buffer: UnsafeMutableRawBufferPointer, pageNo: UInt64) {
     precondition(buffer.count == Format.pageSize)
     Format.magicBytes.withUnsafeBytes { magic in
       unsafe UnsafeMutableRawBufferPointer(rebasing: buffer[Offset.magic..<Offset.formatVersion])
@@ -103,7 +103,7 @@ public struct Meta: Equatable, Sendable {
   /// hold. Returns nil for "not a valid meta" (torn/empty); throws only for
   /// structurally impossible databases (wrong magic on page 0 is reported by
   /// the caller as `badMagic` / `unsupportedFormatVersion`).
-  public static func decode(
+  package static func decode(
     from buffer: UnsafeRawBufferPointer, pageNo: UInt64
   ) -> DecodeResult {
     precondition(buffer.count >= Format.metaHeaderSize)
@@ -132,7 +132,7 @@ public struct Meta: Equatable, Sendable {
         freeEntryCount: buffer.loadLE64(Offset.freeEntryCount)))
   }
 
-  public enum DecodeResult: Equatable, Sendable {
+  package enum DecodeResult: Equatable, Sendable {
     case valid(Meta)
     case notAMeta
     case corrupt
@@ -142,7 +142,7 @@ public struct Meta: Equatable, Sendable {
 
   /// Recovery: pick the newest valid meta of the two. A single torn meta is
   /// normal (it was the in-flight commit); both invalid is fatal.
-  public static func recover(
+  package static func recover(
     meta0: UnsafeRawBufferPointer, meta1: UnsafeRawBufferPointer
   ) throws(DBError) -> Meta {
     let results = unsafe [decode(from: meta0, pageNo: 0), decode(from: meta1, pageNo: 1)]
@@ -166,17 +166,17 @@ public struct Meta: Equatable, Sendable {
 
 /// Root reference of one COW B+tree within the file. The kernel hosts two
 /// today (main + free-list); the relational layer will host many.
-public struct TreeHandle: Equatable, Sendable {
+package struct TreeHandle: Equatable, Sendable {
   /// 0 = empty tree.
-  public var rootPage: UInt64
-  public var depth: UInt16
-  public var count: UInt64
+  package var rootPage: UInt64
+  package var depth: UInt16
+  package var count: UInt64
 
-  public init(rootPage: UInt64, depth: UInt16, count: UInt64) {
+  package init(rootPage: UInt64, depth: UInt16, count: UInt64) {
     self.rootPage = rootPage
     self.depth = depth
     self.count = count
   }
 
-  public static let empty = TreeHandle(rootPage: 0, depth: 0, count: 0)
+  package static let empty = TreeHandle(rootPage: 0, depth: 0, count: 0)
 }

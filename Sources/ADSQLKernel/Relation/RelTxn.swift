@@ -162,7 +162,7 @@ extension ReadTxn {
   }
 
   /// Forward scan over a table in rowid order.
-  public func withRowCursor<R>(
+  package func withRowCursor<R>(
     table: String, _ body: (inout RowCursor<CommittedResolver>) throws(DBError) -> R
   ) throws(DBError) -> R {
     var cursor = try RowCursor(
@@ -172,7 +172,7 @@ extension ReadTxn {
   }
 
   /// Forward scan over an index within typed bounds.
-  public func withIndexCursor<R>(
+  package func withIndexCursor<R>(
     index name: String, bounds: IndexBounds = .all, covering: [String]? = nil,
     _ body: (inout RowCursor<CommittedResolver>) throws(DBError) -> R
   ) throws(DBError) -> R {
@@ -271,7 +271,7 @@ extension WriteTxn {
     try tableRecord(table).handle.count
   }
 
-  public func withRowCursor<R>(
+  package func withRowCursor<R>(
     table: String, _ body: (inout RowCursor<TxnContext>) throws(DBError) -> R
   ) throws(DBError) -> R {
     var cursor = try RowCursor(
@@ -280,7 +280,7 @@ extension WriteTxn {
     return try body(&cursor)
   }
 
-  public func withIndexCursor<R>(
+  package func withIndexCursor<R>(
     index name: String, bounds: IndexBounds = .all,
     _ body: (inout RowCursor<TxnContext>) throws(DBError) -> R
   ) throws(DBError) -> R {

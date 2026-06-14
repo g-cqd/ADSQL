@@ -14,8 +14,8 @@
 ///
 /// Entries are chunked so values stay inline (no overflow chains inside the
 /// free tree), which keeps commit-time self-serialization convergent.
-public enum FreeList {
-  public static let pagesPerEntry = 400
+package enum FreeList {
+  package static let pagesPerEntry = 400
   static let keySize = 10
 
   // MARK: - Codecs
@@ -115,7 +115,7 @@ public enum FreeList {
   /// pool. `limit` must be min(reader generations, committed generation).
   /// Returns the number of pages harvested.
   @discardableResult
-  public static func harvest(ctx: TxnContext, upTo limit: UInt64) throws(DBError) -> Int {
+  package static func harvest(ctx: TxnContext, upTo limit: UInt64) throws(DBError) -> Int {
     var free = ctx.meta.freeTree
     var harvested = 0
     while free.rootPage != 0 {
@@ -160,7 +160,7 @@ public enum FreeList {
   ///
   /// Requires `harvest` to have run at transaction start (gen-0 keys are
   /// assumed consumed) and must be the last mutation before commit.
-  public static func serialize(ctx: TxnContext) throws(DBError) {
+  package static func serialize(ctx: TxnContext) throws(DBError) {
     let commitGen = ctx.meta.generation + 1
     var free = ctx.meta.freeTree
     var genSeq: UInt16 = 0
@@ -241,7 +241,7 @@ public enum FreeList {
   // MARK: - Inspection (integrity, tests)
 
   /// Every page currently listed as free, with its availability generation.
-  public static func allListedPages(
+  package static func allListedPages(
     resolver: some PageResolver, tree: TreeHandle
   ) throws(DBError) -> [(gen: UInt64, page: UInt64)] {
     var listed: [(gen: UInt64, page: UInt64)] = []

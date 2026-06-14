@@ -1,6 +1,6 @@
 /// Resolves page numbers to page bytes. Read transactions resolve straight
 /// from committed storage; write transactions overlay their dirty table.
-public protocol PageResolver {
+package protocol PageResolver {
   func resolvePage(_ pageNo: UInt64) throws(DBError) -> UnsafeRawBufferPointer
   /// Advisory readahead for an upcoming contiguous page run (forward scans).
   func prefetch(fromPage: UInt64, count: Int)
@@ -13,13 +13,13 @@ extension PageResolver {
   /// Default: prefetch is a no-op (write contexts and test resolvers don't
   /// scan-prefetch; only the mapped committed reader forwards it).
   @inline(__always)
-  public func prefetch(fromPage: UInt64, count: Int) {}
+  package func prefetch(fromPage: UInt64, count: Int) {}
   @inline(__always)
-  public var prefetchWindow: Int { 0 }
+  package var prefetchWindow: Int { 0 }
 }
 
 /// Committed-page reader (mmap in production, dictionaries in tests).
-public protocol PageSource: AnyObject {
+package protocol PageSource: AnyObject {
   func page(_ pageNo: UInt64) throws(DBError) -> UnsafeRawBufferPointer
   func prefetch(fromPage: UInt64, count: Int)
   var prefetchWindow: Int { get }
@@ -27,32 +27,32 @@ public protocol PageSource: AnyObject {
 
 extension PageSource {
   @inline(__always)
-  public func prefetch(fromPage: UInt64, count: Int) {}
+  package func prefetch(fromPage: UInt64, count: Int) {}
   @inline(__always)
-  public var prefetchWindow: Int { 0 }
+  package var prefetchWindow: Int { 0 }
 }
 
 /// Page allocation state for one write transaction. Fresh pages (allocated
 /// and freed within the same transaction, never visible to any reader) are
 /// recycled immediately; committed pages freed here must wait for readers
 /// and are handed to the free-list at commit.
-public struct PageAllocator {
+package struct PageAllocator {
   /// Next never-used page (high-water mark, becomes meta.pageCount).
-  public var highWater: UInt64
+  package var highWater: UInt64
   /// Reusable pages harvested from the free-list (older generations whose
   /// readers are gone) plus same-transaction fresh frees.
-  public var pool: [UInt64]
+  package var pool: [UInt64]
   /// While the free-list serializes itself at commit time, the pool is
   /// frozen (its contents are being written out) and all allocation comes
   /// from the high-water mark.
-  public var highWaterOnly = false
+  package var highWaterOnly = false
 
-  public init(highWater: UInt64, pool: [UInt64] = []) {
+  package init(highWater: UInt64, pool: [UInt64] = []) {
     self.highWater = highWater
     self.pool = pool
   }
 
-  public mutating func allocate() -> UInt64 {
+  package mutating func allocate() -> UInt64 {
     if !highWaterOnly, let reused = pool.popLast() { return reused }
     defer { highWater += 1 }
     return highWater
@@ -60,7 +60,7 @@ public struct PageAllocator {
 
   /// Allocate bypassing the recycled pool (used by free-list maintenance to
   /// avoid consuming the pool it is itself rebuilding).
-  public mutating func allocateHighWater() -> UInt64 {
+  package mutating func allocateHighWater() -> UInt64 {
     defer { highWater += 1 }
     return highWater
   }
@@ -68,15 +68,15 @@ public struct PageAllocator {
 
 /// Mutable state of one write transaction. Single-threaded by construction:
 /// only the writer loop touches it.
-public final class TxnContext: PageResolver, OverflowPager {
-  public let source: PageSource
-  public var meta: Meta
-  public var allocator: PageAllocator
+package final class TxnContext: PageResolver, OverflowPager {
+  package let source: PageSource
+  package var meta: Meta
+  package var allocator: PageAllocator
   /// Pages written this transaction (always includes every allocated page).
-  public var dirty: [UInt64: PageBuf] = [:]
+  package var dirty: [UInt64: PageBuf] = [:]
   /// Committed pages this transaction stopped referencing: reclaimable only
   /// once concurrent readers move past this generation.
-  public var pendingFree: [UInt64] = []
+  package var pendingFree: [UInt64] = []
 
   /// Reusable encode buffers for the insert path: one for the row record, one for
   /// each index entry key (used sequentially). `putBytes` copies the bytes into
@@ -109,7 +109,7 @@ public final class TxnContext: PageResolver, OverflowPager {
 
   /// Relational state (catalog, handles, sequences), loaded lazily on first
   /// relational use. Value-typed: TxnRestorePoint snapshots it by copy.
-  public internal(set) var relation: RelationState?
+  package internal(set) var relation: RelationState?
 
   /// Active NEW/OLD row frame while a trigger body executes (M5/F5). The write
   /// path consults it so trigger-body expressions can read `new.col`/`old.col`;
@@ -127,7 +127,7 @@ public final class TxnContext: PageResolver, OverflowPager {
   var undoAllocated: [UInt64] = []
   var undoFreedOwned: [(pageNo: UInt64, buf: PageBuf)] = []
 
-  public init(source: PageSource, meta: Meta, pool: [UInt64] = []) {
+  package init(source: PageSource, meta: Meta, pool: [UInt64] = []) {
     self.source = source
     self.meta = meta
     self.allocator = PageAllocator(highWater: meta.pageCount, pool: pool)
@@ -135,7 +135,7 @@ public final class TxnContext: PageResolver, OverflowPager {
 
   // MARK: - Page access
 
-  public func resolvePage(_ pageNo: UInt64) throws(DBError) -> UnsafeRawBufferPointer {
+  package func resolvePage(_ pageNo: UInt64) throws(DBError) -> UnsafeRawBufferPointer {
     if let buf = dirty[pageNo] { return unsafe buf.readOnly }
     // Committed pages live in [0, meta.pageCount); a higher number is a corrupt
     // in-page pointer that would otherwise read mapped-but-uncommitted (zeroed)
@@ -146,10 +146,10 @@ public final class TxnContext: PageResolver, OverflowPager {
   }
 
   @inline(__always)
-  public func owns(_ pageNo: UInt64) -> Bool { dirty[pageNo] != nil }
+  package func owns(_ pageNo: UInt64) -> Bool { dirty[pageNo] != nil }
 
   /// Brand-new zeroed page owned by this transaction.
-  public func allocatePage() -> (pageNo: UInt64, buf: PageBuf) {
+  package func allocatePage() -> (pageNo: UInt64, buf: PageBuf) {
     let pageNo = allocator.allocate()
     let buf = PageBuf()
     buf.requestEpoch = requestEpoch
@@ -163,7 +163,7 @@ public final class TxnContext: PageResolver, OverflowPager {
   /// goes to pendingFree) — COW-once-per-transaction. Under group commit,
   /// pages owned by an *earlier request* are additionally cloned on first
   /// touch so the current request can be rolled back alone.
-  public func shadow(_ pageNo: UInt64) throws(DBError) -> (pageNo: UInt64, buf: PageBuf) {
+  package func shadow(_ pageNo: UInt64) throws(DBError) -> (pageNo: UInt64, buf: PageBuf) {
     if let buf = dirty[pageNo] {
       if requestEpoch != 0, buf.requestEpoch != requestEpoch {
         let clone = unsafe PageBuf(copying: buf.readOnly)
@@ -184,7 +184,7 @@ public final class TxnContext: PageResolver, OverflowPager {
   }
 
   /// Releases a page this transaction no longer references.
-  public func freePage(_ pageNo: UInt64) {
+  package func freePage(_ pageNo: UInt64) {
     if let buf = dirty.removeValue(forKey: pageNo) {
       // Never visible to anyone: recycle immediately.
       allocator.pool.append(pageNo)
@@ -222,40 +222,40 @@ public final class TxnContext: PageResolver, OverflowPager {
 
   // MARK: - OverflowPager
 
-  public func allocateOverflowPage() throws(DBError) -> (pageNo: UInt64, buffer: UnsafeMutableRawBufferPointer) {
+  package func allocateOverflowPage() throws(DBError) -> (pageNo: UInt64, buffer: UnsafeMutableRawBufferPointer) {
     let (pageNo, buf) = allocatePage()
     return unsafe (pageNo, buf.raw)
   }
 
-  public func readOverflowPage(_ pageNo: UInt64) throws(DBError) -> UnsafeRawBufferPointer {
+  package func readOverflowPage(_ pageNo: UInt64) throws(DBError) -> UnsafeRawBufferPointer {
     unsafe try resolvePage(pageNo)
   }
 
-  public func freeOverflowPage(_ pageNo: UInt64) throws(DBError) {
+  package func freeOverflowPage(_ pageNo: UInt64) throws(DBError) {
     freePage(pageNo)
   }
 }
 
 /// Read-side resolver over committed pages only.
-public struct CommittedResolver: PageResolver {
-  public let source: PageSource
+package struct CommittedResolver: PageResolver {
+  package let source: PageSource
   /// Snapshot's committed high-water: a committed tree never references a page
   /// number ≥ pageCount, so anything beyond it is a corrupt in-page pointer
   /// (which would read mapped-but-uncommitted space without faulting). `.max`
   /// leaves the bound off for low-level resolvers built without a meta.
-  public let pageCount: UInt64
+  package let pageCount: UInt64
   /// Verify each resolved page's checksum before use (opt-in; off on the hot
   /// path). Catches the full corruption class — a tampered cellCount/keyLen
   /// changes the page bytes, so the stored XXH64 no longer matches.
-  public let verifyChecksums: Bool
+  package let verifyChecksums: Bool
 
-  public init(source: PageSource, pageCount: UInt64 = .max, verifyChecksums: Bool = false) {
+  package init(source: PageSource, pageCount: UInt64 = .max, verifyChecksums: Bool = false) {
     self.source = source
     self.pageCount = pageCount
     self.verifyChecksums = verifyChecksums
   }
   @inline(__always)
-  public func resolvePage(_ pageNo: UInt64) throws(DBError) -> UnsafeRawBufferPointer {
+  package func resolvePage(_ pageNo: UInt64) throws(DBError) -> UnsafeRawBufferPointer {
     guard pageNo < pageCount else { throw DBError.corruptPage(pageNo: pageNo) }
     let page = unsafe try source.page(pageNo)
     if verifyChecksums, unsafe !PageHeader.verifyChecksum(page, pageNo: pageNo) {
@@ -264,9 +264,9 @@ public struct CommittedResolver: PageResolver {
     return unsafe page
   }
   @inline(__always)
-  public func prefetch(fromPage: UInt64, count: Int) {
+  package func prefetch(fromPage: UInt64, count: Int) {
     source.prefetch(fromPage: fromPage, count: count)
   }
   @inline(__always)
-  public var prefetchWindow: Int { source.prefetchWindow }
+  package var prefetchWindow: Int { source.prefetchWindow }
 }

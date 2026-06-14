@@ -141,7 +141,7 @@ public struct RowView: ~Copyable, ~Escapable {
 /// Forward iteration over a table (rowid order) or an index (key order),
 /// materializing rows. Index cursors resolve each entry's rowid back into
 /// the table tree; a dangling entry is corruption and throws.
-public struct RowCursor<R: PageResolver>: ~Copyable {
+package struct RowCursor<R: PageResolver>: ~Copyable {
   enum Mode {
     case table
     case index(Catalog.IndexRecord)

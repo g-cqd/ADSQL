@@ -3,19 +3,19 @@ import Synchronization
 
 /// POSIX-backed storage channel. All calls are stateless per-fd operations
 /// (`pread`/`pwrite`/`fcntl`), safe to issue from any thread.
-public final class FileChannel: StorageChannel, @unchecked Sendable {
-  public let fileDescriptor: Int32
+package final class FileChannel: StorageChannel, @unchecked Sendable {
+  package let fileDescriptor: Int32
   private let closeOnDeinit: Bool
   /// Guards against double-close: a second close() on a recycled descriptor
   /// number would tear down an unrelated file out from under another thread.
   private let closed = Atomic<Bool>(false)
 
-  public enum Mode: Sendable {
+  package enum Mode: Sendable {
     case readOnly
     case readWrite(create: Bool)
   }
 
-  public init(path: String, mode: Mode) throws(DBError) {
+  package init(path: String, mode: Mode) throws(DBError) {
     var flags: Int32
     switch mode {
     case .readOnly:
@@ -31,7 +31,7 @@ public final class FileChannel: StorageChannel, @unchecked Sendable {
   }
 
   /// Wraps an already-open descriptor (ownership not transferred).
-  public init(borrowing fd: Int32) {
+  package init(borrowing fd: Int32) {
     self.fileDescriptor = fd
     self.closeOnDeinit = false
   }
@@ -40,13 +40,13 @@ public final class FileChannel: StorageChannel, @unchecked Sendable {
     if closeOnDeinit { close() }
   }
 
-  public func fileSize() throws(DBError) -> Int {
+  package func fileSize() throws(DBError) -> Int {
     var st = stat()
     guard unsafe fstat(fileDescriptor, &st) == 0 else { try throwErrno("fstat") }
     return Int(st.st_size)
   }
 
-  public func pread(into buffer: UnsafeMutableRawBufferPointer, at offset: Int) throws(DBError) {
+  package func pread(into buffer: UnsafeMutableRawBufferPointer, at offset: Int) throws(DBError) {
     var done = 0
     while done < buffer.count {
       let n = unsafe Darwin.pread(
@@ -60,7 +60,7 @@ public final class FileChannel: StorageChannel, @unchecked Sendable {
     }
   }
 
-  public func pwrite(_ buffer: UnsafeRawBufferPointer, at offset: Int) throws(DBError) {
+  package func pwrite(_ buffer: UnsafeRawBufferPointer, at offset: Int) throws(DBError) {
     var done = 0
     while done < buffer.count {
       let n = unsafe Darwin.pwrite(
@@ -73,7 +73,7 @@ public final class FileChannel: StorageChannel, @unchecked Sendable {
     }
   }
 
-  public func pwritev(_ buffers: [UnsafeRawBufferPointer], at offset: Int) throws(DBError) {
+  package func pwritev(_ buffers: [UnsafeRawBufferPointer], at offset: Int) throws(DBError) {
     var at = offset
     var index = 0
     while unsafe index < buffers.count {
@@ -112,7 +112,7 @@ public final class FileChannel: StorageChannel, @unchecked Sendable {
     }
   }
 
-  public func sync(_ profile: DurabilityProfile) throws(DBError) {
+  package func sync(_ profile: DurabilityProfile) throws(DBError) {
     switch profile {
     case .none:
       return
@@ -127,7 +127,7 @@ public final class FileChannel: StorageChannel, @unchecked Sendable {
     }
   }
 
-  public func preallocate(minimumSize: Int) throws(DBError) {
+  package func preallocate(minimumSize: Int) throws(DBError) {
     let current = try fileSize()
     guard minimumSize > current else { return }
     var store = fstore_t(
@@ -144,16 +144,16 @@ public final class FileChannel: StorageChannel, @unchecked Sendable {
     guard ftruncate(fileDescriptor, off_t(minimumSize)) == 0 else { try throwErrno("ftruncate") }
   }
 
-  public func truncate(to size: Int) throws(DBError) {
+  package func truncate(to size: Int) throws(DBError) {
     guard ftruncate(fileDescriptor, off_t(size)) == 0 else { try throwErrno("ftruncate") }
   }
 
   /// Toggles the unified-buffer-cache bypass for bulk load paths.
-  public func setNoCache(_ enabled: Bool) {
+  package func setNoCache(_ enabled: Bool) {
     _ = fcntl(fileDescriptor, F_NOCACHE, enabled ? 1 : 0)
   }
 
-  public func close() {
+  package func close() {
     guard fileDescriptor >= 0 else { return }
     let (exchanged, _) = closed.compareExchange(
       expected: false, desired: true, ordering: .acquiringAndReleasing)

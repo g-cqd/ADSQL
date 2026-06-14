@@ -18,20 +18,20 @@
 ///
 /// Index entries append an 8-byte sign-biased big-endian rowid suffix.
 /// Table-tree row keys are the bare 8-byte suffix (no tag).
-public enum KeyCodec {
-  public enum Tag {
-    public static let null: UInt8 = 0x05
-    public static let integer: UInt8 = 0x10
-    public static let real: UInt8 = 0x18
-    public static let text: UInt8 = 0x20
-    public static let textNocase: UInt8 = 0x21
-    public static let blob: UInt8 = 0x28
+package enum KeyCodec {
+  package enum Tag {
+    package static let null: UInt8 = 0x05
+    package static let integer: UInt8 = 0x10
+    package static let real: UInt8 = 0x18
+    package static let text: UInt8 = 0x20
+    package static let textNocase: UInt8 = 0x21
+    package static let blob: UInt8 = 0x28
   }
 
   // MARK: - Values
 
   /// NaN must be normalized away (SQLite stores NaN as NULL) before encoding.
-  public static func append(
+  package static func append(
     _ value: Value, collation: Collation, to key: inout [UInt8]
   ) throws(DBError) {
     switch value {
@@ -84,7 +84,7 @@ public enum KeyCodec {
     appendEscaped(bytes, to: &key)
   }
 
-  public static func encode(
+  package static func encode(
     _ values: [Value], collations: [Collation]
   ) throws(DBError) -> [UInt8] {
     precondition(values.count == collations.count)
@@ -106,7 +106,7 @@ public enum KeyCodec {
   /// (REAL normalizes -0.0 to +0.0, exactly as the encoder does). **NOCASE text
   /// was case-folded at encode time, so it decodes to its folded bytes, not the
   /// original** — callers needing the original must not decode a NOCASE column.
-  public static func decode(
+  package static func decode(
     _ key: UnsafeRawBufferPointer, columns: Int
   ) throws(DBError) -> [Value] {
     var values: [Value] = []
@@ -182,7 +182,7 @@ public enum KeyCodec {
   }
 
   /// Table-tree row key: bare 8-byte sign-biased big-endian rowid.
-  public static func rowKey(_ rowid: Int64) -> [UInt8] {
+  package static func rowKey(_ rowid: Int64) -> [UInt8] {
     var key: [UInt8] = []
     key.reserveCapacity(8)
     appendBE(biased(rowid), to: &key)
@@ -194,16 +194,16 @@ public enum KeyCodec {
   /// index-scan hot path where a row key is built per row only to seek the
   /// table tree.
   @inline(__always)
-  public static func writeRowKey(_ rowid: Int64, into buffer: UnsafeMutableRawBufferPointer) {
+  package static func writeRowKey(_ rowid: Int64, into buffer: UnsafeMutableRawBufferPointer) {
     withUnsafeBytes(of: biased(rowid).bigEndian) { unsafe buffer.copyMemory(from: $0) }
   }
 
-  public static func appendRowidSuffix(_ rowid: Int64, to key: inout [UInt8]) {
+  package static func appendRowidSuffix(_ rowid: Int64, to key: inout [UInt8]) {
     appendBE(biased(rowid), to: &key)
   }
 
   /// Reads the trailing 8-byte rowid suffix of an index key (or a row key).
-  public static func rowid(fromSuffixOf key: UnsafeRawBufferPointer) -> Int64? {
+  package static func rowid(fromSuffixOf key: UnsafeRawBufferPointer) -> Int64? {
     guard key.count >= 8 else { return nil }
     let raw = unsafe key.loadBE64(key.count - 8)
     return Int64(bitPattern: raw ^ 0x8000_0000_0000_0000)
@@ -213,7 +213,7 @@ public enum KeyCodec {
 
   /// Smallest byte string strictly greater than every key with `prefix`:
   /// rightmost non-0xFF byte incremented, tail truncated. nil = unbounded.
-  public static func prefixSuccessor(_ prefix: [UInt8]) -> [UInt8]? {
+  package static func prefixSuccessor(_ prefix: [UInt8]) -> [UInt8]? {
     var out = prefix
     while let last = out.last {
       if last != 0xFF {
@@ -261,7 +261,7 @@ public enum KeyCodec {
 
   /// SQLite NOCASE: ASCII A–Z only.
   @inline(__always)
-  public static func asciiFolded(_ bytes: [UInt8]) -> [UInt8] {
+  package static func asciiFolded(_ bytes: [UInt8]) -> [UInt8] {
     var out = bytes
     for i in out.indices where out[i] >= 0x41 && out[i] <= 0x5A {
       out[i] |= 0x20

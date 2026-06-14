@@ -10,13 +10,13 @@ import Darwin
 ///
 /// Slots are u16 cell offsets in key order growing up from the header; cell
 /// content grows down from the page end.
-public enum Node {
-  public static let leafOverflowFlag: UInt8 = 0b0000_0001
+package enum Node {
+  package static let leafOverflowFlag: UInt8 = 0b0000_0001
 
   // MARK: - Key comparison (memcmp order)
 
   @inline(__always)
-  public static func compare(_ a: UnsafeRawBufferPointer, _ b: UnsafeRawBufferPointer) -> Int {
+  package static func compare(_ a: UnsafeRawBufferPointer, _ b: UnsafeRawBufferPointer) -> Int {
     let n = min(a.count, b.count)
     if n > 0 {
       let c = unsafe memcmp(a.baseAddress!, b.baseAddress!, n)
@@ -29,13 +29,13 @@ public enum Node {
   // MARK: - Sizes
 
   @inline(__always)
-  public static func inlineLeafCellSize(keyLen: Int, valueLen: Int) -> Int { 5 + keyLen + valueLen }
+  package static func inlineLeafCellSize(keyLen: Int, valueLen: Int) -> Int { 5 + keyLen + valueLen }
   @inline(__always)
-  public static func overflowLeafCellSize(keyLen: Int) -> Int { 15 + keyLen }
+  package static func overflowLeafCellSize(keyLen: Int) -> Int { 15 + keyLen }
   @inline(__always)
-  public static func branchCellSize(keyLen: Int) -> Int { 10 + keyLen }
+  package static func branchCellSize(keyLen: Int) -> Int { 10 + keyLen }
   @inline(__always)
-  public static func shouldInline(keyLen: Int, valueLen: Int) -> Bool {
+  package static func shouldInline(keyLen: Int, valueLen: Int) -> Bool {
     inlineLeafCellSize(keyLen: keyLen, valueLen: valueLen) <= Format.maxInlineCellSize
   }
 
@@ -50,13 +50,13 @@ public enum Node {
   // there), so there is nothing to bind to without threading the resolver
   // through every node primitive. Owner: the page buffer of the enclosing read.
   @safe public struct LeafCell {
-    public var key: UnsafeRawBufferPointer
+    package var key: UnsafeRawBufferPointer
     /// Inline payload, or nil when the value lives in an overflow chain.
-    public var inlineValue: UnsafeRawBufferPointer?
-    public var overflowHead: UInt64
-    public var overflowLength: UInt32
+    package var inlineValue: UnsafeRawBufferPointer?
+    package var overflowHead: UInt64
+    package var overflowLength: UInt32
 
-    public var valueLength: Int {
+    package var valueLength: Int {
       unsafe inlineValue?.count ?? Int(overflowLength)
     }
   }
@@ -66,7 +66,7 @@ public enum Node {
     unsafe PageHeader.slotOffset(page, index)
   }
 
-  public static func leafCell(_ page: UnsafeRawBufferPointer, _ index: Int) -> LeafCell {
+  package static func leafCell(_ page: UnsafeRawBufferPointer, _ index: Int) -> LeafCell {
     let at = unsafe cellStart(page, index)
     let flags = unsafe page[at]
     let keyLen = unsafe Int(page.loadLE16(at + 1))
@@ -88,19 +88,19 @@ public enum Node {
   }
 
   @inline(__always)
-  public static func branchKey(_ page: UnsafeRawBufferPointer, _ index: Int) -> UnsafeRawBufferPointer {
+  package static func branchKey(_ page: UnsafeRawBufferPointer, _ index: Int) -> UnsafeRawBufferPointer {
     let at = unsafe cellStart(page, index)
     let keyLen = unsafe Int(page.loadLE16(at))
     return unsafe UnsafeRawBufferPointer(rebasing: page[at + 10..<at + 10 + keyLen])
   }
 
   @inline(__always)
-  public static func branchChild(_ page: UnsafeRawBufferPointer, _ index: Int) -> UInt64 {
+  package static func branchChild(_ page: UnsafeRawBufferPointer, _ index: Int) -> UInt64 {
     unsafe page.loadLE64(cellStart(page, index) + 2)
   }
 
   @inline(__always)
-  public static func nodeKey(_ page: UnsafeRawBufferPointer, _ index: Int) -> UnsafeRawBufferPointer {
+  package static func nodeKey(_ page: UnsafeRawBufferPointer, _ index: Int) -> UnsafeRawBufferPointer {
     if unsafe PageHeader.pageType(page) == .branch {
       return unsafe branchKey(page, index)
     }
@@ -113,7 +113,7 @@ public enum Node {
 
   /// Total encoded size of the cell at `index` (used by removal accounting
   /// and page compaction).
-  public static func cellLength(_ page: UnsafeRawBufferPointer, _ index: Int) -> Int {
+  package static func cellLength(_ page: UnsafeRawBufferPointer, _ index: Int) -> Int {
     let at = unsafe cellStart(page, index)
     switch unsafe PageHeader.pageType(page) {
     case .branch:
@@ -132,7 +132,7 @@ public enum Node {
 
   /// Binary search over the page's cells.
   /// Returns the first index whose key is >= `key`, and whether it's exact.
-  public static func search(
+  package static func search(
     _ page: UnsafeRawBufferPointer, key: UnsafeRawBufferPointer
   ) -> (index: Int, exact: Bool) {
     var lo = 0
@@ -148,13 +148,13 @@ public enum Node {
 
   /// Index of the child to descend into for `key`: -1 = leftmost child.
   @inline(__always)
-  public static func branchChildSlot(_ page: UnsafeRawBufferPointer, key: UnsafeRawBufferPointer) -> Int {
+  package static func branchChildSlot(_ page: UnsafeRawBufferPointer, key: UnsafeRawBufferPointer) -> Int {
     let (index, exact) = unsafe search(page, key: key)
     return exact ? index : index - 1
   }
 
   @inline(__always)
-  public static func descendTarget(_ page: UnsafeRawBufferPointer, key: UnsafeRawBufferPointer) -> UInt64 {
+  package static func descendTarget(_ page: UnsafeRawBufferPointer, key: UnsafeRawBufferPointer) -> UInt64 {
     let slot = unsafe branchChildSlot(page, key: key)
     return unsafe slot < 0 ? PageHeader.link(page) : branchChild(page, slot)
   }
@@ -180,7 +180,7 @@ public enum Node {
     }
   }
 
-  public static func leafCellSize(keyLen: Int, value: LeafValue) -> Int {
+  package static func leafCellSize(keyLen: Int, value: LeafValue) -> Int {
     switch value {
     case .inline(let v): return inlineLeafCellSize(keyLen: keyLen, valueLen: v.count)
     case .overflow: return overflowLeafCellSize(keyLen: keyLen)
@@ -259,7 +259,7 @@ public enum Node {
     return true
   }
 
-  public static func leafInsert(
+  package static func leafInsert(
     _ page: UnsafeMutableRawBufferPointer, at index: Int,
     key: UnsafeRawBufferPointer, value: LeafValue
   ) -> Bool {
@@ -268,7 +268,7 @@ public enum Node {
     }
   }
 
-  public static func branchInsert(
+  package static func branchInsert(
     _ page: UnsafeMutableRawBufferPointer, at index: Int,
     key: UnsafeRawBufferPointer, child: UInt64
   ) -> Bool {
@@ -279,7 +279,7 @@ public enum Node {
 
   /// Removes the cell at slot `index`, accounting its bytes as fragmented
   /// (or reclaiming directly when it borders the cell area start).
-  public static func removeCell(_ page: UnsafeMutableRawBufferPointer, at index: Int) {
+  package static func removeCell(_ page: UnsafeMutableRawBufferPointer, at index: Int) {
     let ro = UnsafeRawBufferPointer(page)
     let count = unsafe PageHeader.cellCount(ro)
     let offset = unsafe PageHeader.slotOffset(ro, index)
@@ -300,7 +300,7 @@ public enum Node {
   }
 
   /// Overwrites the child pointer of a branch cell in place (fixed width).
-  public static func branchSetChild(
+  package static func branchSetChild(
     _ page: UnsafeMutableRawBufferPointer, at index: Int, child: UInt64
   ) {
     let offset = unsafe PageHeader.slotOffset(UnsafeRawBufferPointer(page), index)
@@ -311,7 +311,7 @@ public enum Node {
 
   /// Rewrites the cell area densely (slot order preserved), clearing
   /// fragmentation. Uses a scratch copy of the page.
-  public static func compact(_ page: UnsafeMutableRawBufferPointer) {
+  package static func compact(_ page: UnsafeMutableRawBufferPointer) {
     let scratch = unsafe PageBuf(copying: UnsafeRawBufferPointer(page))
     let ro = unsafe scratch.readOnly
     let count = unsafe PageHeader.cellCount(ro)
@@ -392,7 +392,7 @@ public enum Node {
   /// Splits a full leaf while inserting (key, value) at `index`.
   /// `left` may alias the original page's buffer. Returns the separator key
   /// (first key of the right page).
-  public static func splitLeafInserting(
+  package static func splitLeafInserting(
     original: UnsafeRawBufferPointer, at index: Int,
     key: UnsafeRawBufferPointer, value: LeafValue,
     left: UnsafeMutableRawBufferPointer, right: UnsafeMutableRawBufferPointer
@@ -457,7 +457,7 @@ public enum Node {
   /// Splits a full branch while inserting (key, child) at cell position
   /// `index`. The middle key moves *up*: it is returned as the separator and
   /// its child becomes the right page's leftmost child.
-  public static func splitBranchInserting(
+  package static func splitBranchInserting(
     original: UnsafeRawBufferPointer, at index: Int,
     key: UnsafeRawBufferPointer, child: UInt64,
     left: UnsafeMutableRawBufferPointer, right: UnsafeMutableRawBufferPointer

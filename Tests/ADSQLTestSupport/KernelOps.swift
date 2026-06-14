@@ -3,8 +3,8 @@ import ADSQLKernel
 /// Byte-array bridges over the kernel's raw-buffer APIs, shared by suites.
 /// (Closures stay untyped or non-throwing to dodge the Swift 6.4 typed-throws
 /// reabstraction crash; errors travel via Result.)
-public enum KernelOps {
-  public static func put(_ ctx: TxnContext, _ key: [UInt8], _ value: [UInt8]) throws {
+package enum KernelOps {
+  package static func put(_ ctx: TxnContext, _ key: [UInt8], _ value: [UInt8]) throws {
     var failure: DBError?
     key.withUnsafeBytes { k in
       value.withUnsafeBytes { v in
@@ -15,7 +15,7 @@ public enum KernelOps {
   }
 
   @discardableResult
-  public static func delete(_ ctx: TxnContext, _ key: [UInt8]) throws -> Bool {
+  package static func delete(_ ctx: TxnContext, _ key: [UInt8]) throws -> Bool {
     var result: Result<Bool, DBError> = .success(false)
     key.withUnsafeBytes { k in
       do throws(DBError) { result = .success(try BTree.delete(ctx: ctx, key: k)) } catch {
@@ -25,7 +25,7 @@ public enum KernelOps {
     return try result.get()
   }
 
-  public static func get(
+  package static func get(
     _ resolver: some PageResolver, _ meta: Meta, _ key: [UInt8]
   ) throws -> [UInt8]? {
     var result: Result<[UInt8]?, DBError> = .success(nil)
@@ -43,7 +43,7 @@ public enum KernelOps {
     return try result.get()
   }
 
-  public static func scanAll(
+  package static func scanAll(
     _ resolver: some PageResolver, _ meta: Meta
   ) throws -> [(key: [UInt8], value: [UInt8])] {
     var out: [(key: [UInt8], value: [UInt8])] = []
@@ -56,14 +56,14 @@ public enum KernelOps {
   /// The kernel-wide page liveness invariant, delegated to the kernel's
   /// own Integrity checker (checksums included).
   @discardableResult
-  public static func checkLiveness(
+  package static func checkLiveness(
     _ resolver: some PageResolver, _ meta: Meta
   ) throws -> IntegrityReport {
     try Integrity.check(resolver: resolver, meta: meta, verifyChecksums: false)
   }
 
   /// Applies an op to both the transaction and the model.
-  public static func apply(_ op: DBOp, ctx: TxnContext, model: inout ModelStore) throws {
+  package static func apply(_ op: DBOp, ctx: TxnContext, model: inout ModelStore) throws {
     switch op {
     case .put(let key, let value):
       try put(ctx, key, value)

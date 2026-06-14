@@ -13,7 +13,7 @@ import Synchronization
 ///   groups apply fully, the cut group applies per 4 KiB sub-block at random
 ///   (writeback may reorder *within* barrier groups, never across), later
 ///   groups vanish.
-public final class SimulatedDisk: StorageChannel, @unchecked Sendable {
+package final class SimulatedDisk: StorageChannel, @unchecked Sendable {
   enum Mutation {
     case write(offset: Int, bytes: [UInt8])
     case setSize(Int)
@@ -31,29 +31,29 @@ public final class SimulatedDisk: StorageChannel, @unchecked Sendable {
   private let inner: FileChannel
   private let state = Mutex(State())
 
-  public var fileDescriptor: Int32 { inner.fileDescriptor }
+  package var fileDescriptor: Int32 { inner.fileDescriptor }
 
-  public init(path: String) throws(DBError) {
+  package init(path: String) throws(DBError) {
     self.inner = try FileChannel(path: path, mode: .readWrite(create: true))
     try inner.truncate(to: 0)
   }
 
   // MARK: - StorageChannel
 
-  public func fileSize() throws(DBError) -> Int { try inner.fileSize() }
+  package func fileSize() throws(DBError) -> Int { try inner.fileSize() }
 
-  public func pread(into buffer: UnsafeMutableRawBufferPointer, at offset: Int) throws(DBError) {
+  package func pread(into buffer: UnsafeMutableRawBufferPointer, at offset: Int) throws(DBError) {
     try inner.pread(into: buffer, at: offset)
   }
 
-  public func pwrite(_ buffer: UnsafeRawBufferPointer, at offset: Int) throws(DBError) {
+  package func pwrite(_ buffer: UnsafeRawBufferPointer, at offset: Int) throws(DBError) {
     state.withLock {
       $0.records.append(.init(mutation: .write(offset: offset, bytes: [UInt8](buffer)), group: $0.currentGroup))
     }
     try inner.pwrite(buffer, at: offset)
   }
 
-  public func pwritev(_ buffers: [UnsafeRawBufferPointer], at offset: Int) throws(DBError) {
+  package func pwritev(_ buffers: [UnsafeRawBufferPointer], at offset: Int) throws(DBError) {
     var at = offset
     for buffer in buffers {
       try pwrite(buffer, at: at)
@@ -61,7 +61,7 @@ public final class SimulatedDisk: StorageChannel, @unchecked Sendable {
     }
   }
 
-  public func sync(_ profile: DurabilityProfile) throws(DBError) {
+  package func sync(_ profile: DurabilityProfile) throws(DBError) {
     state.withLock {
       switch profile {
       case .none:
@@ -76,7 +76,7 @@ public final class SimulatedDisk: StorageChannel, @unchecked Sendable {
     // No real fsync: tests never rely on actual disk durability.
   }
 
-  public func preallocate(minimumSize: Int) throws(DBError) {
+  package func preallocate(minimumSize: Int) throws(DBError) {
     let current = try inner.fileSize()
     if minimumSize > current {
       state.withLock {
@@ -86,31 +86,31 @@ public final class SimulatedDisk: StorageChannel, @unchecked Sendable {
     try inner.preallocate(minimumSize: minimumSize)
   }
 
-  public func truncate(to size: Int) throws(DBError) {
+  package func truncate(to size: Int) throws(DBError) {
     state.withLock {
       $0.records.append(.init(mutation: .setSize(size), group: $0.currentGroup))
     }
     try inner.truncate(to: size)
   }
 
-  public func close() { inner.close() }
+  package func close() { inner.close() }
 
   // MARK: - Crash materialization
 
-  public var crashCutGroups: ClosedRange<Int> {
+  package var crashCutGroups: ClosedRange<Int> {
     state.withLock { $0.durableFloor...$0.currentGroup }
   }
 
   /// Builds the post-power-cut file image for a random cut group drawn from
   /// `crashCutGroups`.
-  public func materializeCrashImage(seed: UInt64) -> [UInt8] {
+  package func materializeCrashImage(seed: UInt64) -> [UInt8] {
     var rng = SplitMix64(seed: seed)
     let range = crashCutGroups
     let cut = range.lowerBound + Int(rng.next() % UInt64(range.count))
     return materializeCrashImage(cutGroup: cut, tearSeed: rng.next())
   }
 
-  public func materializeCrashImage(cutGroup: Int, tearSeed: UInt64) -> [UInt8] {
+  package func materializeCrashImage(cutGroup: Int, tearSeed: UInt64) -> [UInt8] {
     var rng = SplitMix64(seed: tearSeed)
     var image: [UInt8] = []
     var logicalSize = 0
@@ -156,7 +156,7 @@ public final class SimulatedDisk: StorageChannel, @unchecked Sendable {
   }
 
   /// Writes a crash image to `path` so it can be reopened as a real database.
-  public func writeCrashImage(_ image: [UInt8], to path: String) throws(DBError) {
+  package func writeCrashImage(_ image: [UInt8], to path: String) throws(DBError) {
     let out = try FileChannel(path: path, mode: .readWrite(create: true))
     defer { out.close() }
     try out.truncate(to: 0)

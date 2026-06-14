@@ -2,12 +2,12 @@
 /// (COW-once-per-transaction: a page already owned by the transaction is
 /// mutated in place), so committed pages are never touched and readers on
 /// older generations stay consistent without locks.
-public enum BTree {
-  public enum ValueRef: ~Escapable {
+package enum BTree {
+  package enum ValueRef: ~Escapable {
     case inline(RawSpan)
     case overflow(head: UInt64, length: Int)
 
-    public var length: Int {
+    package var length: Int {
       switch self {
       case .inline(let v): return v.byteCount
       case .overflow(_, let length): return length
@@ -30,14 +30,14 @@ public enum BTree {
 
   @inline(__always)
   @_lifetime(borrow resolver)
-  public static func get<R: PageResolver>(
+  package static func get<R: PageResolver>(
     resolver: borrowing R, meta: Meta, key: UnsafeRawBufferPointer
   ) throws(DBError) -> ValueRef? {
     unsafe try get(resolver: resolver, tree: meta.mainTree, key: key)
   }
 
   @_lifetime(borrow resolver)
-  public static func get<R: PageResolver>(
+  package static func get<R: PageResolver>(
     resolver: borrowing R, tree: TreeHandle, key: UnsafeRawBufferPointer
   ) throws(DBError) -> ValueRef? {
     guard tree.rootPage != 0 else { return nil }
@@ -66,7 +66,7 @@ public enum BTree {
 
   /// Materializes a value reference (copying inline bytes or concatenating
   /// the overflow chain).
-  public static func copyValue(
+  package static func copyValue(
     _ ref: ValueRef, resolver: some PageResolver
   ) throws(DBError) -> [UInt8] {
     switch ref {
@@ -81,7 +81,7 @@ public enum BTree {
   /// Zero-copy access to a value's bytes: an inline value is handed to `body`
   /// as the mapped page span directly; an overflow value is assembled once and
   /// spanned. The span is valid only for the duration of `body`.
-  public static func withValueBytes<R>(
+  package static func withValueBytes<R>(
     _ ref: ValueRef, resolver: some PageResolver,
     _ body: (UnsafeRawBufferPointer) throws(DBError) -> R
   ) throws(DBError) -> R {
@@ -106,7 +106,7 @@ public enum BTree {
   // MARK: - Insert / update
 
   @inline(__always)
-  public static func put(
+  package static func put(
     ctx: TxnContext, key: UnsafeRawBufferPointer, value: UnsafeRawBufferPointer
   ) throws(DBError) {
     var tree = ctx.meta.mainTree
@@ -114,7 +114,7 @@ public enum BTree {
     ctx.meta.mainTree = tree
   }
 
-  public static func put(
+  package static func put(
     ctx: TxnContext, tree: inout TreeHandle,
     key: UnsafeRawBufferPointer, value: UnsafeRawBufferPointer
   ) throws(DBError) {
@@ -327,14 +327,14 @@ public enum BTree {
 
   /// In-order traversal of every (key, valueRef) pair.
   @inline(__always)
-  public static func forEach(
+  package static func forEach(
     resolver: some PageResolver, meta: Meta,
     _ body: (UnsafeRawBufferPointer, ValueRef) throws(DBError) -> Void
   ) throws(DBError) {
     unsafe try forEach(resolver: resolver, tree: meta.mainTree, body)
   }
 
-  public static func forEach(
+  package static func forEach(
     resolver: some PageResolver, tree: TreeHandle,
     _ body: (UnsafeRawBufferPointer, ValueRef) throws(DBError) -> Void
   ) throws(DBError) {
@@ -372,25 +372,25 @@ public enum BTree {
 
   // MARK: - Structural validation
 
-  public struct ValidationReport: Sendable {
-    public var reachablePages: Set<UInt64> = []
-    public var kvCount: UInt64 = 0
-    public var leafCount = 0
-    public var branchCount = 0
-    public var overflowPages = 0
+  package struct ValidationReport: Sendable {
+    package var reachablePages: Set<UInt64> = []
+    package var kvCount: UInt64 = 0
+    package var leafCount = 0
+    package var branchCount = 0
+    package var overflowPages = 0
   }
 
   /// Full structural check of the tree under `meta`: page types, in-node key
   /// order, separator bounds, uniform leaf depth, overflow chain lengths.
   /// Returns the set of reachable pages for liveness accounting.
   @inline(__always)
-  public static func validate(
+  package static func validate(
     resolver: some PageResolver, meta: Meta, verifyChecksums: Bool = false
   ) throws(DBError) -> ValidationReport {
     try validate(resolver: resolver, tree: meta.mainTree, verifyChecksums: verifyChecksums)
   }
 
-  public static func validate(
+  package static func validate(
     resolver: some PageResolver, tree: TreeHandle, verifyChecksums: Bool = false
   ) throws(DBError) -> ValidationReport {
     var report = ValidationReport()

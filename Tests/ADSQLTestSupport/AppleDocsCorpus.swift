@@ -19,24 +19,24 @@
 ///
 /// The row count is parameterized so the parity test uses ~2k (fast + plenty to
 /// discriminate ranking) while F6b can scale the *same* generator to ≥100k.
-public enum AppleDocsCorpus {
+package enum AppleDocsCorpus {
   /// One synthetic documentation row. `id` is the 1-based rowid shared by the
   /// base table and every FTS table (so `d.id == fts.rowid`, the apple-docs join).
-  public struct Document: Sendable, Equatable {
-    public let id: Int64
+  package struct Document: Sendable, Equatable {
+    package let id: Int64
     // documents / documents_fts columns
-    public let title: String
-    public let abstract: String
-    public let declaration: String
-    public let headings: String
-    public let key: String
+    package let title: String
+    package let abstract: String
+    package let declaration: String
+    package let headings: String
+    package let key: String
     // documents_body_fts (contentless) column
-    public let body: String
+    package let body: String
     // sf_symbols_fts columns
-    public let name: String
-    public let keywords: String
-    public let categories: String
-    public let aliases: String
+    package let name: String
+    package let keywords: String
+    package let categories: String
+    package let aliases: String
   }
 
   // MARK: - Vocabulary (fixed; indexed by the seeded stream)
@@ -113,7 +113,7 @@ public enum AppleDocsCorpus {
 
   /// Builds `count` deterministic documents from `seed`. Same arguments ⇒ same
   /// rows. `count` rows get ids `1...count` (matching SQLite's implicit rowid).
-  public static func generate(count: Int, seed: UInt64) -> [Document] {
+  package static func generate(count: Int, seed: UInt64) -> [Document] {
     var rng = SplitMix64(seed: seed)
     var docs: [Document] = []
     docs.reserveCapacity(count)
