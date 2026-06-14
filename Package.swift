@@ -46,6 +46,15 @@ let testSettings: [SwiftSetting] =
 // in dev/CI.
 let isDev = Context.environment["ADSQL_DEV"] != nil
 
+// ADSQL ships zero runtime dependencies. The only dependency — the DocC plugin that builds the
+// documentation site — is dev/CI-only (gated behind ADSQL_DEV), so packages that depend on ADSQL
+// never resolve it.
+var packageDependencies: [Package.Dependency] = []
+if isDev {
+    packageDependencies.append(
+        .package(url: "https://github.com/swiftlang/swift-docc-plugin", from: "1.0.0"))
+}
+
 let package = Package(
     name: "ADSQL",
     // Floor OSes match the sibling `../adjson` package: macOS one generation below the device
@@ -63,6 +72,7 @@ let package = Package(
         .library(name: "ADSQL", targets: ["ADSQL"]),
         .executable(name: "adsql", targets: ["ADSQLTool"]),
     ],
+    dependencies: packageDependencies,
     targets: [
         .target(name: "ADCAtomics"),
         .target(
