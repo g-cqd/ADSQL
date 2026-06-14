@@ -15,6 +15,8 @@ struct BenchConfig {
   var evaluator: ExecutionOptions.Evaluator = .treeWalk
   /// Join strategy for the SQL scenarios (`--join`).
   var joinStrategy: ExecutionOptions.Join = .nestedLoop
+  /// Insert strategy for the SQL scenarios (`--insert`).
+  var insertStrategy: ExecutionOptions.Insert = .standard
 }
 
 enum Scenarios {

@@ -237,6 +237,92 @@ public enum BTree {
     tree.depth += 1
   }
 
+  // MARK: - Append fast path (warm rightmost-leaf cache)
+
+  /// Warm cache for `appendMax`: the rightmost leaf's page number, its current
+  /// max key, and the tree root the cache was taken under (a non-append mutation
+  /// re-shadows the root, so a root mismatch means the cache is stale).
+  struct AppendCache: Sendable {
+    var leafPageNo: UInt64
+    var maxKey: [UInt8]
+    var rootPage: UInt64
+  }
+
+  /// Inserts `key` (which the caller GUARANTEES is strictly greater than every
+  /// key already in the tree — e.g. a freshly allocated ascending rowid), reusing
+  /// a warm rightmost-leaf cache to skip the root→leaf descent + per-insert COW
+  /// shadow when the new cell fits the cached leaf. Produces the identical logical
+  /// tree as `put`; it only avoids re-shadowing the path each row.
+  ///
+  /// The in-place append routes through `ctx.shadow`, so the leaf's pre-request
+  /// content is recorded in the undo log and a group-commit `rollbackRequestScope`
+  /// undoes it exactly like a normal write. ANY ineligibility — stale cache (root
+  /// changed), leaf no longer owned, key not strictly greater, or the cell does
+  /// not fit (would split) — falls through to the proven `put`, which also
+  /// refreshes the cache to the (now-dirty) rightmost leaf.
+  static func appendMax(
+    ctx: TxnContext, tree: inout TreeHandle,
+    key: UnsafeRawBufferPointer, value: UnsafeRawBufferPointer,
+    cache: inout AppendCache?
+  ) throws(DBError) {
+    guard unsafe !key.isEmpty else { throw DBError.keyEmpty }
+    guard key.count <= Format.maxKeySize else { throw DBError.keyTooLarge(key.count) }
+
+    if let c = cache, c.rootPage == tree.rootPage, ctx.owns(c.leafPageNo),
+      c.maxKey.withUnsafeBytes({ (m: UnsafeRawBufferPointer) in unsafe Node.compare(key, m) > 0 })
+    {
+      var pager = ctx
+      let leafValue: Node.LeafValue
+      if Node.shouldInline(keyLen: key.count, valueLen: value.count) {
+        leafValue = unsafe .inline(value)
+      } else {
+        let head = unsafe try Overflow.write(value, pager: &pager)
+        leafValue = .overflow(head: head, length: UInt32(value.count))
+      }
+      // `shadow` on a dirty page keeps the page number; under group commit it
+      // clones-on-first-touch-this-request and records the undo entry. The leaf
+      // stays the rightmost, so its parents still point at it — no descent needed.
+      let (leafNo, buf) = try ctx.shadow(c.leafPageNo)
+      let cellCount = unsafe PageHeader.cellCount(buf.readOnly)
+      if unsafe Node.leafInsert(buf.raw, at: cellCount, key: key, value: leafValue) {
+        tree.count += 1
+        cache = unsafe AppendCache(leafPageNo: leafNo, maxKey: [UInt8](key), rootPage: c.rootPage)
+        return
+      }
+      // Did not fit (would split): release any overflow we wrote, then fall through
+      // to the proven split path. `leafInsert` is a no-op when it returns false.
+      if case .overflow(let head, _) = leafValue { try Overflow.free(head: head, pager: &pager) }
+    }
+
+    // Slow / cold path: the verified `put` (empty tree, splits, the exact-replace
+    // case), then refresh the cache to the rightmost leaf now holding `key`.
+    unsafe try put(ctx: ctx, tree: &tree, key: key, value: value)
+    if let leafNo = try rightmostLeaf(ctx: ctx, tree: tree) {
+      cache = unsafe AppendCache(leafPageNo: leafNo, maxKey: [UInt8](key), rootPage: tree.rootPage)
+    } else {
+      cache = nil
+    }
+  }
+
+  /// Page number of the rightmost (max-key) leaf, descending the last child at
+  /// each branch level — mirrors `Cursor.descend(edge: .last)` but returns only
+  /// the leaf page so the append cache can be refreshed after a cold `put`.
+  static func rightmostLeaf(ctx: TxnContext, tree: TreeHandle) throws(DBError) -> UInt64? {
+    guard tree.rootPage != 0 else { return nil }
+    var pageNo = tree.rootPage
+    var level = tree.depth
+    while level > 1 {
+      let page = unsafe try ctx.resolvePage(pageNo)
+      guard unsafe PageHeader.pageType(page) == .branch else {
+        throw DBError.corruptPage(pageNo: pageNo)
+      }
+      let slot = unsafe PageHeader.cellCount(page) - 1
+      pageNo = unsafe slot < 0 ? PageHeader.link(page) : Node.branchChild(page, slot)
+      level -= 1
+    }
+    return pageNo
+  }
+
   // MARK: - Traversal (tests, integrity, future cursors build on this)
 
   /// In-order traversal of every (key, valueRef) pair.

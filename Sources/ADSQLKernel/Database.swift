@@ -269,6 +269,7 @@ public final class Database: Sendable {
     guard let (meta, reclaimLimit) = snapshot else { throw DBError.databaseClosed }
 
     let ctx = TxnContext(source: pager, meta: meta)
+    ctx.appendCursorEnabled = options.execution.insert == .appendCursor
     try FreeList.harvest(ctx: ctx, upTo: reclaimLimit)
     let baselineMain = ctx.meta.mainTree
 

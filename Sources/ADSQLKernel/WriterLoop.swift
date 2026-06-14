@@ -83,6 +83,7 @@ extension Database {
       }
 
       let ctx = TxnContext(source: pager, meta: meta)
+      ctx.appendCursorEnabled = options.execution.insert == .appendCursor
       do throws(DBError) {
         try FreeList.harvest(ctx: ctx, upTo: reclaimLimit)
       } catch {

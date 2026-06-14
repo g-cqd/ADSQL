@@ -84,6 +84,15 @@ public final class TxnContext: PageResolver, OverflowPager {
   /// allocation per row. Query/read paths never touch these.
   var recordScratch: [UInt8] = []
   var indexKeyScratch: [UInt8] = []
+  /// Warm rightmost-leaf append cache per table tree (keyed by tableId), used by
+  /// the opt-in `appendCursor` insert path. Writer-confined; cleared on request
+  /// rollback (below). The per-entry `rootPage` guard catches every other tree
+  /// mutation (a non-append re-shadows the root), so a stale entry never appends.
+  var appendCache: [UInt32: BTree.AppendCache] = [:]
+  /// Whether the opt-in `appendCursor` insert fast path is active for this
+  /// transaction (`DatabaseOptions.execution.insert == .appendCursor`); set once
+  /// at ctx creation. Default off → the proven descent path.
+  var appendCursorEnabled = false
 
   /// Relational state (catalog, handles, sequences), loaded lazily on first
   /// relational use. Value-typed: TxnRestorePoint snapshots it by copy.
@@ -190,6 +199,9 @@ public final class TxnContext: PageResolver, OverflowPager {
     for entry in undoReplaced { dirty[entry.pageNo] = entry.previous }
     for pageNo in undoAllocated { dirty.removeValue(forKey: pageNo) }
     for entry in undoFreedOwned { dirty[entry.pageNo] = entry.buf }
+    // The append cache may point at a leaf whose appends this scope just undid;
+    // drop it so the next append re-establishes it from the restored tree.
+    appendCache.removeAll(keepingCapacity: true)
   }
 
   // MARK: - OverflowPager

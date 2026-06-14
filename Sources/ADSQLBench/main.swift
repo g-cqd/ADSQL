@@ -32,6 +32,12 @@ while let argument = iterator.next() {
     case "auto": config.joinStrategy = .auto
     default: config.joinStrategy = .nestedLoop
     }
+  case "--insert":
+    switch iterator.next() {
+    case "hoisted": config.insertStrategy = .hoisted
+    case "appendCursor", "append": config.insertStrategy = .appendCursor
+    default: config.insertStrategy = .standard
+    }
   case "--seconds":
     config.concurrentSeconds = Double(iterator.next() ?? "") ?? config.concurrentSeconds
   case "--engine":

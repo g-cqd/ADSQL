@@ -80,6 +80,29 @@ enum Relation {
     if let failure { throw failure }
   }
 
+  /// Table-tree put for an ascending, caller-guaranteed-maximal rowid key, routed
+  /// through the warm rightmost-leaf append cache (`BTree.appendMax`). Equivalent
+  /// to `putBytes` but skips the per-row root→leaf descent + COW shadow when the
+  /// cell fits the cached leaf; any ineligibility falls through to the proven put.
+  static func putRowAppend(
+    _ ctx: TxnContext, _ tree: inout TreeHandle, tableId: UInt32, key: [UInt8], value: [UInt8]
+  ) throws(DBError) {
+    var cache = ctx.appendCache[tableId]
+    var failure: DBError?
+    key.withUnsafeBytes { keyBytes in
+      value.withUnsafeBytes { valueBytes in
+        do throws(DBError) {
+          unsafe try BTree.appendMax(
+            ctx: ctx, tree: &tree, key: keyBytes, value: valueBytes, cache: &cache)
+        } catch {
+          failure = error
+        }
+      }
+    }
+    ctx.appendCache[tableId] = cache
+    if let failure { throw failure }
+  }
+
   @discardableResult
   static func deleteBytes(
     _ ctx: TxnContext, _ tree: inout TreeHandle, key: [UInt8]

@@ -412,7 +412,18 @@ extension Relation {
     // reuse on the next row).
     var handle = table.handle
     RecordCodec.encode(row, into: &ctx.recordScratch)
-    try putBytes(ctx, &handle, key: KeyCodec.rowKey(rowid), value: ctx.recordScratch)
+    // appendCursor (opt-in): an auto-allocated rowid is strictly greater than every
+    // existing rowid (it is max+1), so the table-tree key is a guaranteed append —
+    // route it through the warm rightmost-leaf cache. Explicit rowids (which may
+    // land anywhere) take the proven descent path; either way the rowKey is the
+    // table tree's key, and a delete/explicit-put re-shadows the root, so the
+    // cache's rootPage guard invalidates a stale entry automatically.
+    if ctx.appendCursorEnabled, explicitRowid == nil {
+      try putRowAppend(
+        ctx, &handle, tableId: table.tableId, key: KeyCodec.rowKey(rowid), value: ctx.recordScratch)
+    } else {
+      try putBytes(ctx, &handle, key: KeyCodec.rowKey(rowid), value: ctx.recordScratch)
+    }
     table.handle = handle
     state.tableRecords[tableName] = table
 

@@ -42,7 +42,8 @@ enum SQLScenario {
       at: path,
       options: DatabaseOptions(
         durability: .none, maxMapSize: 32 << 30,
-        execution: ExecutionOptions(evaluator: config.evaluator, join: config.joinStrategy)))
+        execution: ExecutionOptions(
+          evaluator: config.evaluator, join: config.joinStrategy, insert: config.insertStrategy)))
     defer { db.close() }
     for sql in ddl { try db.prepare(sql).run() }
 
