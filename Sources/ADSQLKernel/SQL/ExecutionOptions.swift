@@ -1,8 +1,11 @@
-/// Tunable selection of execution strategies. Every option defaults to the
-/// engine's established (reference) behavior; alternative strategies are added
-/// *beside* the reference path and only become a default once benchmarked to win
-/// on accuracy, performance, concurrency, parallelism, reliability, consistency,
-/// and integrity (see the maturity program). A `Sendable` value type, snapshot-
+/// Tunable selection of execution strategies. Alternative strategies are added
+/// *beside* the reference path and only become a default once they win on
+/// accuracy, performance, concurrency, parallelism, reliability, consistency, and
+/// integrity (see the maturity program). **`join` graduated first (RFC 0009 H8):
+/// it defaults to `.auto`**, which selects the merge fast path when eligible (a
+/// proven `≡ nestedLoop ≡ SQLite`, read-only win) and otherwise the reference
+/// nested loop; `.nestedLoop` remains explicitly selectable. `evaluator`/`insert`
+/// still default to their reference paths. A `Sendable` value type, snapshot-
 /// copied into each execution — it introduces no shared mutable state, so the
 /// single-writer / wait-free-reader MVCC model is unaffected.
 public struct ExecutionOptions: Sendable, Equatable {
@@ -43,7 +46,7 @@ public struct ExecutionOptions: Sendable, Equatable {
 
   public init(
     evaluator: Evaluator = .treeWalk,
-    join: Join = .nestedLoop,
+    join: Join = .auto,
     insert: Insert = .standard,
     hashJoinMemoryBudgetBytes: Int = 256 << 20
   ) {

@@ -36,9 +36,12 @@ bounds-checked. Nothing is systemically wrong. The remaining gaps are **narrow a
    over-broad public surface (S1) **remain**.
 
 On performance: **DISTINCT and SEARCH now meet-or-beat SQLite; FTS ranked top-k now BEATS SQLite FTS5**
-(the headline change since the reports — §1.1, §4.4). The two SQL paths that still lose are **JOIN
-(~0.26×)** and **INSERT (~0.77×)**; the merge join + cost model and the `appendCursor` insert are the
-levers (§4.3, §6). A unifying finding (§5.7): the residual cost on JOIN, SEARCH **and** FTS-MATCH is the
+(the headline change since the reports — §1.1, §4.4). The JOIN — formerly the engine's worst loss
+(~0.26×) — **now beats SQLite (~2.1×)** via a merge-join existence fast path that the `.auto` cost model
+selects, and `.auto` is now the **default** join strategy (won all seven criteria; RFC 0009 H4/H8).
+**INSERT (~0.77×) is the one remaining losing SQL path**: its safe per-row waste-clears (rowid cache,
+opt-in `appendCursor`) are in and tested, but the 3-index apple-docs shape is dominated by secondary-index
+COW maintenance, so closing it needs index-maintenance work (a separate lever). A unifying finding (§5.7): the residual cost on JOIN, SEARCH **and** FTS-MATCH is the
 **same per-row `[Value]`/ARC/exclusivity row-materialization** path — one evaluator/row-path lever
 closes all three.
 
