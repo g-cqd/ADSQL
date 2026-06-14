@@ -330,6 +330,18 @@ enum Relation {
     guard !definition.columns.isEmpty else {
       throw DBError.invalidDefinition("fts5 table \(definition.name) has no columns")
     }
+    for column in definition.columns where column.utf8.count > 255 {
+      throw DBError.invalidDefinition("fts5 table \(definition.name): column name too long")
+    }
+    for token in definition.tokenize where token.utf8.count > 255 {
+      throw DBError.invalidDefinition("fts5 table \(definition.name): tokenizer argument too long")
+    }
+    if case .external(let table, let rowid) = definition.content {
+      guard table.utf8.count <= 255, rowid.utf8.count <= 255 else {
+        throw DBError.invalidDefinition(
+          "fts5 table \(definition.name): content table/rowid name too long")
+      }
+    }
     let id = state.version.nextTableId
     state.version.nextTableId += 1
     state.ftsRecords[definition.name] = Catalog.FTSRecord(

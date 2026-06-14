@@ -112,4 +112,34 @@ struct FTSCatalogTests {
       #expect(throws: DBError.self) { try db.prepare("DROP TABLE missing_fts").run() }
     }
   }
+
+  /// Regression: over-long FTS column, tokenizer, and external-content names
+  /// surface a catchable `DBError` instead of tripping the catalog encoder's
+  /// length `precondition`. The 255-byte boundary still round-trips.
+  @Test func rejectsOverLongFTSNamesWithoutTrapping() throws {
+    let dir = TempDir()
+    defer { dir.cleanup() }
+    let db = try Database.open(at: dir.file("fts-long.adsql"))
+    defer { db.close() }
+
+    let tooLong = String(repeating: "a", count: 256)
+    #expect(throws: DBError.invalidDefinition("fts5 table c: column name too long")) {
+      try db.prepare("CREATE VIRTUAL TABLE c USING fts5(\(tooLong))").run()
+    }
+    #expect(throws: DBError.invalidDefinition("fts5 table k: tokenizer argument too long")) {
+      try db.prepare("CREATE VIRTUAL TABLE k USING fts5(body, tokenize='\(tooLong)')").run()
+    }
+    #expect(throws: DBError.invalidDefinition("fts5 table x: content table/rowid name too long")) {
+      try db.prepare(
+        "CREATE VIRTUAL TABLE x USING fts5(body, content='\(tooLong)', content_rowid='id')"
+      ).run()
+    }
+
+    let atLimit = String(repeating: "b", count: 255)
+    try db.prepare("CREATE VIRTUAL TABLE ok USING fts5(\(atLimit))").run()
+    let columns: [String]? = try db.writeSync { (txn) throws(DBError) in
+      try txn.schema().ftsTables["ok"]?.columns
+    }
+    #expect(columns == [atLimit])
+  }
 }

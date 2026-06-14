@@ -101,4 +101,26 @@ struct SQLDDLTests {
     #expect(plan.contains("USING INDEX i_v"), "\(plan)")
     _ = try reopened.verifyIntegrity(deep: true)
   }
+
+  /// Regression: an over-long column name surfaces a catchable `DBError`
+  /// instead of tripping the catalog encoder's length `precondition` (which
+  /// aborted the process). The 255-byte boundary still round-trips.
+  @Test func rejectsOverLongColumnNameWithoutTrapping() throws {
+    let dir = TempDir()
+    defer { dir.cleanup() }
+    let db = try Database.open(at: dir.file("longcol.adsql"))
+    defer { db.close() }
+
+    let tooLong = String(repeating: "a", count: 256)
+    #expect(throws: DBError.invalidDefinition("table t: column name too long (max 255 bytes)")) {
+      try db.prepare("CREATE TABLE t(\(tooLong) INTEGER)").run()
+    }
+
+    let atLimit = String(repeating: "b", count: 255)
+    try db.prepare("CREATE TABLE u(\(atLimit) INTEGER)").run()
+    let columns: [String]? = try db.writeSync { (txn) throws(DBError) in
+      try txn.schema().tables["u"]?.columns.map(\.name)
+    }
+    #expect(columns == [atLimit])
+  }
 }

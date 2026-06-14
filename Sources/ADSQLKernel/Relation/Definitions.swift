@@ -90,6 +90,9 @@ public struct TableDefinition: Equatable, Sendable {
       guard !column.name.isEmpty else {
         throw DBError.invalidDefinition("table \(name): empty column name")
       }
+      guard column.name.utf8.count <= 255 else {
+        throw DBError.invalidDefinition("table \(name): column name too long (max 255 bytes)")
+      }
       guard seen.insert(column.name).inserted else {
         throw DBError.invalidDefinition("table \(name): duplicate column \(column.name)")
       }
