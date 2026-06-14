@@ -246,9 +246,16 @@ public final class Statement: Sendable {
         sub, resolver: resolver, meta: meta, schemaCache: cache, params: params,
         outerContext: outerContext, outerBinding: outerBinding)
     }
+    var mergeIndexes: (outer: Catalog.IndexRecord, inner: Catalog.IndexRecord)?
+    if let mergePlan = plan.mergePlan {
+      mergeIndexes = (
+        outer: try resolveIndex(mergePlan.outerIndex, resolver: resolver, meta: meta, cache: cache),
+        inner: try resolveIndex(mergePlan.innerIndex, resolver: resolver, meta: meta, cache: cache))
+    }
     return try SelectExecutor.run(
       plan, tables: tables, index: index, joinIndexes: joinIndexes, ftsRecords: ftsRecords,
-      resolver: txn.resolver, params: params, subquery: runner, execution: execution)
+      resolver: txn.resolver, params: params, subquery: runner, execution: execution,
+      mergeIndexes: mergeIndexes)
   }
 
   /// Runs one correlated scalar subquery against the current outer row,

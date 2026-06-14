@@ -157,18 +157,21 @@ enum SelectExecutor {
     resolver: R, params: SQLParameters,
     outer: (context: RowContext, binding: QueryBinding)? = nil,
     subquery: @escaping SubqueryRunner = rejectSubquery,
-    execution: ExecutionOptions = .default
+    execution: ExecutionOptions = .default,
+    mergeIndexes: (outer: Catalog.IndexRecord, inner: Catalog.IndexRecord)? = nil
   ) throws(DBError) -> [SQLRow] {
     let evaluator = execution.evaluator
     if plan.isAggregated {
       return try runAggregated(
         plan, tables: tables, index: index, joinIndexes: joinIndexes, ftsRecords: ftsRecords,
-        resolver: resolver, params: params, outer: outer, subquery: subquery, execution: execution)
+        resolver: resolver, params: params, outer: outer, subquery: subquery, execution: execution,
+        mergeIndexes: mergeIndexes)
     }
     if plan.isJoin {
       return try runJoin(
         plan, tables: tables, index: index, joinIndexes: joinIndexes, ftsRecords: ftsRecords,
-        resolver: resolver, params: params, outer: outer, subquery: subquery, execution: execution)
+        resolver: resolver, params: params, outer: outer, subquery: subquery, execution: execution,
+        mergeIndexes: mergeIndexes)
     }
     // Index-ordered DISTINCT: emit one row per distinct index-key prefix, decoded
     // straight from the key (no table descent, no dedup set).
@@ -727,7 +730,7 @@ enum SelectExecutor {
     // a build-side cost estimate). Returns false when ineligible.
     if execution.join == .merge || execution.join == .auto,
       try runMergeJoin(
-        plan, tables: tables, joinIndexes: joinIndexes, resolver: resolver, context: context,
+        plan, tables: tables, resolver: resolver, context: context,
         emit: { () throws(DBError) in if try passesWhere() { try body() } })
     {
       return
@@ -1033,46 +1036,66 @@ enum SelectExecutor {
     return true
   }
 
-  /// Merge-join existence/COUNT fast path (RFC 0009 H4). A 2-table INNER
-  /// existence self-equi-join on a **UNIQUE, NOT-NULL, single-column** index needs
-  /// no per-outer inner probe: each outer row matches exactly the one inner row
-  /// with the same key (itself), so a single ordered pass over the shared index
-  /// emits once per entry — O(N) byte walk, no descent, no materialization
-  /// (`COUNT(*)` = the row count). UNIQUE + NOT-NULL rules out dup-run cross-products
-  /// and NULL non-matches, so the result is provably identical to the nested loop.
-  /// Returns false (→ the proven nested-loop driver) for any shape outside this
-  /// subset; the general 2-table / dup-run / nullable merge is a later slice.
+  /// Merge-join existence/COUNT fast path (RFC 0009 H4/R2). A 2-table INNER
+  /// existence equi-join whose join-key columns each have a UNIQUE, NOT-NULL,
+  /// single-column index (the binder's `mergePlan`; indexes resolved into
+  /// `context.mergeIndexes`) needs no per-outer probe: lock-step the two sorted
+  /// indexes and emit once per key present on both sides (the intersection).
+  /// UNIQUE + NOT-NULL rules out dup-run cross-products and NULL non-matches, so
+  /// the result is provably identical to the nested loop. A self-join is the case
+  /// where the two indexes coincide (the two cursors walk the same tree in step).
+  /// Returns false (→ the proven nested-loop driver) outside this subset.
   private static func runMergeJoin<R: PageResolver>(
-    _ plan: BoundSelect, tables: [Catalog.TableRecord], joinIndexes: [Catalog.IndexRecord?],
+    _ plan: BoundSelect, tables: [Catalog.TableRecord],
     resolver: R, context: RowContext, emit: () throws(DBError) -> Void
   ) throws(DBError) -> Bool {
-    guard plan.joins.count == 1, plan.joins[0].kind == .inner else { return false }
-    let join = plan.joins[0]
-    guard join.innerExistenceOnly, plan.isAggregated, plan.whereExpr == nil,
-      !plan.finalizationReferencedTables.contains(0), join.table == 1,
-      tables.count == 2, tables[0].tableId == tables[1].tableId,  // self-join (shared index)
-      let idx = joinIndexes.first ?? nil,
-      idx.definition.unique, idx.definition.columns.count == 1,
-      let idxCol = tables[0].definition.columnIndex(of: idx.definition.columns[0]),
-      tables[0].definition.columns[idxCol].notNull,
-      let key = hashEquiKey(join.on, innerDepth: 1, binding: plan.binding),
-      key.innerColumn == idxCol,
-      case .boundColumn(let outerTable, let outerColumn) = key.outerColumn,
-      outerTable == 0, outerColumn == idxCol
+    guard let indexes = context.mergeIndexes,
+      plan.joins.count == 1, plan.joins[0].kind == .inner, plan.joins[0].innerExistenceOnly,
+      plan.isAggregated, plan.whereExpr == nil,
+      !plan.finalizationReferencedTables.contains(0),
+      !plan.finalizationReferencedTables.contains(1)
     else { return false }
 
-    // Neither table's columns are read (existence inner + COUNT(*)-style outer), so
-    // load defensive empty spans and emit once per index entry in key order.
+    // Neither table's columns are read (existence + COUNT(*)-style), so empty
+    // spans suffice; two ordered cursors lock-step on the key prefix.
     let emptySpan = unsafe UnsafeRawBufferPointer(start: nil, count: 0)
     unsafe context.load(0, rowid: 0, span: emptySpan)
     unsafe context.load(1, rowid: 0, span: emptySpan)
-    var cursor = Cursor(resolver: resolver, tree: idx.handle)
-    var positioned = try cursor.move(to: .first)
-    while positioned {
-      try emit()
-      positioned = try cursor.next()
+    var outer = Cursor(resolver: resolver, tree: indexes.outer.handle)
+    var inner = Cursor(resolver: resolver, tree: indexes.inner.handle)
+    var oValid = try outer.move(to: .first)
+    var iValid = try inner.move(to: .first)
+    while oValid, iValid {
+      let cmp = try compareMergeKeyPrefixes(&outer, &inner)
+      if cmp == 0 {
+        try emit()
+        oValid = try outer.next()
+        iValid = try inner.next()
+      } else if cmp < 0 {
+        oValid = try outer.next()
+      } else {
+        iValid = try inner.next()
+      }
     }
     return true
+  }
+
+  /// Compares the two cursors' current index keys by their column prefix — the
+  /// bytes before the 8-byte rowid suffix (A4). Both cursors are valid.
+  private static func compareMergeKeyPrefixes<R: PageResolver>(
+    _ outer: inout Cursor<R>, _ inner: inout Cursor<R>
+  ) throws(DBError) -> Int {
+    var result = 0
+    _ = unsafe try outer.withCurrent { (oKey, _) throws(DBError) -> Bool in
+      let oPrefix = unsafe UnsafeRawBufferPointer(rebasing: oKey[0..<(oKey.count - 8)])
+      _ = unsafe try inner.withCurrent { (iKey, _) throws(DBError) -> Bool in
+        let iPrefix = unsafe UnsafeRawBufferPointer(rebasing: iKey[0..<(iKey.count - 8)])
+        result = unsafe Node.compare(oPrefix, iPrefix)
+        return true
+      }
+      return true
+    }
+    return result
   }
 
   private static func andConjuncts(_ expr: SQLExpr) -> [SQLExpr] {
@@ -1105,9 +1128,11 @@ enum SelectExecutor {
     joinIndexes: [Catalog.IndexRecord?], ftsRecords: [String: Catalog.FTSRecord],
     resolver: R, params: SQLParameters,
     outer: (context: RowContext, binding: QueryBinding)?, subquery: @escaping SubqueryRunner,
-    execution: ExecutionOptions = .default
+    execution: ExecutionOptions = .default,
+    mergeIndexes: (outer: Catalog.IndexRecord, inner: Catalog.IndexRecord)? = nil
   ) throws(DBError) -> [SQLRow] {
     let context = RowContext(definitions: tables.map(\.definition))
+    context.mergeIndexes = mergeIndexes
     let env = rowEnv(plan, context: context, params: params, outer: outer, subquery: subquery)
     let paramsEnv = SQLEvalEnv.parametersOnly { p throws(DBError) in try params.lookup(p) }
     let collectKeys = !plan.orderBy.isEmpty
@@ -1152,9 +1177,11 @@ enum SelectExecutor {
     joinIndexes: [Catalog.IndexRecord?], ftsRecords: [String: Catalog.FTSRecord],
     resolver: R, params: SQLParameters,
     outer: (context: RowContext, binding: QueryBinding)?, subquery: @escaping SubqueryRunner,
-    execution: ExecutionOptions = .default
+    execution: ExecutionOptions = .default,
+    mergeIndexes: (outer: Catalog.IndexRecord, inner: Catalog.IndexRecord)? = nil
   ) throws(DBError) -> [SQLRow] {
     let context = RowContext(definitions: tables.map(\.definition))
+    context.mergeIndexes = mergeIndexes
     let scanEnv = rowEnv(plan, context: context, params: params, outer: outer, subquery: subquery)
     let paramsEnv = SQLEvalEnv.parametersOnly { p throws(DBError) in try params.lookup(p) }
     let columnCounts = plan.binding.tables.map(\.columnNames.count)
@@ -1438,6 +1465,10 @@ enum SelectExecutor {
   final class RowContext {
     let slots: [RowSlot]
     var nullExtended: [Bool]
+    /// Resolved join-key indexes for an eligible 2-table merge join (set by
+    /// `runJoin`/`runAggregated` from the plan's `mergePlan`); `runMergeJoin` uses
+    /// them under `.merge`/`.auto`. nil ⇒ not merge-eligible.
+    var mergeIndexes: (outer: Catalog.IndexRecord, inner: Catalog.IndexRecord)?
 
     init(definitions: [TableDefinition]) {
       self.slots = definitions.map { RowSlot(table: $0) }

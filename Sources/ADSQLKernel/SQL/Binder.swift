@@ -225,6 +225,7 @@ enum Binder {
     let boundHaving = having.map(bind)
     let boundAggregates = aggregates.map { bindAggregate($0, binding) }
     let boundJoinsOn = joins.map { bind($0.on) }
+    let mergePlan = mergeJoinPlan(joins: joins, boundOn: boundJoinsOn, binding: binding, schema: schema)
     // Apply the captured weights now that every expression has been bound (so a
     // bm25() anywhere in the projection/ORDER BY is seen). Default to all-ones
     // for a plain `rank` reference (the table index is the leading table or the
@@ -342,7 +343,51 @@ enum Binder {
       accessYieldsOrder: yieldsOrder && planning.yieldsOrder,
       rowidOrderSatisfiesOrderBy: yieldsOrder && planning.rowidOrderSatisfiesOrderBy,
       finalizationReferencedTables: finalizationReferenced,
-      distinctIndexName: distinctIndexName)
+      distinctIndexName: distinctIndexName,
+      mergePlan: mergePlan)
+  }
+
+  /// A 2-table INNER equi-join whose join-key columns each have a UNIQUE,
+  /// NOT-NULL, single-column index of the same collation → merge-eligible (the
+  /// executor lock-steps the two sorted indexes under `.merge`/`.auto`). nil
+  /// otherwise (the proven nested-loop / hash paths handle every other shape).
+  private static func mergeJoinPlan(
+    joins: [BoundJoin], boundOn: [SQLExpr], binding: QueryBinding, schema: Schema
+  ) -> MergePlan? {
+    guard joins.count == 1, joins[0].kind == .inner, binding.tables.count == 2,
+      !binding.tables[0].isFTS, !binding.tables[1].isFTS,
+      case .binary(.eq, let lhs, let rhs) = boundOn[0]
+    else { return nil }
+    func cols(_ a: SQLExpr, _ b: SQLExpr) -> (outer: Int, inner: Int)? {
+      guard case .boundColumn(let at, let ac) = a, case .boundColumn(let bt, let bc) = b,
+        at == 0, bt == 1
+      else { return nil }
+      return (ac, bc)
+    }
+    guard let (oc, ic) = cols(lhs, rhs) ?? cols(rhs, lhs),
+      binding.tables[0].columnCollations[oc] == binding.tables[1].columnCollations[ic],
+      let outerIndex = uniqueKeyIndex(binding.tables[0], column: oc, schema: schema),
+      let innerIndex = uniqueKeyIndex(binding.tables[1], column: ic, schema: schema)
+    else { return nil }
+    return MergePlan(
+      outerIndex: outerIndex, innerIndex: innerIndex, outerColumn: oc, innerColumn: ic)
+  }
+
+  /// The name of a UNIQUE, single-column index on `column` of `table` whose
+  /// column is NOT NULL (so no NULL keys break the merge lock-step), else nil.
+  private static func uniqueKeyIndex(
+    _ table: TableBinding, column: Int, schema: Schema
+  ) -> String? {
+    guard let definition = schema.tables[table.table], column < definition.columns.count,
+      definition.columns[column].notNull
+    else { return nil }
+    let columnName = table.columnNames[column].lowercased()
+    for index in schema.indexes(on: table.table)
+    where index.unique && index.columns.count == 1
+      && index.columns[0].lowercased() == columnName {
+      return index.name
+    }
+    return nil
   }
 
   /// Adds the `(table)` of every `.boundColumn` in `expr` to `refs`. Sets

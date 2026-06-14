@@ -132,6 +132,17 @@ struct QueryBinding: Sendable {
   }
 }
 
+/// A 2-table INNER equi-join the executor can merge-join (both join-key columns
+/// have a UNIQUE, NOT-NULL, single-column index of the same collation) — one
+/// ordered lock-step pass instead of a per-outer probe. Strategy-independent
+/// metadata computed by the binder; the executor uses it only under `.merge`/`.auto`.
+struct MergePlan: Sendable {
+  let outerIndex: String
+  let innerIndex: String
+  let outerColumn: Int
+  let innerColumn: Int
+}
+
 /// A SELECT resolved against one schema version: one or more tables (the first
 /// is the leading/outer table), joins, projection, filters, and ordering. The
 /// access plan optimizes the leading table; joined tables nested-loop scan.
@@ -176,6 +187,9 @@ struct BoundSelect: Sendable {
   /// key order, emitting one row per distinct key prefix decoded from the key —
   /// no table descent, no per-row dedup set. nil ⇒ the row-at-a-time path.
   let distinctIndexName: String?
+  /// A mergeable 2-table INNER equi-join (`MergePlan`), or nil. Strategy-
+  /// independent; the executor merge-joins it only under `.merge`/`.auto`.
+  let mergePlan: MergePlan?
 
   /// The leading (outer) table — the one the access plan optimizes.
   var source: TableBinding { binding.tables[0] }
