@@ -414,10 +414,13 @@ accumulation that the optimizer proves exclusive) — closes JOIN, SEARCH **and*
   ≤ 8192 bits (no overflow). Prefix-sum uses wrapping `&+` matching the encoder. The zero-copy `docLength`
   (`FTS/FTSIndex.swift:318–338`) reads via `BTree.withValueBytes` (scope-bounded borrow) and decodes only
   the leading field-length varints — a correctness + perf win.
-- **Two micro-fixes (low risk, Phase 2):** guard-throw the force-unwraps `block.first!`/`block.last!`
-  (`FTS/Postings.swift:62–63`); drop the **redundant** `unsafe` on already-safe `Varint.read`
-  (`FTS/FTSIndex.swift:325,330`); optionally document/guard `Unicode.Scalar(scalar.value+0x20)!`
-  (`FTS/Trigram.swift:60`, safe-by-ASCII-range invariant).
+- **Re-verified at HEAD `2d5f347` — NO ACTION needed; the three flagged sites are all justified** (the
+  initial scan over-flagged them): `Postings.swift:62–63` `block.first!`/`.last!` are provably non-empty
+  (the `while index < postings.count` loop invariant; internal encoder data, **not** an untrusted
+  boundary); `FTS/FTSIndex.swift` `unsafe Varint.read(raw,…)` is **required**, not redundant (the F6k/F6n
+  zero-copy `docLength` reads a raw `UnsafeRawBufferPointer`); `FTS/Trigram.swift:60`
+  `Unicode.Scalar(scalar.value+0x20)!` is guarded by `(0x41...0x5A).contains` on the same line. Adding
+  `guard…throw`s here would defend can't-happen cases on trusted internal data — churn, not safety.
 
 ### 5.9 S4 reclassified — FTS-write-bleed is now largely localized
 
