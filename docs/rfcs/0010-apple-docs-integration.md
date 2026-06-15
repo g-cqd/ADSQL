@@ -180,13 +180,27 @@ and uses portable **C11 atomics** (`ADCAtomics`) for cross-process sync (the har
   not the core engine), add a Linux CI matrix lane.
 - **Tests — S/M.** Mostly portable (Foundation + POSIX); fence `F_FULLFSYNC`/`_np`-timing cases.
 
-### INT — `ad_storage_*` engine swap **[GATE]** · ABSENT
-Make ADSQL the engine *inside* `libAppleDocsCore`, behind the frozen ABI (`ad_storage_open`/`_close`/
-`_search_pages`, §2.5), replacing the `CSQLiteShim`/libsqlite3 dlopen. This **is** A3 (`searchFramed`)
-exposed as the C entry point: `ad_storage_search_pages` decodes the request bag → runs the compiled FTS
-search plan → frames rows into the response buffer. Honour the runtime contract: **synchronous** calls,
-prepared-plan reuse, `BEGIN IMMEDIATE` transactions on the writer, and a read-only multi-reader pool
-(one ADSQL `ReadTxn` per pool slot — a natural fit for wait-free MVCC).
+### INT — `Storage` backend swap **[GATE]** · ABSENT
+**ADSQL does not invent a new C ABI** — apple-docs already owns the `@_cdecl` wrappers
+(`ad_storage_open`/`_close`/`_search_pages`, each `(UnsafePointer<UInt8>?, Int) -> ResultBuffer`, with
+`ad_abi_version() == 1`; `swift/Sources/ADCore/StorageExports.swift`), the request/response byte format
+(§2.5, verbatim), and `ResultBuffer`/`RequestReader`. Those wrappers delegate to a Swift `Storage` type —
+`Storage.open(path:) -> handle`, `Storage.close(handle)`, `Storage.searchPages(handle:, SearchPagesParams)
+-> [UInt8]?` — which **today wraps the dlopen'd libsqlite3 via `CSQLiteShim`**.
+
+**ADSQL's INT job: become that `Storage` backend.** apple-docs' `swift/` package takes ADSQL as a
+**SwiftPM dependency** (⇒ requires **F0 Linux**), and `Storage.searchPages` runs the §2.2 main query
+against the **F1-imported** ADSQL corpus and frames the §2.5 cells — i.e. A3 `searchFramed` emitting
+apple-docs' wire format. The escape hatch already exists: if the backend is unavailable the wrapper
+returns `.internalError` and JS `bun:sqlite` serves, and the whole bridge is gated by apple-docs'
+`APPLE_DOCS_NATIVE` switch — so the swap lands **dark, reversibly**. Runtime contract: **synchronous**
+calls, prepared-plan reuse, and a read-only multi-reader pool (one ADSQL `ReadTxn` per pool worker — a
+natural fit for wait-free MVCC; the `bun:sqlite` writer is untouched).
+
+**A macOS prototype is feasible first** — wire ADSQL as the `Storage` backend on macOS and prove
+byte-identical `searchPages` output vs `bun:sqlite` via apple-docs' `test/unit/native/storage-search-pages.test.js`,
+*before* Linux. Correctness-first: the prototype may use the existing `.all()` path + manual framing;
+F5/A2–A4 then optimize the framing without changing the bytes.
 
 ### F1 — SQLite-file importer **[THE GATE]** · ✅ DONE
 A library API + `adsql import` CLI: read a SQLite `.db` (via the existing `CSQLite` dep) → write an
