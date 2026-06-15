@@ -52,14 +52,16 @@ jobs:
       - name: Test (SQLite-differential suite)
         run: swift test
 
-  # Linux build lane (port Phase 1, RFC 0011). ADSQL was Darwin-only; this lane is the actual
-  # Linux verification (the port is developed on macOS, which cannot build for Linux locally).
+  # Linux build + test lane (port, RFC 0010 F0 — the #1 apple-docs adoption gate). ADSQL was
+  # Darwin-only; this lane is the actual Linux verification (the port is developed on macOS, which
+  # cannot build for Linux locally). The build now passes on x64 + arm64; this adds `swift test` to
+  # validate runtime behaviour of the Glibc forks (the clonefile->copy snapshot fallback, fdatasync
+  # barriers, posix_fallocate, the cross-process reader table) — the durability/correctness gate.
   #
-  # NON-BLOCKING FOR NOW (`continue-on-error: true`): the Glibc forks are best-effort against a
-  # portability audit and residual compile errors are expected to be iterated here. Keeping the
-  # lane advisory means an in-progress port never reddens the overall CI signal.
-  # TODO(RFC 0011 Phase 2): once this is reliably green, drop `continue-on-error` so Linux builds
-  # become a required gate, then add `swift test` (durability validation is Phase 2).
+  # NON-BLOCKING FOR NOW (`continue-on-error: true`): test-target compile + runtime differences are
+  # iterated here, so an in-progress port never reddens the overall CI signal.
+  # TODO(RFC 0010 F0): once build + test is reliably green on Linux, drop `continue-on-error` so the
+  # Linux lane becomes a required gate.
   #
   # Toolchain: the manifest is `swift-tools-version: 6.3` and uses `.strictMemorySafety()` (SE-0458)
   # plus the experimental `Lifetimes` feature (SE-0446/0456), so the Linux toolchain must be recent
@@ -100,6 +102,8 @@ jobs:
             spm-linux-${{ matrix.arch }}-
       - name: Build
         run: swift build
+      - name: Test (SQLite-differential suite)
+        run: swift test
 
   platforms:
     name: Build (${{ matrix.platform }})
