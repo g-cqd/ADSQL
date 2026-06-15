@@ -253,6 +253,10 @@ enum Binder {
             case .countStar: break
             case .count(let e): collectTableRefs(e, into: &alwaysRefs, unknown: &unknownRefs)
             case .sum(let e): collectTableRefs(e, into: &alwaysRefs, unknown: &unknownRefs)
+            case .jsonGroupArray(let e): collectTableRefs(e, into: &alwaysRefs, unknown: &unknownRefs)
+            case .jsonGroupObject(let name, let value):
+                collectTableRefs(name, into: &alwaysRefs, unknown: &unknownRefs)
+                collectTableRefs(value, into: &alwaysRefs, unknown: &unknownRefs)
             }
         }
         collectAccessRefs(leadingAccess, into: &alwaysRefs, unknown: &unknownRefs)

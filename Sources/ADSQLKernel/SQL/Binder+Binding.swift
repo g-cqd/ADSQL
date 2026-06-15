@@ -49,6 +49,13 @@ extension Binder {
         case .countStar: return spec
         case .count(let expr): return AggregateSpec(kind: .count(bindColumnsNoWeights(expr, binding)))
         case .sum(let expr): return AggregateSpec(kind: .sum(bindColumnsNoWeights(expr, binding)))
+        case .jsonGroupArray(let expr):
+            return AggregateSpec(kind: .jsonGroupArray(bindColumnsNoWeights(expr, binding)))
+        case .jsonGroupObject(let name, let value):
+            return AggregateSpec(
+                kind: .jsonGroupObject(
+                    name: bindColumnsNoWeights(name, binding),
+                    value: bindColumnsNoWeights(value, binding)))
         }
     }
 
@@ -146,6 +153,7 @@ extension Binder {
 
     private static let aggregateNames: Set<String> = [
         "COUNT", "SUM", "AVG", "MIN", "MAX", "TOTAL", "GROUP_CONCAT",
+        "JSON_GROUP_ARRAY", "JSON_GROUP_OBJECT",
     ]
 
     /// Replaces aggregate calls with `aggregateResult(slot)` references,
@@ -176,6 +184,16 @@ extension Binder {
                 case "SUM":
                     guard !star, args.count == 1 else { throw DBError.sqlUnsupported("SUM(expr)") }
                     return slot(AggregateSpec(kind: .sum(args[0])))
+                case "JSON_GROUP_ARRAY":
+                    guard !star, args.count == 1 else {
+                        throw DBError.sqlUnsupported("json_group_array(value)")
+                    }
+                    return slot(AggregateSpec(kind: .jsonGroupArray(args[0])))
+                case "JSON_GROUP_OBJECT":
+                    guard !star, args.count == 2 else {
+                        throw DBError.sqlUnsupported("json_group_object(name, value)")
+                    }
+                    return slot(AggregateSpec(kind: .jsonGroupObject(name: args[0], value: args[1])))
                 default:
                     throw DBError.sqlUnsupported("aggregate \(upper) (only COUNT and SUM in this slice)")
                 }

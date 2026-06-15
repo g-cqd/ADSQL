@@ -196,6 +196,13 @@ enum SQLJSON {
         }
     }
 
+    /// JSON text for a SQL value used as an aggregate element (a json_group_array element
+    /// or a json_group_object value).
+    static func encodeValue(_ value: Value) throws(DBError) -> String { try jsonLiteral(value) }
+
+    /// JSON object-key text for json_group_object labels.
+    static func encodeKey(_ key: String) -> String { renderString(key) }
+
     /// `json(X)`: validate and minify JSON text. NULL → NULL.
     static func minify(_ value: Value) throws(DBError) -> Value {
         if value.isNull { return .null }

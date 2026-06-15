@@ -87,6 +87,34 @@ struct SQLAggregateTests {
         #expect(rowsMatch(ours, theirs, ordered: ordered), "\(sql): adsql \(ours) vs sqlite \(theirs)")
     }
 
+    // Order-deterministic JSON aggregates: a full scan visits rows in rowid order in both
+    // engines, so json_group_array/json_group_object emit elements in the same order.
+    static let jsonQueries: [String] = [
+        "SELECT json_group_array(id) FROM docs",
+        "SELECT json_group_array(score) FROM docs",
+        "SELECT json_group_array(framework) FROM docs WHERE framework IS NOT NULL",
+        "SELECT framework, json_group_array(id) FROM docs GROUP BY framework ORDER BY framework",
+        "SELECT json_group_object(framework, id) FROM docs WHERE id <= 6",
+        "SELECT framework, json_group_object(framework, score) FROM docs"
+            + " WHERE framework IS NOT NULL GROUP BY framework ORDER BY framework",
+        // Aggregate over zero rows (no GROUP BY still yields one row).
+        "SELECT json_group_array(id) FROM docs WHERE id < 0",
+        "SELECT json_group_object(framework, id) FROM docs WHERE id < 0",
+    ]
+
+    @Test(arguments: jsonQueries)
+    func jsonAggregatesMatchSQLite(_ sql: String) throws {
+        let dir = TempDir()
+        defer { dir.cleanup() }
+        let (db, mirror) = try AggFixture.make(dir, "json-agg.adsql")
+        defer { db.close() }
+
+        let ours = try db.prepare(sql).all().map(\.values)
+        let theirs = try mirror.query(sql)
+        let ordered = sql.lowercased().contains("order by")
+        #expect(rowsMatch(ours, theirs, ordered: ordered), "\(sql): adsql \(ours) vs sqlite \(theirs)")
+    }
+
     @Test func emptyTableAggregates() throws {
         let dir = TempDir()
         defer { dir.cleanup() }
