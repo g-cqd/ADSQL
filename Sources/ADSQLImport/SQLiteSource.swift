@@ -16,6 +16,13 @@ public final class SQLiteSource {
         public let isRowidAlias: Bool
     }
 
+    /// An explicit (`CREATE INDEX`) secondary index on a table.
+    public struct Index: Sendable {
+        public let name: String
+        public let columns: [String]
+        public let unique: Bool
+    }
+
     public init(path: String) throws(DBError) {
         var opened: OpaquePointer?
         let rc = sqlite3_open_v2(path, &opened, SQLITE_OPEN_READONLY, nil)
@@ -70,6 +77,36 @@ public final class SQLiteSource {
         return raw.map {
             Column(name: $0.name, type: $0.type, notNull: $0.notNull, isRowidAlias: $0.name == aliasName)
         }
+    }
+
+    /// Explicit `CREATE INDEX` indexes of a table — skips auto-indexes (PK / UNIQUE
+    /// constraints, `origin` != `c`) and expression indexes (a NULL `index_info`
+    /// column name), which ADSQL doesn't model.
+    public func indexes(of table: String) throws(DBError) -> [Index] {
+        var lists: [(name: String, unique: Bool, origin: String)] = []
+        try query("PRAGMA index_list(\"\(escapeIdent(table))\")") { stmt in
+            lists.append(
+                (
+                    name: Self.text(stmt, 1), unique: sqlite3_column_int(stmt, 2) != 0,
+                    origin: Self.text(stmt, 3)
+                ))
+        }
+        var result: [Index] = []
+        for list in lists where list.origin == "c" {
+            var columns: [String] = []
+            var hasExpression = false
+            try query("PRAGMA index_info(\"\(escapeIdent(list.name))\")") { stmt in
+                if sqlite3_column_type(stmt, 2) == SQLITE_NULL {
+                    hasExpression = true
+                } else {
+                    columns.append(Self.text(stmt, 2))
+                }
+            }
+            if !hasExpression, !columns.isEmpty {
+                result.append(Index(name: list.name, columns: columns, unique: list.unique))
+            }
+        }
+        return result
     }
 
     // MARK: Iteration

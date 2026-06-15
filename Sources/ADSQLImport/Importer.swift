@@ -7,19 +7,28 @@ extension Database {
     /// - auto-introspects every regular source table (`sqlite_master` +
     ///   `PRAGMA table_info`), creates it with strict, affinity-mapped columns
     ///   (preserving the `INTEGER PRIMARY KEY` rowid), and **batch-copies** its
-    ///   rows, coercing each loose source cell to its strict column type;
+    ///   rows, coercing each loose source cell to its strict column type, then
+    ///   ports its explicit (`CREATE INDEX`) secondary indexes;
     /// - reconstructs each FTS5 table named in `manifest` from its source rows
     ///   (FTS5 config isn't introspectable, hence the manifest);
     /// - returns a **deep** integrity report.
     ///
     /// Rows are committed in batches of `batchSize` (one write transaction each)
-    /// to bound dirty-page memory over a large corpus. The target should be empty.
+    /// to bound dirty-page memory over a large corpus. The target **must be empty**
+    /// — importing an object it already has throws, so a re-run never duplicates.
     @discardableResult
     public func importSQLite(
         from sqlitePath: String, manifest: ImportManifest = .empty, batchSize: Int = 10_000
     ) throws(DBError) -> IntegrityReport {
         let source = try SQLiteSource(path: sqlitePath)
         let skip = manifest.skipTableNames
+
+        // Idempotency: refuse to import an object the target already has, so a
+        // re-run never silently duplicates (a re-import means a fresh target).
+        let existing = try read { (txn) throws(DBError) in
+            let schema = try txn.schema()
+            return Set(schema.tables.keys).union(schema.ftsTables.keys)
+        }
 
         for tableName in try source.tableNames() where !skip.contains(tableName) {
             // Virtual tables (FTS5 and the like) are only imported via the manifest.
@@ -28,10 +37,16 @@ extension Database {
             {
                 continue
             }
+            guard !existing.contains(tableName) else {
+                throw DBError.invalidDefinition("import target already contains table '\(tableName)'")
+            }
             try importTable(named: tableName, from: source, batchSize: batchSize)
         }
 
         for fts in manifest.ftsTables {
+            guard !existing.contains(fts.name) else {
+                throw DBError.invalidDefinition("import target already contains FTS table '\(fts.name)'")
+            }
             try importFTS(fts, from: source, batchSize: batchSize)
         }
 
@@ -77,6 +92,15 @@ extension Database {
             if batch.count >= batchSize { try flush() }
         }
         try flush()
+
+        // Port explicit secondary indexes (each backfills from the rows just copied).
+        for index in try source.indexes(of: tableName) {
+            try writeSync { (txn) throws(DBError) in
+                try txn.createIndex(
+                    IndexDefinition(
+                        index.name, on: tableName, columns: index.columns, unique: index.unique))
+            }
+        }
     }
 
     private func importFTS(
