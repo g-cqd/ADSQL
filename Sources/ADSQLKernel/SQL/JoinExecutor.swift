@@ -17,10 +17,16 @@ extension SelectExecutor {
         joinIndexes: [Catalog.IndexRecord?], ftsRecords: [String: Catalog.FTSRecord],
         resolver: R, context: RowContext, env: SQLEvalEnv, paramsEnv: SQLEvalEnv,
         execution: ExecutionOptions = .default,
+        foldedWhere: SQLExpr?, foldedJoinOn: [SQLExpr],
         _ body: () throws(DBError) -> Void
     ) throws(DBError) {
+        // `foldedWhere` / `foldedJoinOn` are the residual WHERE and per-join ON with
+        // query-invariant subtrees already hoisted to constants (see `runJoin`);
+        // evaluating them per row is semantically identical to the unfolded `plan`
+        // versions but skips recomputing param/literal-only work. The hash/merge fast
+        // paths still derive their equi-key structure from the *unfolded* `plan.joins`.
         func passesWhere() throws(DBError) -> Bool {
-            guard let predicate = plan.whereExpr else { return true }
+            guard let predicate = foldedWhere else { return true }
             return SQLEval.truth(try SQLEval.evaluate(predicate, env)) == .yes
         }
 
@@ -130,7 +136,7 @@ extension SelectExecutor {
                 if existence {
                     matched = true
                     try descend(depth + 1)
-                } else if SQLEval.truth(try SQLEval.evaluate(join.on, env)) == .yes {
+                } else if SQLEval.truth(try SQLEval.evaluate(foldedJoinOn[depth - 1], env)) == .yes {
                     matched = true
                     try descend(depth + 1)
                 }
@@ -282,9 +288,14 @@ extension SelectExecutor {
             }
         }
         guard !equiInner.isEmpty else { return false }
-        let onResidual: SQLExpr? =
+        let onResidualRaw: SQLExpr? =
             residualConjuncts.isEmpty
             ? nil : residualConjuncts.dropFirst().reduce(residualConjuncts[0]) { .binary(.and, $0, $1) }
+        // Hoist query-invariant subtrees of the non-equi ON residual once (params
+        // bound in `paramsEnv`); evaluated per matched inner row below.
+        let onResidual = try onResidualRaw.map { e throws(DBError) in
+            try SQLEval.foldInvariant(e, paramsEnv)
+        }
 
         // SEMI-JOIN: when the inner is existence-only (no inner column is read by the
         // query) and the ON is pure equi (no residual), the inner row *values* are never
@@ -468,6 +479,29 @@ extension SelectExecutor {
         let collectKeys = !plan.orderBy.isEmpty
         let bounds = try sliceBounds(plan, params: params)
 
+        // Query-invariant hoisting (once per execution, params bound in `paramsEnv`):
+        // pre-evaluate every param/literal-only subtree of the WHERE / each ON / the
+        // projection outputs / the ORDER BY keys, so the per-row tree-walk sees a
+        // `.literal` instead of recomputing it. This is the join path's dominant
+        // win on the apple-docs `/search` query — the tier CASE's `$raw_lc || '%'`
+        // LIKE prefix was rebuilt (malloc + scalar map) for every matched row even
+        // though it is the same for all rows. Folding never collapses a subtree that
+        // reads a column/aggregate/subquery (those stay intact, children folded), so
+        // results are identical. The hash/merge equi-key analysis below reads the
+        // UNFOLDED `plan.joins[].on`, so its structure is untouched.
+        let foldedWhere = try plan.whereExpr.map { e throws(DBError) in
+            try SQLEval.foldInvariant(e, paramsEnv)
+        }
+        let foldedJoinOn = try plan.joins.map { j throws(DBError) in
+            try SQLEval.foldInvariant(j.on, paramsEnv)
+        }
+        let foldedOutputs = try plan.outputs.map { o throws(DBError) in
+            try SQLEval.foldInvariant(o.expr, paramsEnv)
+        }
+        let foldedOrderBy = try plan.orderBy.map { t throws(DBError) in
+            try SQLEval.foldInvariant(t.expr, paramsEnv)
+        }
+
         // Bounded top-N: an ORDER BY + small positive LIMIT (no DISTINCT) keeps only
         // `offset+limit` rows in a sorted buffer during the scan instead of
         // materializing and sorting every matched row — and projects the full output
@@ -487,16 +521,17 @@ extension SelectExecutor {
                 try forEachFilteredRow(
                     plan, tables: tables, index: index, joinIndexes: joinIndexes,
                     ftsRecords: ftsRecords, resolver: resolver, context: context, env: env,
-                    paramsEnv: paramsEnv, execution: execution
+                    paramsEnv: paramsEnv, execution: execution,
+                    foldedWhere: foldedWhere, foldedJoinOn: foldedJoinOn
                 ) { () throws(DBError) in
                     var keys: [Value] = []
-                    keys.reserveCapacity(plan.orderBy.count)
-                    for term in plan.orderBy { keys.append(try SQLEval.evaluate(term.expr, env)) }
+                    keys.reserveCapacity(foldedOrderBy.count)
+                    for term in foldedOrderBy { keys.append(try SQLEval.evaluate(term, env)) }
                     // Only project the full tuple when the row qualifies for the buffer.
                     if buffer.wouldDrop(keys) { return }
                     var projected: [Value] = []
-                    projected.reserveCapacity(plan.outputs.count)
-                    for output in plan.outputs { projected.append(try SQLEval.evaluate(output.expr, env)) }
+                    projected.reserveCapacity(foldedOutputs.count)
+                    for output in foldedOutputs { projected.append(try SQLEval.evaluate(output, env)) }
                     buffer.insert(keys: keys, row: projected)
                 }
                 let kept = buffer.sortedRows()
@@ -509,15 +544,16 @@ extension SelectExecutor {
         var sortKeys: [[Value]] = []
         try forEachFilteredRow(
             plan, tables: tables, index: index, joinIndexes: joinIndexes, ftsRecords: ftsRecords,
-            resolver: resolver, context: context, env: env, paramsEnv: paramsEnv, execution: execution
+            resolver: resolver, context: context, env: env, paramsEnv: paramsEnv, execution: execution,
+            foldedWhere: foldedWhere, foldedJoinOn: foldedJoinOn
         ) { () throws(DBError) in
             var projected: [Value] = []
-            projected.reserveCapacity(plan.outputs.count)
-            for output in plan.outputs { projected.append(try SQLEval.evaluate(output.expr, env)) }
+            projected.reserveCapacity(foldedOutputs.count)
+            for output in foldedOutputs { projected.append(try SQLEval.evaluate(output, env)) }
             rows.append(projected)
             if collectKeys {
                 var keys: [Value] = []
-                for term in plan.orderBy { keys.append(try SQLEval.evaluate(term.expr, env)) }
+                for term in foldedOrderBy { keys.append(try SQLEval.evaluate(term, env)) }
                 sortKeys.append(keys)
             }
         }

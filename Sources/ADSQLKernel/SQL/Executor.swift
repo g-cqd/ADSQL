@@ -133,6 +133,23 @@ enum SelectExecutor {
             if let residual, reads(residual) { return true }
             return false
         }()
+        // Query-invariant hoisting: pre-evaluate every param/literal-only subtree of
+        // the residual / outputs / ORDER BY keys ONCE (params already bound in
+        // `paramsEnv`) so the per-row thunk sees a `.literal`, not a recomputed
+        // expression. Folded against `paramsEnv` (parameters-only): an invariant
+        // subtree references no column, so the column-rejecting env is exactly right
+        // (and would throw rather than misfold if one ever slipped through). The
+        // compiled path already bakes literals, but still rebuilds e.g. `? || '%'`
+        // per row — folding collapses that to a constant here too.
+        let foldedResidual = try residual.map { e throws(DBError) in
+            try SQLEval.foldInvariant(e, paramsEnv)
+        }
+        let foldedOutputs = try plan.outputs.map { o throws(DBError) in
+            try SQLEval.foldInvariant(o.expr, paramsEnv)
+        }
+        let foldedOrderBy = try plan.orderBy.map { t throws(DBError) in
+            try SQLEval.foldInvariant(t.expr, paramsEnv)
+        }
         // Per-row evaluation: compile each expression once (compiled-closures path)
         // or wrap the tree-walk evaluator; an unsupported sub-expression falls back to
         // tree-walk so results are identical regardless of strategy.
@@ -146,10 +163,10 @@ enum SelectExecutor {
         }
         let accumulator = Accumulator(
             context: context,
-            residualThunk: residual.map(makeThunk),
-            outputThunks: plan.outputs.map { makeThunk($0.expr) },
+            residualThunk: foldedResidual.map(makeThunk),
+            outputThunks: foldedOutputs.map(makeThunk),
             orderBy: plan.orderBy,
-            orderThunks: plan.orderBy.map { makeThunk($0.expr) },
+            orderThunks: foldedOrderBy.map(makeThunk),
             orderCollations: plan.orderCollations, collectKeys: collectKeys,
             sliceEnd: sliceEnd, topN: topN, dedupRowids: dedupRowids,
             distinct: plan.distinct, distinctCollations: plan.outputCollations, fastSort: fastSort,

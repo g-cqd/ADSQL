@@ -19,6 +19,30 @@ extension SelectExecutor {
         let columnCounts = plan.binding.tables.map(\.columnNames.count)
         let noGroupBy = plan.groupBy.isEmpty
 
+        // Query-invariant hoisting (once per execution, params bound): pre-evaluate
+        // param/literal-only subtrees of the WHERE / each ON / GROUP BY keys / HAVING
+        // / outputs / ORDER BY so the per-row + per-group walks see constants. Folding
+        // never collapses a subtree that reads a column or an aggregate slot (those
+        // stay intact with their invariant children folded), so results are identical.
+        let foldedWhere = try plan.whereExpr.map { e throws(DBError) in
+            try SQLEval.foldInvariant(e, paramsEnv)
+        }
+        let foldedJoinOn = try plan.joins.map { j throws(DBError) in
+            try SQLEval.foldInvariant(j.on, paramsEnv)
+        }
+        let foldedGroupBy = try plan.groupBy.map { e throws(DBError) in
+            try SQLEval.foldInvariant(e, paramsEnv)
+        }
+        let foldedHaving = try plan.having.map { e throws(DBError) in
+            try SQLEval.foldInvariant(e, paramsEnv)
+        }
+        let foldedOutputs = try plan.outputs.map { o throws(DBError) in
+            try SQLEval.foldInvariant(o.expr, paramsEnv)
+        }
+        let foldedOrderBy = try plan.orderBy.map { t throws(DBError) in
+            try SQLEval.foldInvariant(t.expr, paramsEnv)
+        }
+
         var order: [GroupKey] = []
         var groups: [GroupKey: (accumulators: GroupAccumulators, representative: [[Value]])] = [:]
 
@@ -33,14 +57,15 @@ extension SelectExecutor {
 
         try forEachFilteredRow(
             plan, tables: tables, index: index, joinIndexes: joinIndexes, ftsRecords: ftsRecords,
-            resolver: resolver, context: context, env: scanEnv, paramsEnv: paramsEnv, execution: execution
+            resolver: resolver, context: context, env: scanEnv, paramsEnv: paramsEnv, execution: execution,
+            foldedWhere: foldedWhere, foldedJoinOn: foldedJoinOn
         ) { () throws(DBError) in
             let key: GroupKey
             if noGroupBy {
                 key = implicitKey
             } else {
                 var parts: [Value] = []
-                for expr in plan.groupBy { parts.append(try SQLEval.evaluate(expr, scanEnv)) }
+                for expr in foldedGroupBy { parts.append(try SQLEval.evaluate(expr, scanEnv)) }
                 key = GroupKey(parts, collations: plan.groupCollations)
             }
             if groups[key] == nil {
@@ -69,16 +94,16 @@ extension SelectExecutor {
             let env = aggregateEnv(
                 plan.binding, representative: group.representative,
                 accumulators: group.accumulators, params: params)
-            if let having = plan.having {
+            if let having = foldedHaving {
                 if SQLEval.truth(try SQLEval.evaluate(having, env)) != .yes { continue }
             }
             var projected: [Value] = []
-            projected.reserveCapacity(plan.outputs.count)
-            for output in plan.outputs { projected.append(try SQLEval.evaluate(output.expr, env)) }
+            projected.reserveCapacity(foldedOutputs.count)
+            for output in foldedOutputs { projected.append(try SQLEval.evaluate(output, env)) }
             rows.append(projected)
             if collectKeys {
                 var keys: [Value] = []
-                for term in plan.orderBy { keys.append(try SQLEval.evaluate(term.expr, env)) }
+                for term in foldedOrderBy { keys.append(try SQLEval.evaluate(term, env)) }
                 sortKeys.append(keys)
             }
         }
