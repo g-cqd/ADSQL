@@ -347,9 +347,19 @@ enum Planner {
         for conjunct in conjuncts {
             switch conjunct {
             case .binary(let op, let lhs, let rhs) where op.isComparison:
-                if let column = columnReference(lhs, source: source), isConstant(rhs) {
+                // An explicit `COLLATE` on the constant operand overrides the comparison's
+                // collation (SQLite rule). If it differs from the column's own collation,
+                // the index — keyed in the column's collation — cannot satisfy the seek, so
+                // we must NOT turn it into a probe (which would also drop the conjunct from
+                // the residual and silently mis-/under-return). Leaving the constraint out
+                // keeps the conjunct in the residual, re-checked with the right collation.
+                if let column = columnReference(lhs, source: source), isConstant(rhs),
+                    collationMatchesColumn(value: rhs, columnCollation: source.columnCollations[column])
+                {
                     appendComparison(op, column: column, value: rhs, flipped: false, source: conjunct, to: &constraints)
-                } else if let column = columnReference(rhs, source: source), isConstant(lhs) {
+                } else if let column = columnReference(rhs, source: source), isConstant(lhs),
+                    collationMatchesColumn(value: lhs, columnCollation: source.columnCollations[column])
+                {
                     appendComparison(op, column: column, value: lhs, flipped: true, source: conjunct, to: &constraints)
                 }
             case .inList(let subject, let items, let negated):
@@ -391,6 +401,17 @@ enum Planner {
     private static func columnReference(_ expr: SQLExpr, source: TableBinding) -> Int? {
         guard case .column(let qualifier, let name, _) = expr else { return nil }
         return source.columnIndex(qualifier: qualifier, name: name)
+    }
+
+    /// True unless the constant operand carries a top-level explicit `COLLATE` whose
+    /// collation differs from the column's — in which case the comparison's collation
+    /// (the explicit one wins) is NOT the index's key collation, so the conjunct cannot
+    /// be served by an index seek. (The column operand here is always a bare `.column`:
+    /// `columnReference` rejects a `.collate`-wrapped column, so its own explicit COLLATE
+    /// is handled by that path falling through to a residual scan.)
+    private static func collationMatchesColumn(value: SQLExpr, columnCollation: Collation) -> Bool {
+        if case .collate(_, let collation) = value { return collation == columnCollation }
+        return true
     }
 
     /// An expression with no column references (and no subqueries): evaluable
