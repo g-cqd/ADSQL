@@ -65,6 +65,14 @@ enum SearchPagesScenario {
     /// Wall-clock window each scaling step runs (per thread, concurrently).
     static let scalingSeconds = 2.0
 
+    /// Warmup window run (and discarded) before each measured scaling step. It faults
+    /// the mmap'd pages in / warms caches so the measured window reflects STEADY-STATE
+    /// throughput. Without it, first-touch page faults inside the short measured window
+    /// inflate the mean latency — and so depress req/s (= requests ÷ wall time) far
+    /// below 1 ÷ p50, since the median stays warm. Standard benchmark hygiene; it makes
+    /// req/s a trustworthy throughput metric that reconciles with the latency p50.
+    static let warmupSeconds = 1.0
+
     static func run(engines: [String], dir: String, config: BenchConfig) throws {
         // REAL-CORPUS mode: both `--corpus` and `--sqlite` given ⇒ skip synthetic
         // generation entirely and measure against the pre-built 4 GB databases (the
@@ -660,6 +668,18 @@ enum SearchPagesScenario {
         threads: Int,
         work: @escaping @Sendable (StopFlag, inout LatencyHistogram) -> Int
     ) -> ScalingResult {
+        // Warm the working set at this thread count first (result discarded), then
+        // measure — so req/s reflects steady state, not cold-start page faults.
+        _ = runWindow(threads: threads, seconds: warmupSeconds, work: work)
+        return runWindow(threads: threads, seconds: scalingSeconds, work: work)
+    }
+
+    /// Spawns `threads` workers spinning `work` until a shared `seconds` deadline,
+    /// returning total requests + merged latency histogram + elapsed wall time.
+    private static func runWindow(
+        threads: Int, seconds: Double,
+        work: @escaping @Sendable (StopFlag, inout LatencyHistogram) -> Int
+    ) -> ScalingResult {
         let stop = StopFlag()
         let group = DispatchGroup()
         let collected = Mutex<[(Int, LatencyHistogram)]>([])
@@ -673,7 +693,7 @@ enum SearchPagesScenario {
             }
         }
         // Run the window on this thread (a simple sleep — the workers spin).
-        let deadline = start + UInt64(scalingSeconds * 1e9)
+        let deadline = start + UInt64(seconds * 1e9)
         while nowNanos() < deadline {
             let remaining = deadline &- nowNanos()
             if remaining > 0 { usleep(useconds_t(min(remaining / 1000, 20_000))) }

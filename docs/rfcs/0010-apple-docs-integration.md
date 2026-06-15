@@ -334,15 +334,20 @@ first; the **perf features** then make it *beat* SQLite — the reason for the s
   > **⚠️ 2026-06-15 RE-MEASUREMENT — the "DEFINITIVE" verdict below did NOT reproduce.** Re-running the
   > same `search --corpus … --sqlite … --corpus-denorm …` battery on the on-disk corpus
   > (`/tmp/apple-docs-denorm.{adsql,db}`, **~0.5 GB — NOT 4 GB**; "4 GB" was always apple-docs' *production*
-  > size, never the bench corpus) shows **SQLite WINNING at every thread count**: 8-way **SQLite ~962 vs
-  > ADSQL-denorm ~195 req/s** (SQLite scaled ~18×, ADSQL ~6.9×); single-thread ADSQL-denorm **25.5 ms vs
-  > SQLite 4.4 ms (~5.8× slower)**. TWO caveats blunt this (so it does not flip the headline to "SQLite
-  > wins" either): (1) the sweep's req/s are internally inconsistent with its own p50s (1-thread 53 req/s
-  > vs a 4.4 ms p50 ⇒ unreliable req/s accounting); (2) at ~0.5 GB the working set is RAM/cache-resident, so
+  > size, never the bench corpus) shows **SQLite WINNING at every thread count, ~5×.** The sweep's req/s
+  > were first found contaminated by **cold-start mmap page faults** inside the short window (mean ≫ median,
+  > so req/s ≪ 1/p50 — *not* a counting bug); a **warmup window now precedes each measured step** (this
+  > commit), and the reliable WARMED numbers confirm the result and reconcile with the latency p50:
+  > | engine | 1 | 2 | 4 | 8 | scale | p50 |
+  > |---|---|---|---|---|---|---|
+  > | ADSQL-denorm | 34 | 66 | 130 | 204 req/s | 5.9× | 17–25 ms |
+  > | SQLite | 154 | 302 | 603 | **1011 req/s** | 6.6× | 4.5 ms |
+  > Both scale ~6× → **no crossover**; SQLite stays ~5× ahead (matching the ~5× single-thread gap). The ONE
+  > remaining caveat (so this is not the final word either): at ~0.5 GB the working set is RAM-resident, so
   > SQLite never hits the memory-bandwidth ceiling that is the ENTIRE premise of the wait-free-MVCC thesis —
-  > the wrong regime to test it. **Net: the "beats SQLite" concurrency headline is UNVERIFIED** — it needs
-  > (a) fixed req/s accounting in the sweep AND (b) a genuine ≥4 GB working set (or the real apple-docs
-  > `load.mjs` against a wired-in ADSQL) before it can be trusted in either direction.
+  > the wrong regime to test it. **Net: the "beats SQLite" headline is UNVERIFIED, and at the only testable
+  > scale ADSQL LOSES ~5×.** Settling it needs a genuine ≥4 GB working set (or the real apple-docs `load.mjs`
+  > against a wired-in ADSQL), where SQLite *might* ceiling on bandwidth. The req/s metric is now trustworthy.
   >
   > **Single-thread profile (`/usr/bin/sample`, denorm /search — SOLID):** the cost is the JOIN (FTS ⋈
   > `documents`, inherent — FTS yields docids, `documents` holds the columns): per-match `documents` SEEK +
