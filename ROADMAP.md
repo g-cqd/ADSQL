@@ -95,7 +95,7 @@ seeded op generator, simulated disk for crash injection). Tests in `ADSQLKernelT
 | **Health + perf program (R1–R7)** | ✅ done | General 2-table merge join + `.auto` cost model (**JOIN now ~2.1× faster than SQLite**); hoisted insert + a `sample`-profiled, evidence-based closure of the INSERT gap as inherent; compiled-evaluator default flip; god-file splits (no file > ~600 lines); `public`→`package` storage encapsulation (external surface −35%); seven-criteria `StrategyBench`; FTS bench breadth. |
 | **M6 — Hardening** | ⏳ future | Expanded fuzz / crash-injection; ops polish. *(The SQLite-file importer moved up — it is now **F1 of M8**.)* |
 | **M7 — Query DSL & metaprogramming** | ⏳ deferred below M8 | Type-safe, injection-safe query DSL + a scoped `swift-syntax` macro tier. |
-| **M8 — apple-docs read-engine swap** | ⏳ **active — top priority** | Swap SQLite behind apple-docs `/search` (it ceilings at ~32 req/s on memory-bandwidth contention). **P0 gate:** F1 importer → F2 FTS byte-parity → F4 covering serve → F5 streaming → F6 denorm; then **P1/P2** boundary collapse (A1–A7). See **[RFC 0010](docs/rfcs/0010-apple-docs-integration.md)**. |
+| **M8 — apple-docs read-engine swap** | ⏳ **active — top priority** | Become the engine *inside* apple-docs' `libAppleDocsCore` (Bun + `bun:ffi`, frozen `ad_storage_*` C ABI), replacing dlopen'd libsqlite3 — `/search` ceilings at ~32 req/s on memory-bandwidth contention. **Adoption gate (apple-docs RFC 0001):** ✅ F1 importer · ✅ F2 FTS byte-parity · **F0 Linux x64/arm64 — the #1 open blocker** · `json_each` FROM-clause TVF (RFC 0011) · **INT** the ABI swap (= A3). **Then read-path perf:** F6 denorm → F4 covering *(in progress)* → F5 streaming → P1/P2 boundary collapse (A1–A7). See **[RFC 0010](docs/rfcs/0010-apple-docs-integration.md)**. |
 
 ### Scorecard vs system SQLite (apple-docs shapes, M-series, 200k rows / 2k FTS docs)
 
@@ -124,11 +124,14 @@ seeded op generator, simulated disk for crash injection). Tests in `ADSQLKernelT
 ## 3. Future work (prioritized backlog)
 
 > **Driving program — apple-docs read-engine integration (M8, [RFC 0010](docs/rfcs/0010-apple-docs-integration.md)).**
-> The backlog is now **sequenced by M8**: P0 swap-gate **F1** importer → **F2** FTS byte-parity →
-> **F4** covering serve → **F5** streaming → **F6** denorm, then P1/P2 boundary-collapse **A1–A7**
-> (compiled FTS-search primitive, caller row encoder, one-call `searchFramed(into:)`, mmap→out
-> single-copy, pushed filters, snapshot/plan cache). Items below carry their **F#/A#** where they feed
-> M8; **VDBE** and **M7 (Query DSL)** are deferred below it.
+> The end goal is concrete: ADSQL becomes the engine *inside* apple-docs' `libAppleDocsCore` (Bun +
+> `bun:ffi`, frozen `ad_storage_*` ABI), replacing libsqlite3. The backlog is **sequenced by M8's
+> two-stage critical path** — first the **adoption gate** (✅ **F1** importer · ✅ **F2** FTS byte-parity ·
+> **F0 Linux x64/arm64**, the #1 open blocker · `json_each` FROM-clause TVF, RFC 0011 · **INT** the ABI
+> swap), then **read-path perf** to beat SQLite (**F6** denorm → **F4** covering → **F5** streaming, then
+> P1/P2 boundary-collapse **A1–A7**: compiled FTS-search primitive, caller row encoder, one-call
+> `searchFramed(into:)`, mmap→out single-copy, pushed filters, snapshot/plan cache). Items below carry
+> their **F#/A#** where they feed M8; **VDBE** and **M7 (Query DSL)** are deferred below it.
 
 ### A. Performance levers (open)
 - **VDBE register machine** — a flat opcode loop over a `[Value]` register file (the deep evaluator
@@ -137,10 +140,11 @@ seeded op generator, simulated disk for crash injection). Tests in `ADSQLKernelT
   Multi-week — **deferred below M8** (the apple-docs read path is access-path-bound, not eval-bound).
 - **`ANALYZE` + statistics + real cost model** — replace the heuristic access-path/join scoring with
   per-index selectivity so the planner picks scan-vs-seek and the right join strategy on cost.
-- **Covering / `INCLUDE`-index serving** **(M8 F4 — the memory-bandwidth fix)** — answer queries
-  straight off the index cursor with no base-table descent. `IndexDefinition.includes` +
-  `RowView.coveringIncludes` + `RowCursor(coveringIncludes:)` already exist; the work is wiring
-  `Planner.chooseIndex` to detect "projection ⊆ columns ∪ includes" and the executor to activate it.
+- **Covering / `INCLUDE`-index serving** **(M8 F4 — the memory-bandwidth fix · ⏳ in progress)** — answer
+  queries straight off the index cursor with no base-table descent. `IndexDefinition.includes` +
+  `RowView.coveringIncludes` + `RowCursor(coveringIncludes:)` exist; the work (underway) is wiring the
+  planner to detect "required cols (projection ∪ WHERE ∪ ORDER BY) ⊆ index key ∪ includes" and the
+  executor to pass `coveringIncludes` to the cursor instead of descending to the base row.
 - **Ordered/batched rowid sweep + `madvise` prefetch** (bitmap-heap-scan style); **per-page zone maps
   (min/max)** to skip leaf pages on filtered scans; **batch-at-a-time filter evaluation**;
   **correlated-subquery decorrelation / index-probe.**

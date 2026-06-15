@@ -24,14 +24,30 @@ ADSQL targets this directly: **wait-free-reader MVCC** (readers never block, nev
 **block-max WAND ranked top-k** (already ~2.3× SQLite FTS5) + **covering-index serving** (index-only,
 tiny working set) + **zero-copy row views** (`RawSpan` over the mmap'd page, no per-row allocation).
 
-**Already de-risked (not blockers):**
-- **Portability** — ADSQL builds + passes its full suite on **arm64 and x86_64** (Apple-Silicon-first
-  is a perf framing, not a correctness constraint).
-- **Scalar/JSON surface** — `Sources/ADSQLKernel/SQL/Functions.swift` already implements the scalar +
-  JSON functions the query uses with SQLite-matching semantics (`COALESCE`, `LOWER`/`UPPER`,
-  `LENGTH`/`INSTR`/`SUBSTR`, `JSON_EXTRACT`, `CAST`, `LIKE`, `||`, `DATETIME('now')`), and `json_each`
-  in the `IN (SELECT …)` shape. The literal query is portable; the open items are the importer, FTS
-  byte-parity proof, and the perf/boundary features below.
+### 1.1 The formal adoption gate (apple-docs RFC 0001 · P5 `records.md`)
+
+apple-docs runs on **Bun** (`bun:sqlite`), and its own Swift-native transition **already built the
+integration seam**: a `bun:ffi` dlopen of **`libAppleDocsCore.dylib`** behind a **frozen `ad_storage_*`
+C ABI** (`ad_storage_open` / `_close` / `_search_pages`, ABI v1; `swift/Sources/ADCore/StorageExports.swift`),
+where the engine *today* is a dlopen'd `libsqlite3` via `swift/Sources/CSQLiteShim`. **ADSQL's job is to
+become the engine *inside* that dylib** — there is no new bridge to design; A3 (`searchFramed`) lands as
+the body of `ad_storage_search_pages`, and the wire format in §2.5 is that ABI.
+
+apple-docs RFC 0001 gates ADSQL adoption (its P7) on **three explicit conditions**:
+1. **FTS5 + bm25** — ✅ **HAVE.** bm25f score parity **and** ranked-order parity now proven against
+   SQLite FTS5 through the importer (F2 below, landed).
+2. **Linux x64/arm64** — ❌ **NOT MET — the #1 blocker.** apple-docs is first-class Linux; ADSQL's
+   IO/durability layer is Darwin-specific (`mmap`, `F_BARRIERFSYNC`/`F_FULLFSYNC` via `fcntl`, APFS
+   `clonefile`, the cross-process reader table). This RFC previously mis-scoped portability as
+   "de-risked" — that referred only to macOS arm64+x86_64. **Linux is the largest gate item.** See §4.0.
+3. **real-SQLite → ADSQL corpus migration** — ✅ **F1 importer DONE.** The live `.db` that the
+   `bun:sqlite` writer mutates can't be opened in place, so the migration is offline — exactly F1's shape.
+
+**Scalar/JSON surface** (`Sources/ADSQLKernel/SQL/Functions.swift`) already implements the query's
+functions with SQLite-matching semantics (`COALESCE`, `LOWER`/`UPPER`, `LENGTH`/`INSTR`/`SUBSTR`,
+`JSON_EXTRACT`, `CAST`, `LIKE`, `||`, `COLLATE NOCASE`). The one surface gap to confirm is **`json_each`
+as a FROM-clause table-valued function** (the `d.source_type IN (SELECT value FROM json_each($sources_json))`
+filter) — tracked by the in-flight RFC 0011 (table-valued functions).
 
 ---
 
@@ -110,10 +126,12 @@ cell `[u8 tag][payload]`: `0`=NULL, `1`=INT `[i64 LE]`, `2`=REAL `[f64 LE]`, `3`
 
 | Feature | State | ADSQL seam it builds on / where it lands |
 |---|---|---|
-| **F1** SQLite importer **[GATE]** | **ABSENT** | new `Importer.swift` + `Database.importSQLite`; `adsql import` (`ADSQLTool/main.swift`); CSQLite already linked (test oracle today) |
-| **F2** FTS byte-parity | **PRESENT, gate pending** | `FTS/FTSScorer.swift` (bit-identical bm25f k1=1.2/b=0.75), `WANDTopK` deterministic tie-break (score,docid), `FTSParityTests.swift` |
-| **F3** scalar surface | **PRESENT** | `SQL/Functions.swift` — confirm `COLLATE NOCASE` + `LIKE …||'%'` parity |
-| **F4** covering/INCLUDE serving | **PARTIAL** | `IndexDefinition.includes`, `RowView.coveringIncludes`, `RowCursor(coveringIncludes:)` exist; `Planner.chooseIndex` + executor not wired |
+| **F0** Linux x64/arm64 **[GATE]** | **ABSENT — #1 blocker** | port the Darwin IO/durability layer (`mmap`/`fcntl` barriers / `clonefile` / cross-process reader table) to `Glibc`; add a Linux CI lane (§4.0) |
+| **INT** `ad_storage_*` engine swap **[GATE]** | **ABSENT** | implement the frozen `ad_storage_search_pages` ABI (= A3 `searchFramed`) so ADSQL replaces `CSQLiteShim`/libsqlite3 inside `libAppleDocsCore` |
+| **F1** SQLite importer **[GATE]** | **✅ DONE** | `ADSQLImport` target: `Database.importSQLite(from:manifest:)` + `adsql import`; schema port + coercion + index/PK/UNIQUE port + manifest FTS5 rebuild + deep integrity; idempotent, deterministic |
+| **F2** FTS byte-parity | **✅ LANDED** | bm25f score parity **+ ranked-order parity** (ties → ascending rowid via the bounded-top-N upper-bound fix) proven through the importer vs SQLite FTS5 — `ImportedFTSParityTests.swift`, default + 5-weight |
+| **F3** scalar surface | **PRESENT** | `SQL/Functions.swift` — `COLLATE NOCASE` + `LIKE …||'%'` present; confirm `json_each` FROM-clause TVF (RFC 0011) |
+| **F4** covering/INCLUDE serving | **⏳ IN PROGRESS** | machinery exists; wiring `Planner` covering-detection (required-cols ⊆ index key ∪ includes) + executor activation + differential tests underway |
 | **F5** streaming zero-copy scan | **PARTIAL** | `RowView` (~Escapable) + `RowCursor.forEachRow/forEachRecordSpan` exist package-internal; `Statement` only exposes `.all()` |
 | **F6** build-time denormalization | **ABSENT** | inside F1 |
 | **A1** compiled FTS-search primitive | **seams PRESENT** | `StatementCache` + per-`Statement` bound-plan cache + WAND; add typed `FTSSearchPlan` |
@@ -131,7 +149,46 @@ wiring + a thin accelerated API surface**, not new engine internals.
 
 ## 4. Part I — the swap gate (P0)
 
-### F1 — SQLite-file importer **[THE GATE]** · ABSENT
+### F0 — Linux x64/arm64 **[THE #1 GATE]** · ABSENT
+ADSQL's storage engine is Darwin-specific while apple-docs is first-class Linux, so this is the largest
+single gate item. Port surface (behind a small platform shim):
+- **IO** — `mmap`/`munmap`/`msync` are POSIX (portable); the Darwin-only calls to replace are
+  `fcntl(F_BARRIERFSYNC)` (→ `fdatasync`/`sync_file_range`), `F_FULLFSYNC` (→ `fsync`), `F_NOCACHE`
+  (→ `posix_fadvise(POSIX_FADV_DONTNEED)`), and APFS `clonefile` for O(1) snapshots (→ no CoW clone on
+  ext4/xfs: `copy_file_range` or plain copy, losing the O(1) property — acceptable for an offline import).
+- **Imports** — `import Darwin` → `#if canImport(Glibc) import Glibc`; `strerror_r` is XSI on Darwin vs
+  GNU on glibc (different return type) — guard it.
+- **Cross-process readers / writer lock** — confirm the shared-memory + `fcntl` locking path maps to
+  Linux (`F_OFD_SETLK`).
+- **Build/CI** — add a Linux lane (swiftly already in CI); verify `.strictMemorySafety()` + experimental
+  Lifetimes compile on Linux Swift 6.3; confirm the `CSQLite` system target + ADJSONCore are Linux-clean.
+- **Tests** — fence `clonefile`/`F_FULLFSYNC` cases behind `#if os(macOS)` with a Linux fallback arm.
+
+**Sizing (portability audit — done).** No architectural rewrite: the engine is already Foundation-free
+and uses portable **C11 atomics** (`ADCAtomics`) for cross-process sync (the hardest part), and there are
+**zero `#if os` conditionals today** — the Darwin surface is ~11 bare `import Darwin` sites + two IO files
+(`FileChannel.swift`, `MMap.swift`). Per subsystem:
+- **IO / mmap — S.** `mmap`/`madvise`/`pread`/`pwrite`/`pwritev`/`O_*` map 1:1 to Glibc (import swap + flag aliases).
+- **Durability + snapshots — M (largest).** `F_PREALLOCATE`+`fstore_t` → `posix_fallocate`; `clonefile`
+  has **no Linux CoW** → fall back to `copy_file_range`/plain copy (snapshots lose O(1), fine for an
+  offline import); the barrier/full-fsync forks are trivial (`fsync` is already the local fallback).
+- **Cross-process — S.** C11 atomics + `fcntl`/`flock`/`kill` already portable; but `strerror_r`
+  (`Errors.swift:54`) is the **XSI variant and is silently wrong under glibc's GNU variant — a must-fix**,
+  and `pthread_attr_set_qos_class_np` + `clock_gettime_nsec_np` need an `#if`-out (no correctness impact).
+- **Build / CI — M.** `#if canImport(Glibc)` scaffolding across ~11 files, de-risk `.strictMemorySafety()`
+  + experimental `Lifetimes` on Linux Swift, wire `libsqlite3-dev` (only `ADSQLImport`/bench/tests need it,
+  not the core engine), add a Linux CI matrix lane.
+- **Tests — S/M.** Mostly portable (Foundation + POSIX); fence `F_FULLFSYNC`/`_np`-timing cases.
+
+### INT — `ad_storage_*` engine swap **[GATE]** · ABSENT
+Make ADSQL the engine *inside* `libAppleDocsCore`, behind the frozen ABI (`ad_storage_open`/`_close`/
+`_search_pages`, §2.5), replacing the `CSQLiteShim`/libsqlite3 dlopen. This **is** A3 (`searchFramed`)
+exposed as the C entry point: `ad_storage_search_pages` decodes the request bag → runs the compiled FTS
+search plan → frames rows into the response buffer. Honour the runtime contract: **synchronous** calls,
+prepared-plan reuse, `BEGIN IMMEDIATE` transactions on the writer, and a read-only multi-reader pool
+(one ADSQL `ReadTxn` per pool slot — a natural fit for wait-free MVCC).
+
+### F1 — SQLite-file importer **[THE GATE]** · ✅ DONE
 A library API + `adsql import` CLI: read a SQLite `.db` (via the existing `CSQLite` dep) → write an
 ADSQL database.
 - **Schema port** with **loose→strict coercion** (SQLite dynamic typing → ADSQL `Value`): the tables +
@@ -215,10 +272,16 @@ copy/allocation. These collapse the middle to a single zero-copy call.
 
 ## 6. Phasing
 
-- **P0 — swap gate** *(adsql repo):* **F1** importer → **F2** FTS byte-parity → **F4** covering →
-  **F5** streaming → **F6** denorm (best lands inside F1).
+The critical path splits in two: the **adoption gate** (apple-docs can run on ADSQL *at all*) comes
+first; the **perf features** then make it *beat* SQLite — the reason for the swap (the ~32 req/s ceiling).
+
+- **P0a — adoption gate (all must hold before a swap):** ✅ **F1** importer · ✅ **F2** FTS byte-parity ·
+  **F0** Linux x64/arm64 (the #1 open blocker) · **`json_each`** FROM-clause TVF (RFC 0011) · **INT** the
+  `ad_storage_*` engine swap. Until these hold, apple-docs cannot run on ADSQL.
+- **P0b — read-path perf (why the swap is worth it):** **F6** build-time denormalization (inside F1) →
+  **F4** covering serve *(in progress)* → **F5** streaming zero-copy scan.
 - **P1 — boundary collapse:** **A1** search primitive → **A2** caller encoder → **A3** one-call framed
-  → **A4** mmap→out single-copy.
+  (= the `INT` ABI body) → **A4** mmap→out single-copy.
 - **P2 — polish:** **A5** pushed filters, **A6** snapshot/plan-cache wiring, **A7** vectorized.
 
 ---
