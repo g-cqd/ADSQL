@@ -301,14 +301,17 @@ first; the **perf features** then make it *beat* SQLite — the reason for the s
 - **P0b — read-path perf (REQUIRED, not just "worth it"):** the `ADSQLBench search` bench (§1) measures
   the as-built `searchPagesFramed` at **~26× slower than SQLite** (p50 148 ms vs 5.6 ms, 25k docs; both
   scale with cores — ADSQL 5.0×, SQLite 6.3× at 8 threads — but ADSQL's per-query base is far slower).
-  Cause: **`ORDER BY tier, rank` defeats block-max WAND** (ADSQL scores every match, no LIMIT-20 early
-  termination), then JOINs `documents` + LEFT JOINs `roots` + evaluates 13 filters per match and
-  `.all()`-materializes. So these are **mandatory to beat SQLite**, biggest lever first: **F6** denormalize
-  the `tier` inputs (`title_lc`, an exact/prefix key) **+ fold `roots`** into `documents` at import ⇒ the
-  read query becomes **rank-only (WAND-eligible) with no JOIN** → **A5** push the typed filters into the
-  WAND scan → ✅ **F4** covering serve (engine landed — wire the FTS covering columns) → **A2–A4** stream
-  the §2.5 framing off the mmap (drop `.all()`) → **A1/A6** compiled `FTSSearchPlan` + per-connection plan
-  cache (no per-request prepare) → **F5** streaming scan. The `search` bench is the regression gate.
+  Cause (plan-probed + `sample`-profiled — NOT the join, which was the initial wrong guess): the joins
+  already **SEEK** (`documents` USING ROWID, `roots` USING INDEX), so it is **not** O(matches×docs). The
+  dominant cost is the **per-match tree-walk `SQLEval.evaluate`** (bm25 + tier CASE + 13 filters) over
+  **all ~7k matches** — `ORDER BY tier` prevents top-K pruning, so every match is scored/tiered/filtered;
+  even count-only is ~60 ms, and ADSQL's per-match work is ~45× SQLite's. Levers, biggest first:
+  ✅ **bounded top-N** (landed, `b7e1fb7` — projects only the top-k: ~369→254 ms) → **A1** compile the
+  join/search-path eval (replace the per-match tree-walk `SQLEval.evaluate` with the compiled-closure
+  path the single-table executor already uses — **the big lever**) → **A5** push the typed filters into
+  the scan (fewer matches scored) → **F6** fold `roots` + precompute `tier` inputs (drop a per-match seek
+  + cheapen the CASE) → **A2–A4** stream the §2.5 framing off the mmap (drop `.all()`). The `search` bench
+  is the regression gate; ✅ **F4** covering engine landed.
 - **P1 — boundary collapse:** **A1** search primitive → **A2** caller encoder → **A3** one-call framed
   (= the `INT` ABI body) → **A4** mmap→out single-copy.
 - **P2 — polish:** **A5** pushed filters, **A6** snapshot/plan-cache wiring, **A7** vectorized.

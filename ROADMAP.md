@@ -113,7 +113,7 @@ seeded op generator, simulated disk for crash injection). Tests in `ADSQLKernelT
 | **FTS MATCH** (membership) | **~3.3× slower** ⚠️ | rides the general per-row path |
 | **FTS index build** | **~7× slower** ⚠️ | constant factor vs FTS5 segments |
 | **FTS delete / churn** | **~390× slower** ⚠️ | re-encodes postings per doc → O(corpus); the standout gap |
-| **apple-docs `/search`** (composed, as-built) | **~26× slower** ⚠️ | the headline use case: `ORDER BY tier, rank` defeats WAND → scores all matches + JOIN + 13 filters + `.all()`; F6 denorm + A5 + F4 + A2–A4 required (M8 P0b). `ADSQLBench search` tracks it |
+| **apple-docs `/search`** (composed, as-built) | **~26× slower** ⚠️ | per-match tree-walk `SQLEval.evaluate` (bm25 + tier CASE + 13 filters) over ALL matches — joins already SEEK; `ORDER BY tier` blocks top-K pruning. Bounded top-N landed (369→254 ms); **A1 compiled join eval** (the big lever) + A5 + F6 next (M8 P0b). `ADSQLBench search` tracks it |
 
 > **apple-docs read path (M8) — measured, not assumed:** the `ADSQLBench search` scenario shows the
 > as-built composed `/search` query is **~26× slower than SQLite** (the `ORDER BY tier, rank` shape
