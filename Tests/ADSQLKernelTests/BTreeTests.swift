@@ -18,6 +18,22 @@ private func put(_ ctx: TxnContext, _ key: [UInt8], _ value: [UInt8]) throws {
     if let failure { throw failure }
 }
 
+/// Applies a delete through the public BTree entry point; returns whether it existed.
+@discardableResult
+private func del(_ ctx: TxnContext, _ key: [UInt8]) throws -> Bool {
+    var existed = false
+    var failure: DBError?
+    key.withUnsafeBytes { k in
+        do throws(DBError) {
+            existed = try BTree.delete(ctx: ctx, key: k)
+        } catch {
+            failure = error
+        }
+    }
+    if let failure { throw failure }
+    return existed
+}
+
 private func get(_ resolver: some PageResolver, _ meta: Meta, _ key: [UInt8]) throws -> [UInt8]? {
     var result: Result<[UInt8]?, DBError> = .success(nil)
     key.withUnsafeBytes { k in
@@ -83,6 +99,84 @@ struct BTreeModelTests {
         for probe in 0..<200 {
             let key = Array("k\(probe * 13 % 2000)".utf8)
             #expect(try get(resolver, kernel.meta, key) == model.get(key))
+        }
+    }
+
+    /// Delete-heavy churn over a multi-level tree of LARGE (inline ~3.5 KB) values — so a
+    /// leaf holds only ~4 cells, and deleting ~80% repeatedly drives nodes under the
+    /// quarter-page `rebalanceThreshold`, exercising the **merge** rebalance path + parent
+    /// separator collapse across commits. The tree must stay structurally valid through
+    /// the churn AND remain byte-identical to the reference model, with correct hit/miss
+    /// point lookups. (The BORROW/redistribute path — `rebalancePair`'s `else` branch —
+    /// needs an underfull node adjacent to a *>¾-full* sibling; the public put/delete API
+    /// can't deterministically produce that layout, since splits leave leaves ~half-full,
+    /// so borrow is better exercised by a node-level test. Tracked as a coverage gap.)
+    @Test func deleteHeavyRebalanceMatchesModel() throws {
+        let kernel = MemKernel()
+        var model = ModelStore()
+        let valueSize = 3500  // cell ≈ key+value ≤ maxInlineCellSize (4064) ⇒ stays inline
+
+        // Build a multi-leaf, multi-level tree.
+        var ctx = kernel.begin()
+        var keys: [[UInt8]] = []
+        for i in 0..<240 {
+            let n = String(i)
+            let key = Array(("k-" + String(repeating: "0", count: 5 - n.count) + n).utf8)
+            let value = [UInt8](repeating: UInt8(i & 0xFF), count: valueSize)
+            try put(ctx, key, value)
+            model.put(key, value)
+            keys.append(key)
+            if i % 60 == 59 {
+                kernel.commit(ctx)
+                ctx = kernel.begin()
+            }
+        }
+        kernel.commit(ctx)
+        #expect(kernel.meta.treeDepth >= 2, "large values should force a multi-level tree")
+
+        // Seeded Fisher–Yates shuffle of delete order (deterministic).
+        var rng = SplitMix64(seed: 0xB0FF_5EED)
+        var order = Array(keys.indices)
+        for i in stride(from: order.count - 1, to: 0, by: -1) {
+            order.swapAt(i, Int(rng.next() % UInt64(i + 1)))
+        }
+
+        // Delete ~80%, validating + model-matching through the churn.
+        ctx = kernel.begin()
+        var deleted = 0
+        let target = (keys.count * 4) / 5
+        for (step, idx) in order.prefix(target).enumerated() {
+            #expect(try del(ctx, keys[idx]), "delete of a present key must report existed=true")
+            _ = model.delete(keys[idx])
+            deleted += 1
+            if step % 30 == 29 {
+                kernel.commit(ctx)
+                _ = try BTree.validate(resolver: CommittedResolver(source: kernel), meta: kernel.meta)
+                ctx = kernel.begin()
+            }
+        }
+        kernel.commit(ctx)
+
+        // Deleting an already-absent key is a no-op (existed=false), count unchanged.
+        ctx = kernel.begin()
+        #expect(try del(ctx, keys[order[0]]) == false)
+        kernel.commit(ctx)
+
+        // Final: structurally valid + byte-identical to the model.
+        let resolver = CommittedResolver(source: kernel)
+        let report = try BTree.validate(resolver: resolver, meta: kernel.meta)
+        #expect(report.kvCount == UInt64(model.count))
+        #expect(model.count == keys.count - deleted)
+        let scanned = try scanAll(resolver, kernel.meta)
+        let expected = model.sortedPairs()
+        #expect(scanned.map(\.key) == expected.map(\.key))
+        #expect(scanned.map(\.value) == expected.map(\.value))
+
+        // Point lookups: surviving keys hit with the right value, deleted keys miss.
+        let deletedSet = Set(order.prefix(target).map { keys[$0] })
+        for key in keys {
+            #expect(try get(resolver, kernel.meta, key) == model.get(key))
+            #expect((try get(resolver, kernel.meta, key) == nil) == deletedSet.contains(key))
         }
     }
 
