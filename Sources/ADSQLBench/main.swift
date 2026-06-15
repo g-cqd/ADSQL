@@ -20,6 +20,9 @@ import Foundation
 // to SKIP synthetic generation and measure against pre-built databases instead (the
 // definitive RFC 0010 §1 measurement at the real 4 GB apple-docs scale). Runs the
 // ORIGINAL `searchPagesFramed` only (the real corpus has no F6 denorm columns).
+// Additionally pass `--corpus-denorm <adsql-path>` (an ADSQL corpus whose documents
+// carry the F6 denorm columns) to ALSO measure `searchPagesFramedDenorm` at real
+// scale — the decisive "does F6 cross SQLite" arm (RFC 0010 §2.2-2.4 "F6").
 
 var config = BenchConfig()
 var engines = ["adsql", "sqlite"]
@@ -58,6 +61,8 @@ while let argument = iterator.next() {
         if let engine = iterator.next() { engines = [engine] }
     case "--corpus":
         config.realADSQLPath = iterator.next()
+    case "--corpus-denorm":
+        config.realDenormPath = iterator.next()
     case "--sqlite":
         config.realSQLitePath = iterator.next()
     case "--dir":

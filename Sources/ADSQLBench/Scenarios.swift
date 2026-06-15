@@ -32,6 +32,12 @@ struct BenchConfig {
     /// Real-corpus mode for the `search` scenario (`--sqlite`): path to the
     /// system-SQLite database read-only counterpart of ``realADSQLPath``.
     var realSQLitePath: String?
+    /// Real-corpus mode for the `search` scenario (`--corpus-denorm`): path to a
+    /// pre-built ADSQL database whose `documents` carries the F6 denorm columns
+    /// (`title_lc`/`key_lc`/`year_num`/`track_lc`/`root_display`/`root_slug`). When
+    /// present, the run ALSO measures ``searchPagesFramedDenorm`` against it — the
+    /// decisive "does F6 cross SQLite at real scale" arm (RFC 0010 §2.2-2.4 "F6").
+    var realDenormPath: String?
 }
 
 enum Scenarios {

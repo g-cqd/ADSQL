@@ -69,9 +69,12 @@ enum SearchPagesScenario {
         // REAL-CORPUS mode: both `--corpus` and `--sqlite` given ⇒ skip synthetic
         // generation entirely and measure against the pre-built 4 GB databases (the
         // definitive RFC 0010 §1 measurement). The original §2.2 `searchPagesFramed`
-        // is the only path here — the real corpus has no F6 denorm columns.
+        // is the always-present arm; `--corpus-denorm` (an ADSQL corpus with the F6
+        // denorm columns) adds the `searchPagesFramedDenorm` arm — the decisive
+        // "does F6 cross SQLite at real scale" measurement.
         if let adsqlPath = config.realADSQLPath, let sqlitePath = config.realSQLitePath {
-            try runRealCorpus(adsqlPath: adsqlPath, sqlitePath: sqlitePath)
+            try runRealCorpus(
+                adsqlPath: adsqlPath, sqlitePath: sqlitePath, denormPath: config.realDenormPath)
             return
         }
 
@@ -125,13 +128,15 @@ enum SearchPagesScenario {
     /// ADSQL opens `adsqlPath` (read-only, wait-free MVCC), SQLite opens `sqlitePath`
     /// (read-only, one connection per worker). No synthetic generation — both engines
     /// query the SAME imported apple-docs data, so the compare is real end to end.
-    /// Runs the ORIGINAL §2.2 `searchPagesFramed` only (the real corpus has no F6
-    /// denorm columns); the workload is `SearchWorkload.params` whose terms
-    /// (swiftui/view/render/model/…) are real apple-docs API terms.
-    static func runRealCorpus(adsqlPath: String, sqlitePath: String) throws {
+    /// The ORIGINAL §2.2 `searchPagesFramed` is the always-present arm; when
+    /// `denormPath` is given (an ADSQL corpus carrying the F6 denorm columns), the
+    /// `searchPagesFramedDenorm` arm runs too. The workload is `SearchWorkload.params`
+    /// whose terms (swiftui/view/render/model/…) are real apple-docs API terms.
+    static func runRealCorpus(adsqlPath: String, sqlitePath: String, denormPath: String?) throws {
         print("  REAL-CORPUS mode (RFC 0010 §1 — the definitive 4 GB measurement)")
-        print("    adsql:  \(adsqlPath)")
-        print("    sqlite: \(sqlitePath)")
+        print("    adsql:        \(adsqlPath)")
+        if let denormPath { print("    adsql-denorm: \(denormPath)") }
+        print("    sqlite:       \(sqlitePath)")
         print(
             "    workload: \(SearchWorkload.params.count) queries · limit \(limit) · "
                 + "single-thread iters \(realSingleThreadIterations)")
@@ -142,9 +147,20 @@ enum SearchPagesScenario {
         // 0 where SQLite returns many, the import is broken: STOP and report.
         try sanityCheckRealCorpus(adsqlPath: adsqlPath, sqlitePath: sqlitePath)
 
-        // 1. Single-thread per-request latency (p50/p99), original path only.
+        // 0b. DENORM equivalence sanity (correctness — non-negotiable): for every
+        // workload query, `searchPagesFramedDenorm` on the denorm corpus must return
+        // the SAME framed row count AND the SAME top docids as `searchPagesFramed`
+        // (original) on the original corpus. A divergence means the denorm SOURCE was
+        // built wrong (a LOWER/json mismatch); STOP and report rather than measure a
+        // wrong query.
+        if let denormPath {
+            try denormEquivalenceCheck(originalPath: adsqlPath, denormPath: denormPath)
+        }
+
+        // 1. Single-thread per-request latency (p50/p99): original, [denorm], sqlite.
         print("\n  -- single-thread latency (per request) --")
         try singleThreadRealADSQL(path: adsqlPath)
+        if let denormPath { try singleThreadRealADSQLDenorm(path: denormPath) }
         try singleThreadRealSQLite(path: sqlitePath)
 
         // 2. Concurrency scaling: throughput + p99 at 1/2/4/8 reader threads.
@@ -152,7 +168,49 @@ enum SearchPagesScenario {
         print(
             "  engine   threads     req/s        p50          p99       (vs 1-thread)")
         try scaleRealADSQL(path: adsqlPath)
+        if let denormPath { try scaleRealADSQLDenorm(path: denormPath) }
         try scaleRealSQLite(path: sqlitePath)
+    }
+
+    /// Cross-corpus DENORM equivalence (RFC 0010 §2.2-2.4 "F6"): proves the denorm
+    /// SOURCE was built faithfully by checking, per workload query, that
+    /// `searchPagesFramedDenorm` over the denorm corpus and `searchPagesFramed` over
+    /// the ORIGINAL corpus agree on (a) the framed row count and (b) the ordered list
+    /// of top docids (the `path`/`d.key` column, the result identity). The two
+    /// corpora are independently built, so this catches any `LOWER`/`json`/COALESCE
+    /// mismatch baked into the denorm columns. Throws ``RealCorpusError`` on the
+    /// first divergence so a wrong source aborts the run.
+    static func denormEquivalenceCheck(originalPath: String, denormPath: String) throws {
+        print("\n  -- DENORM equivalence (denorm framed == original framed: count + top docids) --")
+        let original = try Database.open(
+            at: originalPath,
+            options: DatabaseOptions(durability: .none, maxMapSize: 32 << 30, readOnly: true))
+        defer { original.close() }
+        let denorm = try Database.open(
+            at: denormPath,
+            options: DatabaseOptions(durability: .none, maxMapSize: 32 << 30, readOnly: true))
+        defer { denorm.close() }
+
+        var checked = 0
+        for params in SearchWorkload.params {
+            let originalBytes = try searchPagesFramed(original, params)
+            let denormBytes = try searchPagesFramedDenorm(denorm, params)
+            let originalDocs = framedTopDocids(originalBytes)
+            let denormDocs = framedTopDocids(denormBytes)
+            // Row count from the §2.5 header (independent of the docid decode).
+            let originalCount = framedHeaderRowCount(originalBytes)
+            let denormCount = framedHeaderRowCount(denormBytes)
+            guard originalCount == denormCount, originalDocs == denormDocs else {
+                throw RealCorpusError.denormDiverged(
+                    query: params.query,
+                    originalCount: originalCount, denormCount: denormCount,
+                    originalDocs: originalDocs, denormDocs: denormDocs)
+            }
+            checked += 1
+        }
+        print(
+            "    OK — \(checked)/\(SearchWorkload.params.count) workload queries: denorm corpus "
+                + "matches the original corpus on framed row count AND ordered top docids")
     }
 
     /// Per-term `documents_fts MATCH` counts for both engines (the §2.2 query's
@@ -249,6 +307,33 @@ enum SearchPagesScenario {
         print("  [sqlite] SearchQuery.sql + frame  \(histogram.summary())")
     }
 
+    /// Single-thread latency for the F6 DENORM path (`searchPagesFramedDenorm`) on the
+    /// denorm corpus. Same battery as ``singleThreadRealADSQL(path:)`` so the per-query
+    /// before/after is directly comparable.
+    static func singleThreadRealADSQLDenorm(path: String) throws {
+        let db = try Database.open(
+            at: path,
+            options: DatabaseOptions(durability: .none, maxMapSize: 32 << 30, readOnly: true))
+        defer { db.close() }
+        var warmRows = 0
+        for params in SearchWorkload.params {
+            warmRows += framedHeaderRowCount(try searchPagesFramedDenorm(db, params))
+        }
+        precondition(warmRows > 0, "adsql denorm workload returned no rows — corpus/query mismatch")
+
+        var denorm = LatencyHistogram()
+        denorm.reserve(SearchWorkload.params.count * realSingleThreadIterations)
+        for _ in 0..<realSingleThreadIterations {
+            for params in SearchWorkload.params {
+                let start = nowNanos()
+                let bytes = try searchPagesFramedDenorm(db, params)
+                denorm.record(nowNanos() - start)
+                blackhole(bytes.count)
+            }
+        }
+        print("  [adsql]  searchPagesFramedDenorm  \(denorm.summary())")
+    }
+
     // MARK: - Real-corpus concurrency scaling (original §2.2 path only)
 
     static func scaleRealADSQL(path: String) throws {
@@ -298,6 +383,33 @@ enum SearchPagesScenario {
                 return local
             }
             printScaling("sqlite", threads: threads, result: result, baseline: &baseline)
+        }
+    }
+
+    /// Concurrency scaling for the F6 DENORM path on the denorm corpus — the same
+    /// 1/2/4/8 sweep as ``scaleRealADSQL(path:)`` but calling `searchPagesFramedDenorm`,
+    /// so the throughput table shows ADSQL(denorm) alongside ADSQL(original) + SQLite.
+    static func scaleRealADSQLDenorm(path: String) throws {
+        let db = try Database.open(
+            at: path,
+            options: DatabaseOptions(durability: .none, maxMapSize: 32 << 30, readOnly: true))
+        defer { db.close() }
+        var baseline: Double = 0
+        for threads in readerCounts {
+            let result = runScaling(threads: threads) { stop, histogram in
+                var local = 0
+                var index = 0
+                while !stop.isSet {
+                    let params = SearchWorkload.params[index % SearchWorkload.params.count]
+                    index += 1
+                    let start = nowNanos()
+                    if let bytes = try? searchPagesFramedDenorm(db, params) { blackhole(bytes.count) }
+                    histogram.record(nowNanos() - start)
+                    local += 1
+                }
+                return local
+            }
+            printScaling("adsql/d", threads: threads, result: result, baseline: &baseline)
         }
     }
 
@@ -607,6 +719,63 @@ enum SearchPagesScenario {
                 | (UInt32(bytes[7]) << 24))
     }
 
+    /// The §2.5 header `rowCount` (u32 LE at byte offset 4) decoded straight from a
+    /// framed buffer — used by the denorm equivalence check and the denorm warm-up.
+    static func framedHeaderRowCount(_ bytes: [UInt8]) -> Int {
+        guard bytes.count >= 8 else { return 0 }
+        return Int(
+            UInt32(bytes[4]) | (UInt32(bytes[5]) << 8) | (UInt32(bytes[6]) << 16)
+                | (UInt32(bytes[7]) << 24))
+    }
+
+    /// Decodes the ordered top docids from a §2.5 framed buffer: column 0 of the
+    /// §2.3 projection is `d.key AS path` (a TEXT cell), the natural result identity.
+    /// Walks the full row-major cell stream (decoding each cell's length by tag) so
+    /// it lands on col 0 of each row, and returns those keys in result order. Returns
+    /// `[]` on any malformed/truncated buffer (treated as "no docids" — a divergence
+    /// the caller will surface against the non-empty other side).
+    static func framedTopDocids(_ bytes: [UInt8]) -> [String] {
+        guard bytes.count >= 8 else { return [] }
+        let columnCount = Int(
+            UInt32(bytes[0]) | (UInt32(bytes[1]) << 8) | (UInt32(bytes[2]) << 16)
+                | (UInt32(bytes[3]) << 24))
+        let rowCount = framedHeaderRowCount(bytes)
+        guard columnCount > 0 else { return [] }
+        var offset = 8
+        var docids: [String] = []
+        docids.reserveCapacity(rowCount)
+        for _ in 0..<rowCount {
+            for col in 0..<columnCount {
+                guard offset < bytes.count else { return docids }
+                let tag = bytes[offset]
+                offset += 1
+                switch tag {
+                case 0:  // NULL
+                    if col == 0 { docids.append("") }
+                case 1, 2:  // INT / REAL — 8-byte payload
+                    if col == 0 { docids.append("") }  // col 0 is TEXT; treat as empty on shape drift
+                    offset += 8
+                case 3, 4:  // TEXT / BLOB — [u32 len][bytes]
+                    guard offset + 4 <= bytes.count else { return docids }
+                    let length = Int(
+                        UInt32(bytes[offset]) | (UInt32(bytes[offset + 1]) << 8)
+                            | (UInt32(bytes[offset + 2]) << 16) | (UInt32(bytes[offset + 3]) << 24))
+                    offset += 4
+                    guard offset + length <= bytes.count else { return docids }
+                    if col == 0 && tag == 3 {
+                        docids.append(String(decoding: bytes[offset..<offset + length], as: UTF8.self))
+                    } else if col == 0 {
+                        docids.append("")
+                    }
+                    offset += length
+                default:
+                    return docids  // unknown tag ⇒ malformed; stop
+                }
+            }
+        }
+        return docids
+    }
+
     static let persistent = UInt32(SQLITE_PREPARE_PERSISTENT)
     static let transient = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
 
@@ -649,6 +818,12 @@ enum RealCorpusError: Error, CustomStringConvertible {
     /// ADSQL's `documents_fts` returned no matches for `terms` where system SQLite
     /// returned matches — the FTS import did not populate the index.
     case brokenFTSImport(terms: [String])
+    /// `searchPagesFramedDenorm` on the denorm corpus disagreed with
+    /// `searchPagesFramed` on the original corpus for `query` — the denorm SOURCE
+    /// was built wrong (a `LOWER`/`json`/COALESCE mismatch in an F6 column).
+    case denormDiverged(
+        query: String, originalCount: Int, denormCount: Int,
+        originalDocs: [String], denormDocs: [String])
 
     var description: String {
         switch self {
@@ -658,6 +833,15 @@ enum RealCorpusError: Error, CustomStringConvertible {
                 \(terms.joined(separator: ", ")) where SQLite returned many. The \
                 imported index is empty/unqueryable; aborting before producing \
                 meaningless latency numbers.
+                """
+        case .denormDiverged(let query, let originalCount, let denormCount, let originalDocs, let denormDocs):
+            return """
+                DENORM SOURCE WRONG — searchPagesFramedDenorm (denorm corpus) diverged \
+                from searchPagesFramed (original corpus) for query='\(query)': \
+                rowCount original=\(originalCount) denorm=\(denormCount); \
+                topDocids original=\(originalDocs.prefix(5)) denorm=\(denormDocs.prefix(5)). \
+                A denorm column (title_lc/key_lc/year_num/track_lc/root_display/root_slug) \
+                does not match its SearchDenorm semantics; aborting.
                 """
         }
     }
