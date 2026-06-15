@@ -374,9 +374,14 @@ first; the **perf features** then make it *beat* SQLite — the reason for the s
   > matches a huge doc fraction (single-thread p50 **184–514 ms at 150k** vs ~25 ms on the real 0.5 GB corpus,
   > where matches are ~2%), so it can NOT proxy the real corpus's memory-bandwidth behaviour. **Net: the
   > synthetic size-sweep is a dead end for the headline.** Settling "beats SQLite" requires the REAL
-  > apple-docs corpus (4 GB, realistic match distribution) — via the deferred `INT` cross-repo wire-up, or
-  > importing the real apple-docs SQLite `.db` through F1. Until then the headline stays UNVERIFIED, and at
-  > the only realistic on-disk scale (0.5 GB) ADSQL loses ~5×.
+  > apple-docs corpus (4 GB, realistic match distribution). **(2026-06-15) A disk search confirmed NO ≥4 GB
+  > corpus — and no multi-GB source `.db` to import via F1 — exists locally** (the apple-docs repo holds only
+  > tiny SwiftPM build dbs; the `/tmp` imported corpora are 0.4–0.7 GB). So the F1-import path is dead too,
+  > leaving ONLY the deferred `INT` cross-repo wire-up (the real `load.mjs` against a production-scale corpus)
+  > as a way to settle it. **The "beats SQLite" headline is therefore unvalidatable with local resources; at
+  > every locally-testable scale ADSQL loses ~5×.** Further perf work should target the single-thread gap
+  > directly (join-inner covering / VDBE — real at all scales) rather than re-litigate the unmeasurable
+  > concurrency thesis.
 
   **Real-scale verdict (claimed earlier — now UNVERIFIED, see the flag above):** ADSQL(F6-denorm)
   **BEAT SQLite** — **179 vs 101 req/s** at 8-way (ADSQL scales 6.3×; SQLite ceilings 1.4×, peak 131@4
