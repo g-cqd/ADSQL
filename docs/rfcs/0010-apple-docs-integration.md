@@ -45,9 +45,12 @@ apple-docs RFC 0001 gates ADSQL adoption (its P7) on **three explicit conditions
 
 **Scalar/JSON surface** (`Sources/ADSQLKernel/SQL/Functions.swift`) already implements the query's
 functions with SQLite-matching semantics (`COALESCE`, `LOWER`/`UPPER`, `LENGTH`/`INSTR`/`SUBSTR`,
-`JSON_EXTRACT`, `CAST`, `LIKE`, `||`, `COLLATE NOCASE`). The one surface gap to confirm is **`json_each`
-as a FROM-clause table-valued function** (the `d.source_type IN (SELECT value FROM json_each($sources_json))`
-filter) — tracked by the in-flight RFC 0011 (table-valued functions).
+`JSON_EXTRACT`, `CAST`, `LIKE`, `||`, `COLLATE NOCASE`). The `json_each` filter (`d.source_type IN
+(SELECT value FROM json_each($sources_json))`) uses the **contracted `IN (SELECT … json_each …)` shape**,
+which ADSQL evaluates self-contained via its `inJSONEach` AST node + `SQLJSON.eachValues` — **not** the
+general FROM-clause table-valued `json_each` of RFC 0011. **The entire apple-docs main query (§2.2–2.4) is
+now proven byte-identical to SQLite** (`Tests/ADSQLImportTests/AppleDocsMainQueryTests.swift`), so the hot
+path has **no SQL-surface gap**; the open P0a items are F0 Linux + the INT engine swap.
 
 ---
 
@@ -130,7 +133,7 @@ cell `[u8 tag][payload]`: `0`=NULL, `1`=INT `[i64 LE]`, `2`=REAL `[f64 LE]`, `3`
 | **INT** `ad_storage_*` engine swap **[GATE]** | **ABSENT** | implement the frozen `ad_storage_search_pages` ABI (= A3 `searchFramed`) so ADSQL replaces `CSQLiteShim`/libsqlite3 inside `libAppleDocsCore` |
 | **F1** SQLite importer **[GATE]** | **✅ DONE** | `ADSQLImport` target: `Database.importSQLite(from:manifest:)` + `adsql import`; schema port + coercion + index/PK/UNIQUE port + manifest FTS5 rebuild + deep integrity; idempotent, deterministic |
 | **F2** FTS byte-parity | **✅ LANDED** | bm25f score parity **+ ranked-order parity** (ties → ascending rowid via the bounded-top-N upper-bound fix) proven through the importer vs SQLite FTS5 — `ImportedFTSParityTests.swift`, default + 5-weight |
-| **F3** scalar surface | **PRESENT** | `SQL/Functions.swift` — `COLLATE NOCASE` + `LIKE …||'%'` present; confirm `json_each` FROM-clause TVF (RFC 0011) |
+| **F3** scalar + main-query surface | **✅ PROVEN** | full §2.2–2.4 main query byte-parity vs SQLite — `AppleDocsMainQueryTests`; `json_each` covered by the contracted `inJSONEach` shape (not RFC 0011's FROM-clause TVF) |
 | **F4** covering/INCLUDE serving | **⏳ IN PROGRESS** | machinery exists; wiring `Planner` covering-detection (required-cols ⊆ index key ∪ includes) + executor activation + differential tests underway |
 | **F5** streaming zero-copy scan | **PARTIAL** | `RowView` (~Escapable) + `RowCursor.forEachRow/forEachRecordSpan` exist package-internal; `Statement` only exposes `.all()` |
 | **F6** build-time denormalization | **ABSENT** | inside F1 |
@@ -290,7 +293,8 @@ The critical path splits in two: the **adoption gate** (apple-docs can run on AD
 first; the **perf features** then make it *beat* SQLite — the reason for the swap (the ~32 req/s ceiling).
 
 - **P0a — adoption gate (all must hold before a swap):** ✅ **F1** importer · ✅ **F2** FTS byte-parity ·
-  **F0** Linux x64/arm64 (the #1 open blocker) · **`json_each`** FROM-clause TVF (RFC 0011) · **INT** the
+  ✅ **main-query surface parity** (`AppleDocsMainQueryTests` — §2.2–2.4 byte-identical; `json_each` via the
+  contracted `inJSONEach`, not RFC 0011) · **F0** Linux x64/arm64 (the #1 open blocker) · **INT** the
   `ad_storage_*` engine swap. Until these hold, apple-docs cannot run on ADSQL.
 - **P0b — read-path perf (why the swap is worth it):** **F6** build-time denormalization (inside F1) →
   **F4** covering serve *(in progress)* → **F5** streaming zero-copy scan.
