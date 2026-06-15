@@ -331,8 +331,31 @@ first; the **perf features** then make it *beat* SQLite — the reason for the s
   bench at the **4 GB** corpus with ADSQL wired in (the `INT` cross-repo step) — not more small-scale
   micro-benching. ✅ **F4** covering engine landed.
 
-  **Real-scale verdict (DEFINITIVE — 4 GB / 358k docs, 8-way, `--corpus-denorm`):** ADSQL(F6-denorm)
-  **BEATS SQLite** — **179 vs 101 req/s** at 8-way (ADSQL scales 6.3×; SQLite ceilings 1.4×, peak 131@4
+  > **⚠️ 2026-06-15 RE-MEASUREMENT — the "DEFINITIVE" verdict below did NOT reproduce.** Re-running the
+  > same `search --corpus … --sqlite … --corpus-denorm …` battery on the on-disk corpus
+  > (`/tmp/apple-docs-denorm.{adsql,db}`, **~0.5 GB — NOT 4 GB**; "4 GB" was always apple-docs' *production*
+  > size, never the bench corpus) shows **SQLite WINNING at every thread count**: 8-way **SQLite ~962 vs
+  > ADSQL-denorm ~195 req/s** (SQLite scaled ~18×, ADSQL ~6.9×); single-thread ADSQL-denorm **25.5 ms vs
+  > SQLite 4.4 ms (~5.8× slower)**. TWO caveats blunt this (so it does not flip the headline to "SQLite
+  > wins" either): (1) the sweep's req/s are internally inconsistent with its own p50s (1-thread 53 req/s
+  > vs a 4.4 ms p50 ⇒ unreliable req/s accounting); (2) at ~0.5 GB the working set is RAM/cache-resident, so
+  > SQLite never hits the memory-bandwidth ceiling that is the ENTIRE premise of the wait-free-MVCC thesis —
+  > the wrong regime to test it. **Net: the "beats SQLite" concurrency headline is UNVERIFIED** — it needs
+  > (a) fixed req/s accounting in the sweep AND (b) a genuine ≥4 GB working set (or the real apple-docs
+  > `load.mjs` against a wired-in ADSQL) before it can be trusted in either direction.
+  >
+  > **Single-thread profile (`/usr/bin/sample`, denorm /search — SOLID):** the cost is the JOIN (FTS ⋈
+  > `documents`, inherent — FTS yields docids, `documents` holds the columns): per-match `documents` SEEK +
+  > per-row column **decode** (`RowSlot`/`RecordCodec` via `context.value`) + bm25 score-all (`ORDER BY
+  > tier` defeats WAND), over all ~7k matches. **A5 (push filters into the scan) is REFUTED as the top
+  > lever** — scoring is not dominant; the inner SEEK + decode is. Compiling the join's projection/ORDER-BY
+  > eval to closures (tried + reverted, no-win) gave NO single-thread gain, because the hot `context.value`
+  > decode is identical compiled-or-tree-walked — the AST-walk compiling removes is not the bottleneck. The
+  > real levers remain large: cover the join inner for the sort/filter columns (descend only for the top-k
+  > projection), or the deferred VDBE.
+
+  **Real-scale verdict (claimed earlier — now UNVERIFIED, see the flag above):** ADSQL(F6-denorm)
+  **BEAT SQLite** — **179 vs 101 req/s** at 8-way (ADSQL scales 6.3×; SQLite ceilings 1.4×, peak 131@4
   then regresses on memory-bandwidth contention — §1 confirmed); the crossover is between 4 and 8 threads
   and widens with cores. The ORIGINAL no-F6 query loses (65 vs 101). Single-thread ADSQL(denorm) is still
   ~3.5× slower (29 vs 8.4 ms) — so the swap wins on **throughput at production concurrency**, not
