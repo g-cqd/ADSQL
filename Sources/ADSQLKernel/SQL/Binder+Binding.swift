@@ -12,13 +12,13 @@ extension Binder {
             return .tableScan
         case .rowid(let exprs):
             return .rowid(exprs.map { bindColumnsNoWeights($0, binding) })
-        case .index(let name, let probes, let constraint):
+        case .index(let name, let probes, let constraint, let covering):
             let bound = probes.map { probe in
                 IndexProbe(
                     equality: probe.equality.map { bindColumnsNoWeights($0, binding) },
                     trailing: probe.trailing.map { bindTrailing($0, binding) })
             }
-            return .index(name: name, probes: bound, constraint: constraint)
+            return .index(name: name, probes: bound, constraint: constraint, covering: covering)
         case .fts(let table, let query, let weights):
             // The query string is a literal/parameter; bind it like any expression
             // (a stray column ref would just stay `.column` and fail at evaluation).

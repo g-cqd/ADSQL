@@ -230,7 +230,7 @@ enum Binder {
         // bm25() anywhere in the projection/ORDER BY is seen). Default to all-ones
         // for a plain `rank` reference (the table index is the leading table or the
         // join depth).
-        let leadingAccess = bindAccess(applyWeights(planning.plan, ftsWeights, depth: 0), binding)
+        var leadingAccess = bindAccess(applyWeights(planning.plan, ftsWeights, depth: 0), binding)
         let boundJoinAccess = joins.map {
             bindAccess(applyWeights($0.access, ftsWeights, depth: $0.table), binding)
         }
@@ -286,6 +286,64 @@ enum Binder {
         for t in boundOrderBy { collectTableRefs(t.expr, into: &finalRefs, unknown: &finalUnknown) }
         let finalizationReferenced: Set<Int> =
             finalUnknown ? Set(tables.indices) : finalRefs
+
+        // F4 — covering / INCLUDE-index serving: if the chosen leading access is an
+        // index scan and EVERY base-table column this query still needs is served by
+        // that index — the rowid-alias (read from the key) or an INCLUDE column (read
+        // from the entry value) — serve rows index-only, with no descent into the base
+        // row. Gated to the non-aggregated, single-table path (the only one routed
+        // through `SelectExecutor.run`'s covering-aware accumulator) and disabled on
+        // any unresolved/correlated reference. `requiredColumns` is computed from the
+        // BOUND expressions, so it cannot miss a referenced column (see below).
+        if !isAggregated, joins.isEmpty, !unknownRefs,
+            case .index(let name, _, _, _) = leadingAccess,
+            let definition = sourceIndexes.first(where: { $0.name == name })
+        {
+            // Columns of table 0 the executor must still read from a row at the leaf.
+            // Sources, exhaustively:
+            //   • projection outputs — always read;
+            //   • the RESIDUAL WHERE (`boundResidual`), NOT the full WHERE: the dropped
+            //     conjuncts are exact equalities the index probe enforces by position
+            //     (`col = const`), so their column is never read from a row — only the
+            //     constant the cursor was seeked to. (`boundResidual` == the residual
+            //     here: this branch is gated to the single-table path where the binder
+            //     applied `removeCovered`.) Using the residual is what lets the canonical
+            //     `SELECT c,d FROM t WHERE a=?` (with `a` a key column) be covering;
+            //   • HAVING / ORDER BY / GROUP BY — read during sort/group;
+            //   • the access probe values — constants/parameters in practice, folded in
+            //     defensively so a future probe shape cannot under-count.
+            // Every source is a *bound* expression, so a base-table reference appears as
+            // `.boundColumn(0, c)` this collector sees; an unresolved `.column` would
+            // have set `unknownRefs` and disabled the whole branch. This is why the set
+            // CANNOT under-count: if any column read at runtime were missed, it would be
+            // a `.boundColumn` the exhaustive walk skipped — which it does not.
+            var requiredColumns: Set<Int> = []
+            var requiredUnknown = false
+            func need(_ e: SQLExpr) {
+                collectColumnRefs(e, table: 0, into: &requiredColumns, unknown: &requiredUnknown)
+            }
+            for o in boundOutputs { need(o.expr) }
+            if let r = boundResidual { need(r) }
+            if let h = boundHaving { need(h) }
+            for t in boundOrderBy { need(t.expr) }
+            for g in boundGroupBy { need(g) }
+            collectColumnRefs(forAccess: leadingAccess, table: 0, into: &requiredColumns, unknown: &requiredUnknown)
+
+            // The set this index can serve index-only: the rowid-alias plus every
+            // INCLUDE column. A non-rowid KEY column is NOT included — the entry value
+            // stores only INCLUDE columns, so `RowSlot`/`RowView` cannot decode a key
+            // column from it (a key column can never also be an INCLUDE; the index
+            // definition forbids it). This is stricter than `key ∪ includes`, which is
+            // unsound for the present storage layout — correctness over optimization.
+            var servable: Set<Int> = []
+            if let alias = source.rowidAliasIndex { servable.insert(alias) }
+            for column in definition.includes {
+                if let index = source.columnIndex(qualifier: nil, name: column) { servable.insert(index) }
+            }
+            if !requiredUnknown, requiredColumns.isSubset(of: servable) {
+                leadingAccess = coveringRewrite(leadingAccess, includes: definition.includes)
+            }
+        }
 
         // Index-ordered DISTINCT: a single-table `SELECT DISTINCT <plain cols>` with
         // no WHERE/ORDER BY/aggregate can scan an index whose key columns are exactly
@@ -450,7 +508,7 @@ enum Binder {
             break
         case .rowid(let exprs):
             for e in exprs { collectTableRefs(e, into: &refs, unknown: &unknown) }
-        case .index(_, let probes, _):
+        case .index(_, let probes, _, _):
             for probe in probes {
                 for e in probe.equality { collectTableRefs(e, into: &refs, unknown: &unknown) }
                 if case .range(let lower, let upper)? = probe.trailing {
@@ -463,6 +521,84 @@ enum Binder {
         }
     }
 
+    /// Adds the COLUMN indices of `table` that `expr` reads to `columns` (F4
+    /// covering analysis — the per-table refinement of `collectTableRefs`). Sets
+    /// `unknown` for an unresolved/correlated `.column` or a scalar subquery, whose
+    /// reachable columns can't be determined here (the caller then refuses to claim
+    /// covering). Walks EVERY `SQLExpr` case — the safety of index-only serving rests
+    /// on this never missing a base-table column reference, so it mirrors
+    /// `collectTableRefs` exactly and adds no early-out.
+    private static func collectColumnRefs(
+        _ expr: SQLExpr, table: Int, into columns: inout Set<Int>, unknown: inout Bool
+    ) {
+        switch expr {
+        case .boundColumn(let t, let c):
+            if t == table { columns.insert(c) }
+        case .column, .scalarSubquery:
+            unknown = true
+        case .literal, .parameter, .aggregateResult:
+            break
+        case .binary(_, let l, let r):
+            collectColumnRefs(l, table: table, into: &columns, unknown: &unknown)
+            collectColumnRefs(r, table: table, into: &columns, unknown: &unknown)
+        case .unary(_, let i), .cast(let i, _), .collate(let i, _):
+            collectColumnRefs(i, table: table, into: &columns, unknown: &unknown)
+        case .isNull(let i, _):
+            collectColumnRefs(i, table: table, into: &columns, unknown: &unknown)
+        case .like(let s, let p, _):
+            collectColumnRefs(s, table: table, into: &columns, unknown: &unknown)
+            collectColumnRefs(p, table: table, into: &columns, unknown: &unknown)
+        case .inList(let s, let items, _):
+            collectColumnRefs(s, table: table, into: &columns, unknown: &unknown)
+            for item in items { collectColumnRefs(item, table: table, into: &columns, unknown: &unknown) }
+        case .inJSONEach(let s, let src, _):
+            collectColumnRefs(s, table: table, into: &columns, unknown: &unknown)
+            collectColumnRefs(src, table: table, into: &columns, unknown: &unknown)
+        case .caseWhen(let operand, let whens, let elseExpr):
+            if let operand { collectColumnRefs(operand, table: table, into: &columns, unknown: &unknown) }
+            for when in whens {
+                collectColumnRefs(when.condition, table: table, into: &columns, unknown: &unknown)
+                collectColumnRefs(when.result, table: table, into: &columns, unknown: &unknown)
+            }
+            if let elseExpr { collectColumnRefs(elseExpr, table: table, into: &columns, unknown: &unknown) }
+        case .function(_, let args, _, _):
+            for arg in args { collectColumnRefs(arg, table: table, into: &columns, unknown: &unknown) }
+        }
+    }
+
+    /// Folds an access path's probe/rowid value expressions into the per-table
+    /// column set (the column-level analogue of `collectAccessRefs`). Probe values
+    /// are constants/parameters in practice; included defensively so a future probe
+    /// shape can never under-count the columns an index-only scan must serve.
+    private static func collectColumnRefs(
+        forAccess access: AccessPlan, table: Int, into columns: inout Set<Int>, unknown: inout Bool
+    ) {
+        switch access {
+        case .tableScan:
+            break
+        case .rowid(let exprs):
+            for e in exprs { collectColumnRefs(e, table: table, into: &columns, unknown: &unknown) }
+        case .index(_, let probes, _, _):
+            for probe in probes {
+                for e in probe.equality { collectColumnRefs(e, table: table, into: &columns, unknown: &unknown) }
+                if case .range(let lower, let upper)? = probe.trailing {
+                    if let lower { collectColumnRefs(lower.expr, table: table, into: &columns, unknown: &unknown) }
+                    if let upper { collectColumnRefs(upper.expr, table: table, into: &columns, unknown: &unknown) }
+                }
+            }
+        case .fts(_, let query, _):
+            collectColumnRefs(query, table: table, into: &columns, unknown: &unknown)
+        }
+    }
+
+    /// Stamps an `.index` access plan as covering, attaching the index's FULL
+    /// INCLUDE list (the entry-value layout the index-only decoder walks). A no-op
+    /// for any non-`.index` plan.
+    private static func coveringRewrite(_ access: AccessPlan, includes: [String]) -> AccessPlan {
+        guard case .index(let name, let probes, let constraint, _) = access else { return access }
+        return .index(name: name, probes: probes, constraint: constraint, covering: includes)
+    }
+
     /// An exact-equality probe — every matching row satisfies the covered ON
     /// equality exactly (no trailing range to re-check). `.tableScan`/`.fts` are
     /// supersets, so never exact.
@@ -470,7 +606,7 @@ enum Binder {
         switch access {
         case .rowid:
             return true
-        case .index(_, let probes, _):
+        case .index(_, let probes, _, _):
             return !probes.isEmpty && probes.allSatisfy { $0.trailing == nil }
         case .tableScan, .fts:
             return false

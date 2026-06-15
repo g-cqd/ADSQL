@@ -33,7 +33,14 @@ struct IndexProbe: Sendable {
 enum AccessPlan: Sendable {
     case tableScan
     case rowid([SQLExpr])  // one (eq) or many (IN) rowid probes
-    case index(name: String, probes: [IndexProbe], constraint: String)
+    /// An index range/equality scan. `covering` is non-nil only when the binder
+    /// has *proved* every base-table column the query still needs lives in this
+    /// index's served set — the rowid-alias (read from the key) plus its INCLUDE
+    /// columns (read from the entry value). The executor then serves rows straight
+    /// from the index leaf with NO table descent (F4). It carries the index's FULL
+    /// `includes` list (the entry-value layout the decoder walks), never a subset.
+    /// nil ⇒ the ordinary descend-into-the-table path.
+    case index(name: String, probes: [IndexProbe], constraint: String, covering: [String]?)
     /// Full-text MATCH on an FTS5 table: the row source is the docid set
     /// `FTSMatch.evaluate` returns for `query` (a literal/parameter expression),
     /// not a B+tree scan. `query` is the MATCH right-hand operand. `weights` are
@@ -197,7 +204,8 @@ enum Planner {
                     plan: .index(
                         name: index.name,
                         probes: inList.values.map { IndexProbe(equality: [$0], trailing: nil) },
-                        constraint: "\(index.columns[0]) IN (\(inList.values.count))"),
+                        constraint: "\(index.columns[0]) IN (\(inList.values.count))",
+                        covering: nil),
                     yieldsOrder: yields,
                     rowidOrderSatisfiesOrderBy: rowidOrder,
                     coveredConjuncts: [inList.source])
@@ -215,7 +223,8 @@ enum Planner {
                 plan: .index(
                     name: index.name,
                     probes: [IndexProbe(equality: equality, trailing: trailing)],
-                    constraint: constraintText.joined(separator: " AND ")),
+                    constraint: constraintText.joined(separator: " AND "),
+                    covering: nil),
                 yieldsOrder: orderBy.isEmpty || yields,
                 rowidOrderSatisfiesOrderBy: rowidOrder,
                 coveredConjuncts: covered)
@@ -449,15 +458,18 @@ extension AccessPlan {
             return "SCAN \(table)"
         case .rowid(let probes):
             return probes.count > 1 ? "SEARCH \(table) USING ROWID (IN)" : "SEARCH \(table) USING ROWID"
-        case .index(let name, _, let constraint):
-            return "SEARCH \(table) USING INDEX \(name) (\(constraint))"
+        case .index(let name, _, let constraint, let covering):
+            // A covering scan is served index-only (no table descent); flag it so a
+            // planner assertion can distinguish it from an ordinary index search.
+            let suffix = covering != nil ? " COVERING" : ""
+            return "SEARCH \(table) USING INDEX \(name) (\(constraint))\(suffix)"
         case .fts(let ftsTable, _, _):
             return "SCAN \(ftsTable) VIRTUAL TABLE INDEX (MATCH)"
         }
     }
 
     var indexName: String? {
-        if case .index(let name, _, _) = self { return name }
+        if case .index(let name, _, _, _) = self { return name }
         return nil
     }
 }

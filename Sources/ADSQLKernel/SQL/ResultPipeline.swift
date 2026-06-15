@@ -73,9 +73,13 @@ extension SelectExecutor {
             self.nullExtended = Array(repeating: false, count: definitions.count)
         }
 
-        func load(_ table: Int, rowid: Int64, span: UnsafeRawBufferPointer, score: Double = 0) {
+        func load(
+            _ table: Int, rowid: Int64, span: UnsafeRawBufferPointer, score: Double = 0,
+            coveringIncludes: [String]? = nil
+        ) {
             nullExtended[table] = false
-            unsafe slots[table].load(rowid: rowid, span: span, score: score)
+            unsafe slots[table].load(
+                rowid: rowid, span: span, score: score, coveringIncludes: coveringIncludes)
         }
         /// Loads a materialized (span-less) row into a table slot — the hash-join
         /// build side re-serving a decoded row during probe.

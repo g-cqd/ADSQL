@@ -27,9 +27,19 @@ extension SelectExecutor {
         guard plan.isJoin else {
             let source = try resolveSource(
                 plan, table: tables[0], index: index, ftsRecords: ftsRecords, env: paramsEnv)
+            // F4 index-only: when the source is a covering scan, decode slot 0 through
+            // the INCLUDE layout. Currently the binder only marks non-aggregated single-
+            // table plans covering (those run via `SelectExecutor.run`, not here), so
+            // this stays nil on the aggregate path that reaches `forEachFilteredRow`;
+            // honoring it regardless keeps this path correct if that ever changes.
+            let covering: [String]? = {
+                if case .index(_, _, let includes) = source { return includes }
+                return nil
+            }()
             unsafe try forEachRow(source, table: tables[0], resolver: resolver) {
                 rowid, span, score throws(DBError) in
-                unsafe context.load(0, rowid: rowid, span: span, score: score)
+                unsafe context.load(
+                    0, rowid: rowid, span: span, score: score, coveringIncludes: covering)
                 if try passesWhere() { try body() }
                 return true
             }
@@ -154,7 +164,7 @@ extension SelectExecutor {
         context: RowContext, env: SQLEvalEnv, resolver: R, buffer: inout [UInt8]
     ) throws(DBError) -> Bool? {
         guard index.definition.unique,
-            case .index(let name, let probes, _) = join.access,
+            case .index(let name, let probes, _, _) = join.access,
             name == index.definition.name, probes.count == 1,
             probes[0].trailing == nil,
             probes[0].equality.count == index.definition.columns.count

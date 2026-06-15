@@ -25,6 +25,14 @@
     /// if this slot models an FTS table. `compute` returns the per-row `score` for
     /// it without touching the span, parallel to the `aliasIndex → rowid` path.
     private let scoreIndex: Int?
+    /// Index-only (F4 covering) scan: when non-nil, the loaded `span` is the index
+    /// entry's covering value — a `RecordCodec` record of these INCLUDE columns in
+    /// declaration order, NOT the full table record. A column read then resolves to
+    /// its slot within that value (rowid-alias still reads back from the rowid); a
+    /// column that is neither the rowid-alias nor an INCLUDE traps, because the
+    /// planner only takes this path when every read column is one of those. Reset
+    /// per row by `load`. Mirrors `RowView.coveringIncludes`. nil = ordinary record.
+    private var coveringIncludes: [String]?
     private(set) var rowid: Int64 = 0
     /// The bm25 relevance score of the current FTS row (`.real(score)` for the
     /// `rank` column). Zero for non-FTS rows, where `scoreIndex` is nil.
@@ -51,13 +59,19 @@
     }
 
     /// Re-points the slot at a new row's record span; resets the decode state.
-    /// `score` is the FTS row's bm25 score (ignored when not an FTS slot). The
-    /// span must stay valid for as long as the slot is read (the scan driver
-    /// guarantees this within the per-row body).
-    func load(rowid: Int64, span: UnsafeRawBufferPointer, score: Double = 0) {
+    /// `score` is the FTS row's bm25 score (ignored when not an FTS slot). When
+    /// `coveringIncludes` is non-nil, `span` is an index entry's covering value
+    /// (INCLUDE columns only, in declaration order) and column reads resolve through
+    /// it — see the property doc. The span must stay valid for as long as the slot
+    /// is read (the scan driver guarantees this within the per-row body).
+    func load(
+        rowid: Int64, span: UnsafeRawBufferPointer, score: Double = 0,
+        coveringIncludes: [String]? = nil
+    ) {
         self.rowid = rowid
         self.score = score
         unsafe self.span = unsafe span
+        self.coveringIncludes = coveringIncludes
         self.headerParsed = false
         self.locatedCount = 0
         self.offsets.removeAll(keepingCapacity: true)
@@ -71,6 +85,7 @@
     func loadMaterialized(rowid: Int64, values: [Value]) {
         self.rowid = rowid
         self.score = 0
+        self.coveringIncludes = nil  // fully pre-cached; no span/covering read
         for index in cache.indices { cache[index] = index < values.count ? values[index] : nil }
     }
 
@@ -91,14 +106,16 @@
         at index: Int, _ body: (UnsafeRawBufferPointer?) throws(DBError) -> R
     ) throws(DBError) -> R {
         if index == aliasIndex || index == scoreIndex { return try body(nil) }
-        return unsafe try RecordCodec.withText(at: index, in: span, body)
+        let decodeAt = coveringIncludes == nil ? index : coveringSlot(index)
+        return unsafe try RecordCodec.withText(at: decodeAt, in: span, body)
     }
 
     func withBlobBytes<R>(
         at index: Int, _ body: (UnsafeRawBufferPointer?) throws(DBError) -> R
     ) throws(DBError) -> R {
         if index == aliasIndex || index == scoreIndex { return try body(nil) }
-        return unsafe try RecordCodec.withBlob(at: index, in: span, body)
+        let decodeAt = coveringIncludes == nil ? index : coveringSlot(index)
+        return unsafe try RecordCodec.withBlob(at: decodeAt, in: span, body)
     }
 
     /// All columns as a materialized row — the eager fallback (projection of
@@ -114,13 +131,28 @@
         if index == aliasIndex { return .integer(rowid) }
         // The FTS `rank` slot reads the precomputed score, never the (empty) span.
         if index == scoreIndex { return .real(score) }
-        guard let start = try locate(index) else {
+        // Index-only: decode the column from its slot within the covering value.
+        let decodeAt = coveringIncludes == nil ? index : coveringSlot(index)
+        guard let start = try locate(decodeAt) else {
             switch columns[index].defaultValue {
             case .value(let value): return value
             case .datetimeNow, nil: return .null
             }
         }
         return unsafe try RecordCodec.decodeCell(span, at: start)
+    }
+
+    /// The decode position of schema column `index` within the covering value (its
+    /// position in `coveringIncludes`). Traps when the column is not covered — the
+    /// planner only enables index-only serving when every read column is the
+    /// rowid-alias (handled before this is reached) or an INCLUDE column, so a miss
+    /// is a planner bug, not bad data.
+    private func coveringSlot(_ index: Int) -> Int {
+        guard let slot = coveringIncludes?.firstIndex(of: columns[index].name) else {
+            preconditionFailure(
+                "column \(columns[index].name) not covered by this index-only scan")
+        }
+        return slot
     }
 
     /// Byte start of stored cell `index`, or nil if beyond the stored count.

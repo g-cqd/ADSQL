@@ -52,7 +52,7 @@ enum SelectExecutor {
             ordered = plan.orderBy.isEmpty || plan.rowidOrderSatisfiesOrderBy
         case .rowids:
             ordered = plan.accessYieldsOrder
-        case .index(_, let list):
+        case .index(_, let list, _):
             ordered = plan.orderBy.isEmpty || (plan.accessYieldsOrder && list.count <= 1)
         case .fts:
             // The docid set is ascending; the planner sets accessYieldsOrder only
@@ -77,7 +77,7 @@ enum SelectExecutor {
             return bound >= 1 && bound <= 4096 ? bound : nil
         }()
         let dedupRowids: Bool = {
-            if case .index(_, let list) = source { return list.count > 1 }
+            if case .index(_, let list, _) = source { return list.count > 1 }
             return false
         }()
         // F6c — block-max WAND ranked top-k: when the leading FTS source is ordered by
@@ -113,6 +113,13 @@ enum SelectExecutor {
         case .table: residual = plan.whereExpr
         case .rowids, .index, .fts: residual = plan.residualWithoutCovered
         }
+        // F4 index-only: a covering source serves each row from the index entry's
+        // value, so the slot must decode columns through the INCLUDE layout (the full
+        // `includes` list) instead of by schema position. nil ⇒ ordinary record.
+        let covering: [String]? = {
+            if case .index(_, _, let includes) = source { return includes }
+            return nil
+        }()
         // F6e: for an FTS source, computing the per-doc bm25 score is dead work
         // unless the `rank` slot is actually read — by the projection, ORDER BY, or
         // residual — or WAND needs it. Skipping it makes a membership-only MATCH O(n)
@@ -145,7 +152,8 @@ enum SelectExecutor {
             orderThunks: plan.orderBy.map { makeThunk($0.expr) },
             orderCollations: plan.orderCollations, collectKeys: collectKeys,
             sliceEnd: sliceEnd, topN: topN, dedupRowids: dedupRowids,
-            distinct: plan.distinct, distinctCollations: plan.outputCollations, fastSort: fastSort)
+            distinct: plan.distinct, distinctCollations: plan.outputCollations, fastSort: fastSort,
+            covering: covering)
         unsafe try forEachRow(
             source, table: table, resolver: resolver, ftsRankedTopK: ftsRankedTopK,
             ftsScoreNeeded: ftsScoreNeeded
@@ -222,7 +230,10 @@ enum SelectExecutor {
     enum RowSource {
         case table
         case rowids([Int64])
-        case index(Catalog.IndexRecord, [IndexBounds])
+        /// An index range scan. `covering` is non-nil (the index's full INCLUDE
+        /// list) only for an F4 index-only scan the binder proved safe: each row is
+        /// served straight from the index leaf, no table descent. nil = descend.
+        case index(Catalog.IndexRecord, [IndexBounds], covering: [String]?)
         /// An FTS5 MATCH source: the docids `FTSMatch.evaluate` returns (ascending),
         /// each scored by bm25f. `query` is the UTF-8 of the resolved MATCH query
         /// string; `weights` are the per-column bm25() weights (already padded to the
@@ -259,6 +270,9 @@ enum SelectExecutor {
         /// Single TEXT ORDER BY column for the zero-copy top-N early-drop (nil = the
         /// general `[Value]` sort-key path).
         let fastSort: (column: Int, descending: Bool, nocase: Bool)?
+        /// F4 index-only: the INCLUDE layout each row's span decodes through (the
+        /// covering index's full `includes`); nil ⇒ the span is a full table record.
+        let covering: [String]?
         var seenOutputs: Set<GroupKey> = []
         var seenRowids: Set<Int64>?
         var rows: [[Value]] = []
@@ -273,7 +287,8 @@ enum SelectExecutor {
             orderCollations: [Collation], collectKeys: Bool,
             sliceEnd: Int?, topN: Int?, dedupRowids: Bool,
             distinct: Bool, distinctCollations: [Collation],
-            fastSort: (column: Int, descending: Bool, nocase: Bool)?
+            fastSort: (column: Int, descending: Bool, nocase: Bool)?,
+            covering: [String]?
         ) {
             self.context = context
             self.residualThunk = residualThunk
@@ -288,6 +303,7 @@ enum SelectExecutor {
             self.distinct = distinct
             self.distinctCollations = distinctCollations
             self.fastSort = fastSort
+            self.covering = covering
         }
 
         func consume(rowid: Int64, span: UnsafeRawBufferPointer, score: Double) throws(DBError) -> Bool {
@@ -295,7 +311,7 @@ enum SelectExecutor {
                 if seenRowids!.contains(rowid) { return true }
                 seenRowids!.insert(rowid)
             }
-            unsafe context.load(0, rowid: rowid, span: span, score: score)
+            unsafe context.load(0, rowid: rowid, span: span, score: score, coveringIncludes: covering)
             if let residualThunk {
                 if SQLEval.truth(try residualThunk()) != .yes { return true }
             }
@@ -432,12 +448,16 @@ enum SelectExecutor {
                 }
                 if outcome == false { return }  // nil = no such row → skip
             }
-        case .index(let index, let boundsList):
-            // Existence-only (an existence-only join inner): drive the index entries
-            // directly with NO table descent — `coveringIncludes: []` selects the
-            // no-descent branch, serving each entry's (here unread) value span. The
-            // rowid still comes from the key; the caller reads no inner column.
-            let covering: [String]? = existenceOnly ? [] : nil
+        case .index(let index, let boundsList, let planCovering):
+            // Index-only serving with NO table descent in two cases:
+            //   • existence-only (an existence-only join inner): `coveringIncludes: []`
+            //     selects the no-descent branch and serves an (unread) empty-ish span;
+            //     the rowid comes from the key and the caller reads no inner column.
+            //   • F4 covering scan: the binder proved every needed base-table column is
+            //     the rowid-alias or an INCLUDE column, so serve them from the entry
+            //     value via the index's FULL `includes` layout. Existence-only wins when
+            //     both apply (it reads nothing, so the smaller [] is sufficient).
+            let covering: [String]? = existenceOnly ? [] : planCovering
             for bounds in boundsList {
                 let (lower, upper) = try Relation.scanBounds(bounds, index: index, table: table)
                 var cursor = try RowCursor(
@@ -531,11 +551,11 @@ enum SelectExecutor {
             return .table
         case .rowid(let exprs):
             return .rowids(try evaluateRowids(exprs, env))
-        case .index(_, let probes, _):
+        case .index(_, let probes, _, let covering):
             guard let index else { return .table }
             switch try buildIndexBounds(probes, index: index, table: table, env: env) {
-            case .scan: return .table
-            case .bounds(let list): return .index(index, list)
+            case .scan: return .table  // unconvertible probe degraded to a scan: read full rows
+            case .bounds(let list): return .index(index, list, covering: covering)
             }
         case .fts(let name, let queryExpr, let weights):
             guard let record = ftsRecords[name] else {
