@@ -17,8 +17,13 @@ package struct TempDir: Sendable {
     package func cleanup() {
         guard let dir = opendir(path) else { return }
         while let entry = readdir(dir) {
-            let name = withUnsafeBytes(of: entry.pointee.d_name) { raw in
-                String(cString: raw.bindMemory(to: CChar.self).baseAddress!)
+            // Read d_name in place via a pointer, never by copying the whole fixed-size
+            // field: readdir's dirent occupies only d_reclen bytes, so a by-value read of
+            // the entire 1024-byte d_name array over-reads the directory stream's buffer
+            // when the record sits at its end (a heap-buffer-overflow ASan flags).
+            // String(cString:) stops at the NUL, which is within the record's real bytes.
+            let name = withUnsafePointer(to: &entry.pointee.d_name) { ptr in
+                String(cString: UnsafeRawPointer(ptr).assumingMemoryBound(to: CChar.self))
             }
             if name == "." || name == ".." { continue }
             _ = unlink(path + "/" + name)
