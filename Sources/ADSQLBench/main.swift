@@ -24,6 +24,12 @@ import Foundation
 // carry the F6 denorm columns) to ALSO measure `searchPagesFramedDenorm` at real
 // scale — the decisive "does F6 cross SQLite" arm (RFC 0010 §2.2-2.4 "F6").
 
+// Line-buffer stdout so progress prints (corpus build, per-step latency) flush LIVE
+// even when redirected to a file. Fully-buffered output otherwise withholds them until
+// the buffer fills or the process exits — which can make a long-but-progressing run
+// (e.g. a large read battery) look like a stuck build until it's killed.
+setvbuf(stdout, nil, _IOLBF, 0)
+
 var config = BenchConfig()
 var engines = ["adsql", "sqlite"]
 var scenarios: [String] = []

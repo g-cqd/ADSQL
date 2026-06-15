@@ -359,15 +359,24 @@ first; the **perf features** then make it *beat* SQLite — the reason for the s
   > real levers remain large: cover the join inner for the sort/filter columns (descend only for the top-k
   > projection), or the deferred VDBE.
   >
-  > **Validating the thesis is now DOUBLY BLOCKED (2026-06-15).** The only regime where ADSQL could win is
-  > a ≥4 GB working set under concurrency (SQLite saturating memory bandwidth). But (a) no ≥4 GB corpus is
-  > on disk (the real one lives in the apple-docs repo; the `INT` cross-repo wire-up is deferred), and (b)
-  > **building one synthetically is impractical in-loop** — a `search --rows 150000` (~1.7 GB) synthetic
-  > build did **not finish in >8.5 min** (ADSQL's ~7× FTS-build cost, scorecard ⚠️, dominates). So the
-  > **FTS-build-throughput gap is no longer just "off the read path" — it is the practical blocker to
-  > *proving* the read path wins.** Paths forward: build a large corpus ONCE in the background and persist
-  > it for fast read-benching (in flight), or raise FTS-build throughput (raw-segment postings — backlog A)
-  > so large test corpora are buildable. Until one lands, "beats SQLite" cannot be settled.
+  > **Validating the thesis needs a ≥4 GB working set under concurrency** (SQLite saturating memory
+  > bandwidth) — the only regime where ADSQL could win. The one real blocker is corpus availability: no
+  > ≥4 GB corpus is on disk (the real one lives in the apple-docs repo; the `INT` cross-repo wire-up is
+  > deferred). **(Correction, supersedes a 2026-06-15 mis-diagnosis):** an earlier note here claimed the
+  > FTS *build* was O(n²) and blocked building a large synthetic corpus — that was a **stdout-buffering
+  > artifact**: the bench's "corpus build" line is fully buffered, so killing a run before it flushed made
+  > the build look stuck. Sampling proved a 20k-doc build completes in **<9 s** (the process was already in
+  > the read phase). The 150k run's ~18 min was its **200-iteration single-thread read battery on a ~1.7 GB
+  > corpus**, not the build (stdout is now line-buffered + the synthetic iters scale to 25 for big `--rows`,
+  > so this is observable + faster). A clean 150k run then exposed TWO real facts: (1) the ADSQL FTS build is
+  > **~30× slower than SQLite** (106 s vs 3.5 s; mildly super-linear — worse than the 7× scorecard, though
+  > off the read path), and (2) **the synthetic corpus is UNREPRESENTATIVE for the thesis** — its `/search`
+  > matches a huge doc fraction (single-thread p50 **184–514 ms at 150k** vs ~25 ms on the real 0.5 GB corpus,
+  > where matches are ~2%), so it can NOT proxy the real corpus's memory-bandwidth behaviour. **Net: the
+  > synthetic size-sweep is a dead end for the headline.** Settling "beats SQLite" requires the REAL
+  > apple-docs corpus (4 GB, realistic match distribution) — via the deferred `INT` cross-repo wire-up, or
+  > importing the real apple-docs SQLite `.db` through F1. Until then the headline stays UNVERIFIED, and at
+  > the only realistic on-disk scale (0.5 GB) ADSQL loses ~5×.
 
   **Real-scale verdict (claimed earlier — now UNVERIFIED, see the flag above):** ADSQL(F6-denorm)
   **BEAT SQLite** — **179 vs 101 req/s** at 8-way (ADSQL scales 6.3×; SQLite ceilings 1.4×, peak 131@4

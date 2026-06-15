@@ -537,10 +537,15 @@ enum SearchPagesScenario {
         }
         precondition(warmRows > 0, "adsql workload returned no rows — corpus/query mismatch")
 
+        // Iters scale DOWN for a large corpus (each /search is slow then): the 200-iter
+        // default suits the small cache-resident default; a big `--rows` thesis run uses
+        // the real-corpus count so the battery doesn't dominate (200×16×tens-of-ms = min).
+        let iters = rows >= 100_000 ? realSingleThreadIterations : singleThreadIterations
+
         // Original §2.2 framed path.
         var original = LatencyHistogram()
-        original.reserve(SearchWorkload.params.count * singleThreadIterations)
-        for _ in 0..<singleThreadIterations {
+        original.reserve(SearchWorkload.params.count * iters)
+        for _ in 0..<iters {
             for params in SearchWorkload.params {
                 let start = nowNanos()
                 let bytes = try searchPagesFramed(db, params)
@@ -552,8 +557,8 @@ enum SearchPagesScenario {
 
         // F6 denorm framed path (`searchPagesFramedDenorm`) — the before/after arm.
         var denorm = LatencyHistogram()
-        denorm.reserve(SearchWorkload.params.count * singleThreadIterations)
-        for _ in 0..<singleThreadIterations {
+        denorm.reserve(SearchWorkload.params.count * iters)
+        for _ in 0..<iters {
             for params in SearchWorkload.params {
                 let start = nowNanos()
                 let bytes = try searchPagesFramedDenorm(db, params)
@@ -570,9 +575,10 @@ enum SearchPagesScenario {
         for params in SearchWorkload.params { warmRows += conn.frameRowCount(params) }
         precondition(warmRows > 0, "sqlite workload returned no rows — corpus/query mismatch")
 
+        let iters = rows >= 100_000 ? realSingleThreadIterations : singleThreadIterations
         var histogram = LatencyHistogram()
-        histogram.reserve(SearchWorkload.params.count * singleThreadIterations)
-        for _ in 0..<singleThreadIterations {
+        histogram.reserve(SearchWorkload.params.count * iters)
+        for _ in 0..<iters {
             for params in SearchWorkload.params {
                 let start = nowNanos()
                 let bytes = conn.frameBytes(params)
