@@ -129,7 +129,7 @@ cell `[u8 tag][payload]`: `0`=NULL, `1`=INT `[i64 LE]`, `2`=REAL `[f64 LE]`, `3`
 
 | Feature | State | ADSQL seam it builds on / where it lands |
 |---|---|---|
-| **F0** Linux x64/arm64 **[GATE]** | **⏳ BUILDS (x64+arm64) ✅** | Glibc forks landed (imports, `fdatasync`/`fsync`/`posix_fallocate`/`posix_fadvise`, `clonefile`→byte-copy, XSI `strerror_r`, `pthread_t`/`CDispatch`); `swift build` green on both arches in CI. Remaining: `swift test` must pass on Linux (runtime validation of the forks), then flip the lane to required |
+| **F0** Linux x64/arm64 **[GATE]** | **✅ DONE** | Glibc forks landed; **`swift build` + the full `swift test` differential suite pass on x64+arm64** in CI — runtime-validated (clonefile→byte-copy snapshot, `fdatasync`/`fsync`, `posix_fallocate`, the cross-process reader table, XSI `strerror_r`). The CI lane stays advisory only because it tracks the moving nightly tag (the manifest needs 6.3 features); pin + require once a stable ≥6.3 toolchain ships |
 | **INT** `ad_storage_*` engine swap **[GATE]** | **ABSENT** | implement the frozen `ad_storage_search_pages` ABI (= A3 `searchFramed`) so ADSQL replaces `CSQLiteShim`/libsqlite3 inside `libAppleDocsCore` |
 | **F1** SQLite importer **[GATE]** | **✅ DONE** | `ADSQLImport` target: `Database.importSQLite(from:manifest:)` + `adsql import`; schema port + coercion + index/PK/UNIQUE port + manifest FTS5 rebuild + deep integrity; idempotent, deterministic |
 | **F2** FTS byte-parity | **✅ LANDED** | bm25f score parity **+ ranked-order parity** (ties → ascending rowid via the bounded-top-N upper-bound fix) proven through the importer vs SQLite FTS5 — `ImportedFTSParityTests.swift`, default + 5-weight |
@@ -152,9 +152,10 @@ wiring + a thin accelerated API surface**, not new engine internals.
 
 ## 4. Part I — the swap gate (P0)
 
-### F0 — Linux x64/arm64 **[THE #1 GATE]** · ABSENT
-ADSQL's storage engine is Darwin-specific while apple-docs is first-class Linux, so this is the largest
-single gate item. Port surface (behind a small platform shim):
+### F0 — Linux x64/arm64 **[THE #1 GATE]** · ✅ DONE
+ADSQL's storage engine was Darwin-specific; the Glibc port now **builds + passes the full `swift test`
+differential suite on x64 + arm64** (CI lane advisory only while it tracks the moving nightly tag). The
+port surface that was addressed (behind a small platform shim):
 - **IO** — `mmap`/`munmap`/`msync` are POSIX (portable); the Darwin-only calls to replace are
   `fcntl(F_BARRIERFSYNC)` (→ `fdatasync`/`sync_file_range`), `F_FULLFSYNC` (→ `fsync`), `F_NOCACHE`
   (→ `posix_fadvise(POSIX_FADV_DONTNEED)`), and APFS `clonefile` for O(1) snapshots (→ no CoW clone on
@@ -294,8 +295,9 @@ first; the **perf features** then make it *beat* SQLite — the reason for the s
 
 - **P0a — adoption gate (all must hold before a swap):** ✅ **F1** importer · ✅ **F2** FTS byte-parity ·
   ✅ **main-query surface parity** (`AppleDocsMainQueryTests` — §2.2–2.4 byte-identical; `json_each` via the
-  contracted `inJSONEach`, not RFC 0011) · **F0** Linux x64/arm64 (the #1 open blocker) · **INT** the
-  `ad_storage_*` engine swap. Until these hold, apple-docs cannot run on ADSQL.
+  contracted `inJSONEach`, not RFC 0011) · ✅ **F0** Linux x64/arm64 (builds + full suite green on
+  x64+arm64) · **INT** the `ad_storage_*` engine swap — **the last remaining gate item**. Until these
+  hold, apple-docs cannot run on ADSQL.
 - **P0b — read-path perf (why the swap is worth it):** **F6** build-time denormalization (inside F1) →
   **F4** covering serve *(in progress)* → **F5** streaming zero-copy scan.
 - **P1 — boundary collapse:** **A1** search primitive → **A2** caller encoder → **A3** one-call framed

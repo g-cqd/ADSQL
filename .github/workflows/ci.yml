@@ -52,16 +52,16 @@ jobs:
       - name: Test (SQLite-differential suite)
         run: swift test
 
-  # Linux build + test lane (port, RFC 0010 F0 — the #1 apple-docs adoption gate). ADSQL was
-  # Darwin-only; this lane is the actual Linux verification (the port is developed on macOS, which
-  # cannot build for Linux locally). The build now passes on x64 + arm64; this adds `swift test` to
-  # validate runtime behaviour of the Glibc forks (the clonefile->copy snapshot fallback, fdatasync
-  # barriers, posix_fallocate, the cross-process reader table) — the durability/correctness gate.
+  # Linux build + test lane (RFC 0010 F0 — the #1 apple-docs adoption gate). ADSQL was Darwin-only;
+  # this lane is the actual Linux verification (the port is developed on macOS, which cannot build for
+  # Linux locally). `swift build` + the full `swift test` differential suite PASS on x64 + arm64 — the
+  # Glibc forks (clonefile->copy snapshot, fdatasync/fsync barriers, posix_fallocate, the cross-process
+  # reader table, XSI strerror_r) are validated at runtime, so F0 is functionally done.
   #
-  # NON-BLOCKING FOR NOW (`continue-on-error: true`): test-target compile + runtime differences are
-  # iterated here, so an in-progress port never reddens the overall CI signal.
-  # TODO(RFC 0010 F0): once build + test is reliably green on Linux, drop `continue-on-error` so the
-  # Linux lane becomes a required gate.
+  # STILL ADVISORY (`continue-on-error: true`) for one reason: this lane must track the MOVING
+  # `nightly-jammy` tag (see Toolchain below), so a required gate would let an unrelated bad nightly
+  # redden main. TODO(RFC 0010 F0): pin a dated nightly (or a stable >= 6.3 release) and drop
+  # `continue-on-error` to make Linux a required gate.
   #
   # Toolchain: the manifest is `swift-tools-version: 6.3` and uses `.strictMemorySafety()` (SE-0458)
   # plus the experimental `Lifetimes` feature (SE-0446/0456), so the Linux toolchain must be recent
@@ -69,7 +69,7 @@ jobs:
   # version and cannot even parse Package.swift; the nightly image tracks the development toolchain
   # that ships these features. Pin to a dated nightly tag once the features land in a stable release.
   linux:
-    name: Build (Linux, ${{ matrix.arch }})
+    name: Build & test (Linux, ${{ matrix.arch }})
     continue-on-error: true
     runs-on: ${{ matrix.runner }}
     container: swiftlang/swift:nightly-jammy
