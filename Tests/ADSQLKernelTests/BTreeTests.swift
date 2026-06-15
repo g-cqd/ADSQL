@@ -180,6 +180,73 @@ struct BTreeModelTests {
         }
     }
 
+    /// Covers the **BORROW / redistribute** rebalance path (`rebalancePair`'s `else`
+    /// branch + `replaceSeparator`) — which uniform churn can't reach (it depletes the
+    /// siblings too). Two source-derived conditions must hold: (1) a node is "underfull"
+    /// only when `payloadBytes < usablePageSize/4`, so a single cell must be *clearly*
+    /// under a quarter page — i.e. ≥5 cells per leaf (with exactly 4, each cell ≈ ¼ page
+    /// and a 1-cell leaf never underflows); (2) the underfull node + a FULL sibling must
+    /// exceed one page so they cannot merge. Sequential inserts pack each leaf full via
+    /// the append-bias split, so leaf K holds keys [CK..CK+C-1] for the per-leaf capacity
+    /// C (calibrated from `validate`'s `leafCount`, not guessed). Emptying an INTERIOR
+    /// leaf to one cell hits the left-target borrow (move right sibling's first cell in);
+    /// emptying the LAST leaf to one cell hits the right-target borrow (no right sibling →
+    /// move the left sibling's last cell in). Both verified byte-identical to the model.
+    /// (The branch-level borrow — an internal node underflowing — needs a depth-3 tree and
+    /// remains a coverage gap.)
+    @Test func borrowRedistributeMatchesModel() throws {
+        let kernel = MemKernel()
+        var model = ModelStore()
+        let count = 60
+        let valueSize = 2800  // cell < usablePageSize/4 ⇒ ≥5 cells/leaf (1-cell leaf underflows)
+
+        func key(_ i: Int) -> [UInt8] {
+            let n = String(i)
+            return Array(("k-" + String(repeating: "0", count: 4 - n.count) + n).utf8)
+        }
+        var ctx = kernel.begin()
+        for i in 0..<count {
+            let value = [UInt8](repeating: UInt8(i & 0xFF), count: valueSize)
+            try put(ctx, key(i), value)
+            model.put(key(i), value)
+        }
+        kernel.commit(ctx)
+        #expect(kernel.meta.treeDepth >= 2, "must force a branch level")
+
+        // Calibrate the per-leaf capacity C from the (append-bias) full leaves.
+        let leaves = Int(try BTree.validate(resolver: CommittedResolver(source: kernel), meta: kernel.meta).leafCount)
+        let capacity = (count + leaves - 1) / leaves  // ceil(count / leaves)
+        #expect(capacity >= 5, "value size must yield ≥5 cells/leaf so a 1-cell leaf underflows")
+        #expect(leaves >= 4, "need an interior leaf with full neighbours plus a distinct last leaf")
+
+        // Empty interior leaf 2 ([2C..3C-1] → keep 2C) AND the last leaf
+        // ([(L-1)C..count-1] → keep (L-1)C) each down to a single cell. The interior one
+        // borrows from its right sibling (left-target); the last one, lacking a right
+        // sibling, borrows from its left sibling (right-target).
+        func emptyLeafToOneCell(firstKey base: Int) throws {
+            // Delete the run of keys sharing this leaf — [base+1 .. base+capacity-1],
+            // clamped to `count` — leaving only `base`. The final delete underflows it.
+            ctx = kernel.begin()
+            for i in (base + 1)..<min(base + capacity, count) where model.get(key(i)) != nil {
+                #expect(try del(ctx, key(i)))
+                _ = model.delete(key(i))
+            }
+            kernel.commit(ctx)
+        }
+        try emptyLeafToOneCell(firstKey: 2 * capacity)  // interior → left-target borrow
+        try emptyLeafToOneCell(firstKey: (leaves - 1) * capacity)  // last → right-target borrow
+
+        let resolver = CommittedResolver(source: kernel)
+        let report = try BTree.validate(resolver: resolver, meta: kernel.meta)
+        #expect(report.kvCount == UInt64(model.count))
+        let scanned = try scanAll(resolver, kernel.meta)
+        let expected = model.sortedPairs()
+        #expect(scanned.map(\.key) == expected.map(\.key))
+        #expect(scanned.map(\.value) == expected.map(\.value))
+        #expect(try get(resolver, kernel.meta, key(2 * capacity)) == model.get(key(2 * capacity)))
+        #expect(try get(resolver, kernel.meta, key(2 * capacity + 1)) == nil)
+    }
+
     @Test func sequentialInsertsGrowDepthAndStaySorted() throws {
         let kernel = MemKernel()
         var ctx = kernel.begin()
