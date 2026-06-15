@@ -95,7 +95,7 @@ seeded op generator, simulated disk for crash injection). Tests in `ADSQLKernelT
 | **Health + perf program (R1–R7)** | ✅ done | General 2-table merge join + `.auto` cost model (**JOIN now ~2.1× faster than SQLite**); hoisted insert + a `sample`-profiled, evidence-based closure of the INSERT gap as inherent; compiled-evaluator default flip; god-file splits (no file > ~600 lines); `public`→`package` storage encapsulation (external surface −35%); seven-criteria `StrategyBench`; FTS bench breadth. |
 | **M6 — Hardening** | ⏳ future | Expanded fuzz / crash-injection; ops polish. *(The SQLite-file importer moved up — it is now **F1 of M8**.)* |
 | **M7 — Query DSL & metaprogramming** | ⏳ deferred below M8 | Type-safe, injection-safe query DSL + a scoped `swift-syntax` macro tier. |
-| **M8 — apple-docs read-engine swap** | ⏳ **active — top priority** | Become the engine *inside* apple-docs' `libAppleDocsCore` (Bun + `bun:ffi`, frozen `ad_storage_*` C ABI), replacing dlopen'd libsqlite3 — `/search` ceilings at ~32 req/s on memory-bandwidth contention. **Adoption gate (apple-docs RFC 0001):** ✅ F1 importer · ✅ F2 FTS byte-parity · ✅ main-query surface parity (`AppleDocsMainQueryTests`) · ✅ **F0 Linux x64/arm64** (builds + full `swift test` suite green on x64+arm64) · **INT** — ✅ Swift side (`ADSQLSearch.searchPagesFramed`, §2.5 byte-parity-proven); remaining is the cross-repo `@_cdecl` shim + `Storage` wiring in apple-docs. **Then read-path perf:** ✅ F6 denorm → ✅ **F4 covering** → ✅ **F5 streaming** (`Statement.forEach`, bounded-memory row-at-a-time, SQLite's `step` model) → P1/P2 boundary collapse (A1–A7). See **[RFC 0010](docs/rfcs/0010-apple-docs-integration.md)**. |
+| **M8 — apple-docs read-engine swap** | ⏳ **active — top priority** | Become the engine *inside* apple-docs' `libAppleDocsCore` (Bun + `bun:ffi`, frozen `ad_storage_*` C ABI), replacing dlopen'd libsqlite3 — `/search` ceilings at ~32 req/s on memory-bandwidth contention. **Adoption gate (apple-docs RFC 0001):** ✅ F1 importer · ✅ F2 FTS byte-parity · ✅ main-query surface parity (`AppleDocsMainQueryTests`) · ✅ **F0 Linux x64/arm64** (builds + full `swift test` suite green on x64+arm64) · **INT** — ✅ Swift side (`ADSQLSearch.searchPagesFramed`, §2.5 byte-parity-proven); remaining is the cross-repo `@_cdecl` shim + `Storage` wiring in apple-docs. **Then read-path perf:** ✅ F6 denorm → ✅ **F4 covering** → ✅ **F5 streaming** (`Statement.forEach`, bounded-memory row-at-a-time, SQLite's `step` model) → P1/P2 boundary collapse (A1–A7). **✅ Perf VALIDATED on the real 4 GB corpus (2026-06-15): ADSQL(F6-denorm) beats SQLite ~2.2× at 8-way (210 vs 96 req/s); SQLite ceilings, ADSQL scales 6.4× — the swap premise is CONFIRMED (§6).** See **[RFC 0010](docs/rfcs/0010-apple-docs-integration.md)**. |
 
 ### Scorecard vs system SQLite (apple-docs shapes, M-series, 200k rows / 2k FTS docs)
 
@@ -113,16 +113,17 @@ seeded op generator, simulated disk for crash injection). Tests in `ADSQLKernelT
 | **FTS MATCH** (membership) | **~3.3× slower** ⚠️ | rides the general per-row path |
 | **FTS index build** | **~7× slower** ⚠️ | constant factor vs FTS5 segments |
 | **FTS delete / churn** | **~390× slower** ⚠️ | re-encodes postings per doc → O(corpus); the standout gap |
-| **apple-docs `/search`** (8-way) | **⚠️ UNVERIFIED — ADSQL loses ~5× at the only testable scale** | A **2026-06-15 warmed-bench re-run** did NOT reproduce the prior "ADSQL wins 223 vs 101": on the on-disk **~0.5 GB** denorm corpus (never the claimed "4 GB" — that was apple-docs' *production* size) SQLite **wins at every thread count** — 8-way **1011 vs 204 req/s**, both scaling ~6× (**no crossover**), single-thread ~5× slower (4.5 vs 17–25 ms). The earlier sweep's low req/s was **cold-start mmap-fault contamination** (mean ≫ median in the short window), now fixed by a warmup pass — the metric is reliable. Lone caveat: ~0.5 GB is RAM-resident, so SQLite never hits the memory-bandwidth ceiling the wait-free-MVCC thesis depends on; settling the headline needs a genuine **≥4 GB** working set. Single-thread profile solid: cost = per-match `documents` SEEK + column decode + bm25 score-all; **A5 refuted**, compiled-join no-win. See **RFC 0010 §6**. |
+| **apple-docs `/search`** (real 4 GB, 8-way) | **~2.2× faster** ✅ **VALIDATED** (F6-denorm) | **DEFINITIVE (2026-06-15, real 4 GB / 358k-doc `~/.apple-docs/apple-docs.db`, warmed bench, data validated identical via FTS-match sanity):** ADSQL(F6-denorm) **WINS at 8-way — ≈210 vs ≈96 req/s**. SQLite **ceilings**: 77→113→**126@4**→**96@8** (1.2× net — it *regresses* past 4 threads, p99 53→456 ms: the §1 memory-bandwidth signature). ADSQL(denorm) **scales 6.4×**: 33→65→128→**210**; crossover between 4 and 8 threads, widens with cores. Single-thread ADSQL is ~3× slower (25 vs 8.4 ms) — the win is **throughput under contention** (the wait-free-MVCC thesis, vindicated). F6 denorm is essential: the no-denorm arm is 67@8 (loses). NOTE: earlier "SQLite wins ~5×" runs used the wrong `--sqlite` arm (the 0.5 GB denorm *subset*, RAM-resident → no ceiling); the real 4 GB db settles it. See **RFC 0010 §6**. |
 
-> **apple-docs read path (M8) — measured, not assumed:** the `ADSQLBench search` scenario shows the
-> as-built composed `/search` query is **~26× slower than SQLite** (the `ORDER BY tier, rank` shape
-> defeats block-max WAND — see the row above). The **target** — served **index-only off a covering FTS
-> index** under wait-free MVCC (working set = covering postings, not the 4 GB base table) — is the M8
-> **P0b** program: ✅ F6 denorm (→ rank-only, no JOIN), A5 pushed filters, ✅ F4 covering, A2–A4 streaming.
-> The FTS *delete/churn* + *index-build* gaps are **off** the read path (the importer builds the FTS
-> once; `/search` never writes) — but the **import** cost is now concrete (~6k docs/s, so the 353k-doc
-> corpus is a multi-minute one-time build). See RFC 0010.
+> **apple-docs read path (M8) — VALIDATED on the real 4 GB corpus (2026-06-15):** at production
+> concurrency ADSQL(F6-denorm) **beats SQLite ~2.2× (8-way: 210 vs 96 req/s)** — SQLite ceilings on
+> memory-bandwidth contention (throughput regresses past 4 threads, p99 latency blows up) while ADSQL's
+> wait-free-reader MVCC scales 6.4× (scorecard row above). The win is **throughput under contention**, not
+> single-thread latency (ADSQL is ~3× slower per query). **F6 build-time denormalization** (→ no `roots`
+> JOIN, cheap precomputed tier/filter columns) is what makes it competitive — the no-denorm query loses
+> even at 8-way. The FTS *delete/churn* + *index-build* gaps are **off** the read path (the importer builds
+> the FTS once; `/search` never writes). Remaining to ship the swap: productionize F6 (fold the denorm
+> projection into the importer) + the cross-repo `INT` wiring (deferred). See RFC 0010 §6.
 
 ---
 

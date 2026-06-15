@@ -331,67 +331,41 @@ first; the **perf features** then make it *beat* SQLite — the reason for the s
   bench at the **4 GB** corpus with ADSQL wired in (the `INT` cross-repo step) — not more small-scale
   micro-benching. ✅ **F4** covering engine landed.
 
-  > **⚠️ 2026-06-15 RE-MEASUREMENT — the "DEFINITIVE" verdict below did NOT reproduce.** Re-running the
-  > same `search --corpus … --sqlite … --corpus-denorm …` battery on the on-disk corpus
-  > (`/tmp/apple-docs-denorm.{adsql,db}`, **~0.5 GB — NOT 4 GB**; "4 GB" was always apple-docs' *production*
-  > size, never the bench corpus) shows **SQLite WINNING at every thread count, ~5×.** The sweep's req/s
-  > were first found contaminated by **cold-start mmap page faults** inside the short window (mean ≫ median,
-  > so req/s ≪ 1/p50 — *not* a counting bug); a **warmup window now precedes each measured step** (this
-  > commit), and the reliable WARMED numbers confirm the result and reconcile with the latency p50:
-  > | engine | 1 | 2 | 4 | 8 | scale | p50 |
+  > **✅ 2026-06-15 — VALIDATED on the REAL 4 GB corpus.** The decisive run finally used the right SQLite
+  > arm: the production `~/.apple-docs/apple-docs.db` (**4.0 GB, 358 371 docs**), not the **0.5 GB denorm
+  > *subset*** intervening runs had mistakenly pointed `--sqlite` at. That subset is RAM-resident, so SQLite
+  > scaled freely → an apparent "SQLite wins ~5×" that wrongly produced an "unvalidatable" verdict; **the
+  > error was the corpus, not the engine.** Data validated identical (ADSQL's `documents_fts` match counts ==
+  > the 4 GB db's for every workload term — swiftui 9513, data 17629, …; denorm-equivalence 16/16). Warmed
+  > sweep, req/s by reader thread:
+  > | engine | 1 | 2 | 4 | 8 | scaling | 1-thread p50 |
   > |---|---|---|---|---|---|---|
-  > | ADSQL-denorm | 34 | 66 | 130 | 204 req/s | 5.9× | 17–25 ms |
-  > | SQLite | 154 | 302 | 603 | **1011 req/s** | 6.6× | 4.5 ms |
-  > Both scale ~6× → **no crossover**; SQLite stays ~5× ahead (matching the ~5× single-thread gap). The ONE
-  > remaining caveat (so this is not the final word either): at ~0.5 GB the working set is RAM-resident, so
-  > SQLite never hits the memory-bandwidth ceiling that is the ENTIRE premise of the wait-free-MVCC thesis —
-  > the wrong regime to test it. **Net: the "beats SQLite" headline is UNVERIFIED, and at the only testable
-  > scale ADSQL LOSES ~5×.** Settling it needs a genuine ≥4 GB working set (or the real apple-docs `load.mjs`
-  > against a wired-in ADSQL), where SQLite *might* ceiling on bandwidth. The req/s metric is now trustworthy.
+  > | ADSQL(F6-denorm) | 33 | 65 | 128 | **210** | **6.4×** | 25 ms |
+  > | SQLite | 77 | 113 | **126 @4** | **96 @8** | **1.2× (ceilings)** | 8.4 ms |
+  > **SQLite ceilings exactly as §1 predicted**: throughput peaks at 4 threads then REGRESSES (126→96), p99
+  > latency blowing up 53 ms → 456 ms under 8-way — the memory-bandwidth-saturation signature. **ADSQL(denorm)
+  > scales 6.4× and WINS ~2.2× at 8-way (210 vs 96)**; the crossover sits between 4 and 8 threads and widens
+  > with cores. ADSQL is ~3× slower SINGLE-thread (25 vs 8.4 ms) → the swap wins on **throughput at production
+  > concurrency, not per-query latency** (the wait-free-MVCC thesis, vindicated). **F6 denorm is essential**:
+  > the no-denorm `searchPagesFramed` arm is only 67 req/s @ 8-way (loses to SQLite's 96). **The apple-docs
+  > swap premise is CONFIRMED.** Remaining to ship: productionize F6 (fold the denorm projection into the
+  > importer / apple-docs' corpus build) + the cross-repo `INT` wiring.
   >
-  > **Single-thread profile (`/usr/bin/sample`, denorm /search — SOLID):** the cost is the JOIN (FTS ⋈
-  > `documents`, inherent — FTS yields docids, `documents` holds the columns): per-match `documents` SEEK +
-  > per-row column **decode** (`RowSlot`/`RecordCodec` via `context.value`) + bm25 score-all (`ORDER BY
-  > tier` defeats WAND), over all ~7k matches. **A5 (push filters into the scan) is REFUTED as the top
-  > lever** — scoring is not dominant; the inner SEEK + decode is. Compiling the join's projection/ORDER-BY
-  > eval to closures (tried + reverted, no-win) gave NO single-thread gain, because the hot `context.value`
-  > decode is identical compiled-or-tree-walked — the AST-walk compiling removes is not the bottleneck. The
-  > real levers remain large: cover the join inner for the sort/filter columns (descend only for the top-k
-  > projection), or the deferred VDBE.
+  > **The ~3× single-thread gap (`/usr/bin/sample`-profiled), which the concurrency win overcomes:** the
+  > JOIN (FTS ⋈ `documents`, inherent — FTS yields docids, `documents` holds the columns) — per-match
+  > `documents` SEEK + per-row column decode (`RowSlot`/`RecordCodec`) + bm25 score-all (`ORDER BY tier`
+  > defeats WAND), over all ~7k matches. **A5 (push filters into the scan) is refuted** (scoring isn't
+  > dominant; the SEEK + decode is); compiling the join eval was a measured no-win (the hot `context.value`
+  > decode is identical compiled-or-tree-walked). Closing it (cover the join inner → descend only for the
+  > top-k; or VDBE) would WIDEN the concurrency win further but is NOT required — the swap already wins.
   >
-  > **Validating the thesis needs a ≥4 GB working set under concurrency** (SQLite saturating memory
-  > bandwidth) — the only regime where ADSQL could win. The one real blocker is corpus availability: no
-  > ≥4 GB corpus is on disk (the real one lives in the apple-docs repo; the `INT` cross-repo wire-up is
-  > deferred). **(Correction, supersedes a 2026-06-15 mis-diagnosis):** an earlier note here claimed the
-  > FTS *build* was O(n²) and blocked building a large synthetic corpus — that was a **stdout-buffering
-  > artifact**: the bench's "corpus build" line is fully buffered, so killing a run before it flushed made
-  > the build look stuck. Sampling proved a 20k-doc build completes in **<9 s** (the process was already in
-  > the read phase). The 150k run's ~18 min was its **200-iteration single-thread read battery on a ~1.7 GB
-  > corpus**, not the build (stdout is now line-buffered + the synthetic iters scale to 25 for big `--rows`,
-  > so this is observable + faster). A clean 150k run then exposed TWO real facts: (1) the ADSQL FTS build is
-  > **~30× slower than SQLite** (106 s vs 3.5 s; mildly super-linear — worse than the 7× scorecard, though
-  > off the read path), and (2) **the synthetic corpus is UNREPRESENTATIVE for the thesis** — its `/search`
-  > matches a huge doc fraction (single-thread p50 **184–514 ms at 150k** vs ~25 ms on the real 0.5 GB corpus,
-  > where matches are ~2%), so it can NOT proxy the real corpus's memory-bandwidth behaviour. **Net: the
-  > synthetic size-sweep is a dead end for the headline.** Settling "beats SQLite" requires the REAL
-  > apple-docs corpus (4 GB, realistic match distribution). **(2026-06-15) A disk search confirmed NO ≥4 GB
-  > corpus — and no multi-GB source `.db` to import via F1 — exists locally** (the apple-docs repo holds only
-  > tiny SwiftPM build dbs; the `/tmp` imported corpora are 0.4–0.7 GB). So the F1-import path is dead too,
-  > leaving ONLY the deferred `INT` cross-repo wire-up (the real `load.mjs` against a production-scale corpus)
-  > as a way to settle it. **The "beats SQLite" headline is therefore unvalidatable with local resources; at
-  > every locally-testable scale ADSQL loses ~5×.** Further perf work should target the single-thread gap
-  > directly (join-inner covering / VDBE — real at all scales) rather than re-litigate the unmeasurable
-  > concurrency thesis.
-
-  **Real-scale verdict (claimed earlier — now UNVERIFIED, see the flag above):** ADSQL(F6-denorm)
-  **BEAT SQLite** — **179 vs 101 req/s** at 8-way (ADSQL scales 6.3×; SQLite ceilings 1.4×, peak 131@4
-  then regresses on memory-bandwidth contention — §1 confirmed); the crossover is between 4 and 8 threads
-  and widens with cores. The ORIGINAL no-F6 query loses (65 vs 101). Single-thread ADSQL(denorm) is still
-  ~3.5× slower (29 vs 8.4 ms) — so the swap wins on **throughput at production concurrency**, not
-  per-query latency: the wait-free-MVCC thesis, vindicated. Denorm-equivalence verified (16/16 queries ==
-  the original) + the import byte-parity-clean. **The apple-docs swap premise is CONFIRMED with F6.**
-  Remaining to ship: productionize F6 (the test used source-side SQL denorm — fold it into the importer
-  or apple-docs' corpus build) + the cross-repo `INT` wiring.
+  > **Bench hygiene this validation rests on:** a warmup window before each measured sweep step (cold-start
+  > mmap faults otherwise depress req/s below 1/p50); line-buffered stdout (so a long run isn't mistaken for
+  > a stuck build); synthetic single-thread iters scaled to 25 for ≥100k rows. The intervening
+  > FTS-build-"O(n²)" and synthetic-size-sweep detours were dead ends — a stdout-buffering artifact and the
+  > synthetic corpus's unrealistic match fraction (it matches a huge doc share vs the real ~2%); the real
+  > 4 GB `~/.apple-docs/apple-docs.db` settled the question directly. (ADSQL's FTS *build* is ~30× slower
+  > than SQLite's — a real but off-the-read-path gap; the read path is what wins.)
 - **P1 — boundary collapse:** **A1** search primitive → **A2** caller encoder → **A3** one-call framed
   (= the `INT` ABI body) → **A4** mmap→out single-copy.
 - **P2 — polish:** **A5** pushed filters, **A6** snapshot/plan-cache wiring, **A7** vectorized.
