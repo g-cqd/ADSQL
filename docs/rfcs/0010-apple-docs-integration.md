@@ -298,8 +298,17 @@ first; the **perf features** then make it *beat* SQLite — the reason for the s
   contracted `inJSONEach`, not RFC 0011) · ✅ **F0** Linux x64/arm64 (builds + full suite green on
   x64+arm64) · **INT** the `ad_storage_*` engine swap — **the last remaining gate item**. Until these
   hold, apple-docs cannot run on ADSQL.
-- **P0b — read-path perf (why the swap is worth it):** **F6** build-time denormalization (inside F1) →
-  **F4** covering serve *(in progress)* → **F5** streaming zero-copy scan.
+- **P0b — read-path perf (REQUIRED, not just "worth it"):** the `ADSQLBench search` bench (§1) measures
+  the as-built `searchPagesFramed` at **~26× slower than SQLite** (p50 148 ms vs 5.6 ms, 25k docs; both
+  scale with cores — ADSQL 5.0×, SQLite 6.3× at 8 threads — but ADSQL's per-query base is far slower).
+  Cause: **`ORDER BY tier, rank` defeats block-max WAND** (ADSQL scores every match, no LIMIT-20 early
+  termination), then JOINs `documents` + LEFT JOINs `roots` + evaluates 13 filters per match and
+  `.all()`-materializes. So these are **mandatory to beat SQLite**, biggest lever first: **F6** denormalize
+  the `tier` inputs (`title_lc`, an exact/prefix key) **+ fold `roots`** into `documents` at import ⇒ the
+  read query becomes **rank-only (WAND-eligible) with no JOIN** → **A5** push the typed filters into the
+  WAND scan → ✅ **F4** covering serve (engine landed — wire the FTS covering columns) → **A2–A4** stream
+  the §2.5 framing off the mmap (drop `.all()`) → **A1/A6** compiled `FTSSearchPlan` + per-connection plan
+  cache (no per-request prepare) → **F5** streaming scan. The `search` bench is the regression gate.
 - **P1 — boundary collapse:** **A1** search primitive → **A2** caller encoder → **A3** one-call framed
   (= the `INT` ABI body) → **A4** mmap→out single-copy.
 - **P2 — polish:** **A5** pushed filters, **A6** snapshot/plan-cache wiring, **A7** vectorized.

@@ -113,11 +113,16 @@ seeded op generator, simulated disk for crash injection). Tests in `ADSQLKernelT
 | **FTS MATCH** (membership) | **~3.3× slower** ⚠️ | rides the general per-row path |
 | **FTS index build** | **~7× slower** ⚠️ | constant factor vs FTS5 segments |
 | **FTS delete / churn** | **~390× slower** ⚠️ | re-encodes postings per doc → O(corpus); the standout gap |
+| **apple-docs `/search`** (composed, as-built) | **~26× slower** ⚠️ | the headline use case: `ORDER BY tier, rank` defeats WAND → scores all matches + JOIN + 13 filters + `.all()`; F6 denorm + A5 + F4 + A2–A4 required (M8 P0b). `ADSQLBench search` tracks it |
 
-> **apple-docs read path (M8):** served **index-only off a covering FTS index** under wait-free MVCC —
-> the working set is the covering postings, not the 4 GB base table, so the `.all()`-materialization
-> concern doesn't bite (bounded `LIMIT` 20–100 results). The FTS *delete/churn* and *index-build* gaps
-> are **off** the read path (the importer builds the FTS once; `/search` never writes). See RFC 0010.
+> **apple-docs read path (M8) — measured, not assumed:** the `ADSQLBench search` scenario shows the
+> as-built composed `/search` query is **~26× slower than SQLite** (the `ORDER BY tier, rank` shape
+> defeats block-max WAND — see the row above). The **target** — served **index-only off a covering FTS
+> index** under wait-free MVCC (working set = covering postings, not the 4 GB base table) — is the M8
+> **P0b** program: F6 denorm (→ rank-only, no JOIN), A5 pushed filters, F4 covering, A2–A4 streaming.
+> The FTS *delete/churn* + *index-build* gaps are **off** the read path (the importer builds the FTS
+> once; `/search` never writes) — but the **import** cost is now concrete (~6k docs/s, so the 353k-doc
+> corpus is a multi-minute one-time build). See RFC 0010.
 
 ---
 
