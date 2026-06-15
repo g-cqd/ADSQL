@@ -389,14 +389,49 @@ enum SQLFunctions {
             }
             return .text(CivilTime.utcNowString())
         case "JSON_EXTRACT":
-            try requireArgs(2...2)
-            let document = try arg(0)
-            let path = try arg(1)
-            guard case .text(let json) = document else { return .null }
-            guard case .text(let p) = path else {
-                throw DBError.sqlRuntime("json_extract path must be TEXT")
+            guard !star, args.count >= 2 else {
+                throw DBError.sqlBind("json_extract() takes at least 2 arguments")
             }
-            return try SQLJSON.extract(json, path: p)
+            let document = try arg(0)
+            if document.isNull { return .null }
+            var paths: [String] = []
+            paths.reserveCapacity(args.count - 1)
+            for index in 1..<args.count {
+                let p = try arg(index)
+                if p.isNull { return .null }
+                paths.append(SQLFunctions.textify(p))
+            }
+            let json = SQLFunctions.textify(document)
+            if paths.count == 1 { return try SQLJSON.extract(json, path: paths[0]) }
+            return try SQLJSON.extractMultiple(json, paths: paths)
+        case "JSON_TYPE":
+            try requireArgs(1...2)
+            let document = try arg(0)
+            if document.isNull { return .null }
+            var path: String? = nil
+            if args.count == 2 {
+                let p = try arg(1)
+                if p.isNull { return .null }
+                path = SQLFunctions.textify(p)
+            }
+            return try SQLJSON.type(SQLFunctions.textify(document), path: path)
+        case "JSON_VALID":
+            try requireArgs(1...1)
+            return SQLJSON.valid(try arg(0))
+        case "JSON_ARRAY_LENGTH":
+            try requireArgs(1...2)
+            let document = try arg(0)
+            if document.isNull { return .null }
+            var path: String? = nil
+            if args.count == 2 {
+                let p = try arg(1)
+                if p.isNull { return .null }
+                path = SQLFunctions.textify(p)
+            }
+            return try SQLJSON.arrayLength(SQLFunctions.textify(document), path: path)
+        case "JSON_QUOTE":
+            try requireArgs(1...1)
+            return try SQLJSON.quote(try arg(0))
         case "COUNT", "SUM":
             throw DBError.sqlBind("\(name)() is an aggregate and needs GROUP BY context")
         default:

@@ -1,264 +1,72 @@
-/// Minimal JSON support for json_extract and json_each: a strict
-/// no-Foundation parser plus SQLite's value-mapping rules (JSON null → SQL
-/// NULL, numbers → INTEGER/REAL, strings → TEXT, objects/arrays → their
-/// JSON text).
+import ADJSONCore
+
+/// SQLite-compatible JSON support, backed by ADJSON. ADJSON parses text → an immutable
+/// tape (lazy, non-materializing) and `SQLiteJSONPath` walks it with SQLite path
+/// semantics; this layer maps tape nodes to SQL `Value`s and renders containers using
+/// SQLite's number formatting (so `json_extract` on an object/array round-trips, and
+/// integers stay integers rather than becoming `Double`s).
 enum SQLJSON {
-    indirect enum Node: Equatable, Sendable {
-        case null
-        case bool(Bool)
-        case integer(Int64)
-        case real(Double)
-        case string(String)
-        case array([Node])
-        case object([(String, Node)])
-
-        static func == (l: Node, r: Node) -> Bool {
-            switch (l, r) {
-            case (.null, .null): return true
-            case (.bool(let a), .bool(let b)): return a == b
-            case (.integer(let a), .integer(let b)): return a == b
-            case (.real(let a), .real(let b)): return a == b
-            case (.string(let a), .string(let b)): return a == b
-            case (.array(let a), .array(let b)): return a == b
-            case (.object(let a), .object(let b)):
-                return a.count == b.count && zip(a, b).allSatisfy { $0.0 == $1.0 && $0.1 == $1.1 }
-            default: return false
-            }
-        }
-    }
-
     // MARK: - Parsing
 
-    static func parse(_ text: String) throws(DBError) -> Node {
-        var parser = Parser(bytes: Array(text.utf8))
-        let node = try parser.value()
-        parser.skipWhitespace()
-        guard parser.atEnd else { throw DBError.sqlRuntime("malformed JSON (trailing content)") }
-        return node
+    /// Parse JSON text to the lazy root node. The returned `JSON` retains its backing
+    /// `JSONDocument`, so it keeps the parse alive for navigation. Malformed input is a
+    /// runtime error (matching SQLite, which rejects ill-formed JSON in `json_extract`).
+    static func parse(_ text: String) throws(DBError) -> JSON {
+        do {
+            return try ADJSON.parse(text).root
+        } catch {
+            throw DBError.sqlRuntime("malformed JSON")
+        }
     }
 
-    struct Parser {
-        let bytes: [UInt8]
-        var i = 0
-
-        var atEnd: Bool { i >= bytes.count }
-
-        mutating func skipWhitespace() {
-            while i < bytes.count,
-                bytes[i] == 0x20 || bytes[i] == 0x09 || bytes[i] == 0x0A || bytes[i] == 0x0D
-            {
-                i += 1
-            }
-        }
-
-        mutating func value() throws(DBError) -> Node {
-            skipWhitespace()
-            guard i < bytes.count else { throw DBError.sqlRuntime("malformed JSON (empty)") }
-            switch bytes[i] {
-            case 0x7B: return try object()
-            case 0x5B: return try array()
-            case 0x22: return .string(try string())
-            case 0x74:  // true
-                try expect("true")
-                return .bool(true)
-            case 0x66:  // false
-                try expect("false")
-                return .bool(false)
-            case 0x6E:  // null
-                try expect("null")
-                return .null
-            default:
-                return try number()
-            }
-        }
-
-        mutating func expect(_ word: String) throws(DBError) {
-            let w = Array(word.utf8)
-            guard i + w.count <= bytes.count, Array(bytes[i..<i + w.count]) == w else {
-                throw DBError.sqlRuntime("malformed JSON (expected \(word))")
-            }
-            i += w.count
-        }
-
-        mutating func object() throws(DBError) -> Node {
-            i += 1  // {
-            var members: [(String, Node)] = []
-            skipWhitespace()
-            if i < bytes.count, bytes[i] == 0x7D {
-                i += 1
-                return .object([])
-            }
-            while true {
-                skipWhitespace()
-                guard i < bytes.count, bytes[i] == 0x22 else {
-                    throw DBError.sqlRuntime("malformed JSON (object key)")
-                }
-                let key = try string()
-                skipWhitespace()
-                guard i < bytes.count, bytes[i] == 0x3A else {
-                    throw DBError.sqlRuntime("malformed JSON (expected :)")
-                }
-                i += 1
-                members.append((key, try value()))
-                skipWhitespace()
-                guard i < bytes.count else { throw DBError.sqlRuntime("malformed JSON (unterminated object)") }
-                if bytes[i] == 0x2C {
-                    i += 1
-                    continue
-                }
-                if bytes[i] == 0x7D {
-                    i += 1
-                    return .object(members)
-                }
-                throw DBError.sqlRuntime("malformed JSON (object separator)")
-            }
-        }
-
-        mutating func array() throws(DBError) -> Node {
-            i += 1  // [
-            var items: [Node] = []
-            skipWhitespace()
-            if i < bytes.count, bytes[i] == 0x5D {
-                i += 1
-                return .array([])
-            }
-            while true {
-                items.append(try value())
-                skipWhitespace()
-                guard i < bytes.count else { throw DBError.sqlRuntime("malformed JSON (unterminated array)") }
-                if bytes[i] == 0x2C {
-                    i += 1
-                    continue
-                }
-                if bytes[i] == 0x5D {
-                    i += 1
-                    return .array(items)
-                }
-                throw DBError.sqlRuntime("malformed JSON (array separator)")
-            }
-        }
-
-        mutating func string() throws(DBError) -> String {
-            i += 1  // opening quote
-            var out: [UInt8] = []
-            while i < bytes.count {
-                let b = bytes[i]
-                if b == 0x22 {
-                    i += 1
-                    return String(decoding: out, as: UTF8.self)
-                }
-                if b == 0x5C {  // backslash
-                    i += 1
-                    guard i < bytes.count else { break }
-                    switch bytes[i] {
-                    case 0x22: out.append(0x22)
-                    case 0x5C: out.append(0x5C)
-                    case 0x2F: out.append(0x2F)
-                    case 0x62: out.append(0x08)
-                    case 0x66: out.append(0x0C)
-                    case 0x6E: out.append(0x0A)
-                    case 0x72: out.append(0x0D)
-                    case 0x74: out.append(0x09)
-                    case 0x75:  // \uXXXX (+ surrogate pairs)
-                        guard let scalar = try unicodeEscape() else {
-                            throw DBError.sqlRuntime("malformed JSON (\\u escape)")
-                        }
-                        out.append(contentsOf: Array(String(scalar).utf8))
-                        continue
-                    default:
-                        throw DBError.sqlRuntime("malformed JSON (escape)")
-                    }
-                    i += 1
-                    continue
-                }
-                out.append(b)
-                i += 1
-            }
-            throw DBError.sqlRuntime("malformed JSON (unterminated string)")
-        }
-
-        mutating func unicodeEscape() throws(DBError) -> Unicode.Scalar? {
-            func hex4() -> UInt32? {
-                guard i + 5 <= bytes.count else { return nil }
-                var v: UInt32 = 0
-                for k in 1...4 {
-                    let b = bytes[i + k]
-                    let digit: UInt32
-                    switch b {
-                    case 0x30...0x39: digit = UInt32(b - 0x30)
-                    case 0x41...0x46: digit = UInt32(b - 0x41 + 10)
-                    case 0x61...0x66: digit = UInt32(b - 0x61 + 10)
-                    default: return nil
-                    }
-                    v = v << 4 | digit
-                }
-                return v
-            }
-            guard let first = hex4() else { return nil }
-            i += 5
-            if first >= 0xD800, first <= 0xDBFF,
-                i + 1 < bytes.count, bytes[i] == 0x5C, bytes[i + 1] == 0x75
-            {
-                i += 1  // backslash; hex4 expects i at 'u'
-                if let second = hex4(), second >= 0xDC00, second <= 0xDFFF {
-                    i += 5
-                    let combined = 0x10000 + ((first - 0xD800) << 10) + (second - 0xDC00)
-                    return Unicode.Scalar(combined)
-                }
-                i -= 1
-            }
-            return Unicode.Scalar(first) ?? Unicode.Scalar(0xFFFD)
-        }
-
-        mutating func number() throws(DBError) -> Node {
-            let start = i
-            if i < bytes.count, bytes[i] == 0x2D { i += 1 }
-            var isReal = false
-            while i < bytes.count {
-                let b = bytes[i]
-                if b >= 0x30 && b <= 0x39 {
-                    i += 1
-                } else if b == 0x2E || b == 0x65 || b == 0x45 || b == 0x2B || b == 0x2D {
-                    isReal = true
-                    i += 1
-                } else {
-                    break
-                }
-            }
-            guard i > start else { throw DBError.sqlRuntime("malformed JSON (number)") }
-            let text = String(decoding: bytes[start..<i], as: UTF8.self)
-            if !isReal, let v = Int64(text) { return .integer(v) }
-            guard let d = Double(text) else { throw DBError.sqlRuntime("malformed JSON (number)") }
-            return .real(d)
+    private static func parsePath(_ path: String) throws(DBError) -> SQLiteJSONPath {
+        do {
+            return try SQLiteJSONPath(path)
+        } catch {
+            throw DBError.sqlRuntime("bad JSON path: \(path)")
         }
     }
 
     // MARK: - SQL mappings
 
-    /// SQLite json_extract value mapping.
-    static func toSQL(_ node: Node) -> Value {
-        switch node {
-        case .null: return .null
-        case .bool(let b): return .integer(b ? 1 : 0)
-        case .integer(let v): return .integer(v)
-        case .real(let d): return .real(d)
-        case .string(let s): return .text(s)
-        case .array, .object: return .text(render(node))
-        }
+    /// SQLite `json_extract` value mapping for a single lazy node: JSON null (and a
+    /// missing node) → SQL NULL, booleans → 0/1, numbers → INTEGER/REAL, strings → the
+    /// raw text (unquoted), and objects/arrays → their minified JSON text.
+    static func toSQL(_ json: JSON) -> Value {
+        if !json.exists || json.isNull { return .null }
+        if let b = json.bool { return .integer(b ? 1 : 0) }
+        if let i = json.int { return .integer(Int64(i)) }
+        if let d = json.double { return .real(d) }
+        if let s = json.string { return .text(s) }
+        return .text(render(json))  // object or array
     }
 
-    static func render(_ node: Node) -> String {
-        switch node {
-        case .null: return "null"
-        case .bool(let b): return b ? "true" : "false"
-        case .integer(let v): return String(v)
-        case .real(let d): return SQLFunctions.realToText(d)
-        case .string(let s): return renderString(s)
-        case .array(let items):
-            return "[" + items.map(render).joined(separator: ",") + "]"
-        case .object(let members):
-            return "{" + members.map { renderString($0.0) + ":" + render($0.1) }.joined(separator: ",") + "}"
+    /// Minified JSON text with SQLite's number formatting. Used for container results of
+    /// `json_extract`, for the elements of a multi-path extract, and by `json_quote`.
+    static func render(_ json: JSON) -> String {
+        if !json.exists || json.isNull { return "null" }
+        if let b = json.bool { return b ? "true" : "false" }
+        if let i = json.int { return String(i) }
+        if let d = json.double { return SQLFunctions.realToText(d) }
+        if let s = json.string { return renderString(s) }
+        if json.isArray {
+            var out = "["
+            var first = true
+            json.forEachElement { element in
+                if !first { out += "," }
+                first = false
+                out += render(element)
+            }
+            return out + "]"
         }
+        var out = "{"
+        var first = true
+        json.forEachMember { key, value in
+            if !first { out += "," }
+            first = false
+            out += renderString(key) + ":" + render(value)
+        }
+        return out + "}"
     }
 
     private static func renderString(_ s: String) -> String {
@@ -281,63 +89,112 @@ enum SQLJSON {
         return out + "\""
     }
 
-    /// json_extract(doc, '$.a.b[0]'): SQL NULL for missing paths or non-JSON.
-    static func extract(_ json: String, path: String) throws(DBError) -> Value {
-        guard let root = try? parse(json) else { return .null }
-        var node = root
-        var i = path.startIndex
-        guard i < path.endIndex, path[i] == "$" else {
-            throw DBError.sqlRuntime("json path must start with $")
-        }
-        i = path.index(after: i)
-        while i < path.endIndex {
-            if path[i] == "." {
-                i = path.index(after: i)
-                var key = ""
-                while i < path.endIndex, path[i] != ".", path[i] != "[" {
-                    key.append(path[i])
-                    i = path.index(after: i)
-                }
-                guard case .object(let members) = node,
-                    let match = members.first(where: { $0.0 == key })
-                else { return .null }
-                node = match.1
-            } else if path[i] == "[" {
-                i = path.index(after: i)
-                var digits = ""
-                while i < path.endIndex, path[i] != "]" {
-                    digits.append(path[i])
-                    i = path.index(after: i)
-                }
-                guard i < path.endIndex else { throw DBError.sqlRuntime("json path missing ]") }
-                i = path.index(after: i)
-                guard case .array(let items) = node, let index = Int(digits), index >= 0,
-                    index < items.count
-                else { return .null }
-                node = items[index]
-            } else {
-                throw DBError.sqlRuntime("malformed json path")
-            }
-        }
-        return toSQL(node)
-    }
-
-    /// json_each over an array (or single value): the `value` column rowset.
-    static func eachValues(_ json: String) throws(DBError) -> [Value] {
-        guard let root = try? parse(json) else {
-            throw DBError.sqlRuntime("json_each: malformed JSON")
-        }
-        switch root {
-        case .array(let items): return items.map(toSQL)
-        case .object(let members): return members.map { toSQL($0.1) }
-        default: return [toSQL(root)]
-        }
-    }
-}
-
-extension SQLJSON {
-    static func hex4(_ value: UInt32) -> String {
+    private static func hex4(_ value: UInt32) -> String {
         let hex = String(value, radix: 16)
         return String(repeating: "0", count: max(0, 4 - hex.count)) + hex
+    }
+
+    /// SQLite type name for a node: null / true / false / integer / real / text /
+    /// array / object.
+    static func typeName(_ json: JSON) -> String {
+        if json.isNull { return "null" }
+        if let b = json.bool { return b ? "true" : "false" }
+        if json.int != nil { return "integer" }
+        if json.double != nil { return "real" }
+        if json.string != nil { return "text" }
+        if json.isArray { return "array" }
+        return "object"
+    }
+
+    // MARK: - Scalar functions
+
+    /// `json_extract(doc, path)`: single-path form. Returns SQL NULL for a path that
+    /// doesn't resolve; a malformed PATH is an error.
+    static func extract(_ json: String, path: String) throws(DBError) -> Value {
+        let root = try parse(json)
+        return toSQL(try parsePath(path).evaluate(root))
+    }
+
+    /// `json_extract(doc, p1, p2, …)` with two or more paths: a JSON array of the
+    /// extracted values, each rendered as JSON (a path that doesn't resolve → `null`).
+    static func extractMultiple(_ json: String, paths: [String]) throws(DBError) -> Value {
+        let root = try parse(json)
+        var out = "["
+        for (index, path) in paths.enumerated() {
+            if index > 0 { out += "," }
+            let node = try parsePath(path).evaluate(root)
+            out += node.exists ? render(node) : "null"
+        }
+        return .text(out + "]")
+    }
+
+    /// `json_type(doc[, path])`: NULL when the path doesn't resolve.
+    static func type(_ json: String, path: String?) throws(DBError) -> Value {
+        let root = try parse(json)
+        let node: JSON
+        if let path {
+            node = try parsePath(path).evaluate(root)
+        } else {
+            node = root
+        }
+        guard node.exists else { return .null }
+        return .text(typeName(node))
+    }
+
+    /// `json_array_length(doc[, path])`: element count (0 for non-arrays); NULL when the
+    /// path doesn't resolve.
+    static func arrayLength(_ json: String, path: String?) throws(DBError) -> Value {
+        let root = try parse(json)
+        let node: JSON
+        if let path {
+            node = try parsePath(path).evaluate(root)
+        } else {
+            node = root
+        }
+        guard node.exists else { return .null }
+        return .integer(Int64(node.isArray ? node.count : 0))
+    }
+
+    /// `json_valid(x)`: 1 if `x` is well-formed JSON text, else 0; NULL → NULL.
+    static func valid(_ value: Value) -> Value {
+        switch value {
+        case .null: return .null
+        case .blob(let bytes): return .integer((try? ADJSON.parse(bytes)) != nil ? 1 : 0)
+        case .text(let s): return .integer((try? ADJSON.parse(s)) != nil ? 1 : 0)
+        case .integer, .real:
+            return .integer((try? ADJSON.parse(SQLFunctions.textify(value))) != nil ? 1 : 0)
+        }
+    }
+
+    /// `json_quote(value)`: the JSON text for a SQL scalar.
+    static func quote(_ value: Value) throws(DBError) -> Value {
+        switch value {
+        case .null: return .text("null")
+        case .integer(let v): return .text(String(v))
+        case .real(let d): return .text(SQLFunctions.realToText(d))
+        case .text(let s): return .text(renderString(s))
+        case .blob: throw DBError.sqlRuntime("JSON cannot hold BLOB values")
+        }
+    }
+
+    // MARK: - Table-valued helpers
+
+    /// `json_each` over an array (or single value): the `value` column rowset, in
+    /// document order.
+    static func eachValues(_ json: String) throws(DBError) -> [Value] {
+        let root = try parse(json)
+        if root.isArray {
+            var out: [Value] = []
+            out.reserveCapacity(root.count)
+            root.forEachElement { out.append(toSQL($0)) }
+            return out
+        }
+        if root.isObject {
+            var out: [Value] = []
+            out.reserveCapacity(root.count)
+            root.forEachMember { _, value in out.append(toSQL(value)) }
+            return out
+        }
+        return [toSQL(root)]
     }
 }

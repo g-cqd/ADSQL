@@ -46,10 +46,13 @@ let testSettings: [SwiftSetting] =
 // in dev/CI.
 let isDev = Context.environment["ADSQL_DEV"] != nil
 
-// ADSQL ships zero runtime dependencies. The only dependency — the DocC plugin that builds the
-// documentation site — is dev/CI-only (gated behind ADSQL_DEV), so packages that depend on ADSQL
-// never resolve it.
-var packageDependencies: [Package.Dependency] = []
+// ADSQL's only runtime dependency is the ADJSON package — specifically its Foundation-free,
+// swift-syntax-free `ADJSONCore` product, which backs the SQL JSON functions (tape parser +
+// SQLite-dialect path evaluator). The DocC plugin that builds the documentation site is dev/CI-only
+// (gated behind ADSQL_DEV), so packages that depend on ADSQL never resolve it.
+var packageDependencies: [Package.Dependency] = [
+    .package(url: "https://github.com/g-cqd/ADJSON.git", branch: "main")
+]
 if isDev {
     packageDependencies.append(
         .package(url: "https://github.com/swiftlang/swift-docc-plugin", from: "1.0.0"))
@@ -76,7 +79,8 @@ let package = Package(
     targets: [
         .target(name: "ADCAtomics"),
         .target(
-            name: "ADSQLKernel", dependencies: ["ADCAtomics"],
+            name: "ADSQLKernel",
+            dependencies: ["ADCAtomics", .product(name: "ADJSONCore", package: "ADJSON")],
             swiftSettings: kernelSettings),
         .target(
             name: "ADSQL", dependencies: ["ADSQLKernel"], swiftSettings: strictSettings,
