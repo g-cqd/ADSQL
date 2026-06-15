@@ -4,10 +4,125 @@
 /// primaries (literals, columns, parenthesised, subqueries), CASE, and function
 /// calls. An `extension SQLParser`; pure code motion (all members are internal).
 extension SQLParser {
+    /// A deferred step on `climb`'s explicit stack — the work to finish once the
+    /// operand currently being parsed completes. Replaces a recursive-descent call
+    /// frame, so nesting depth lives on the heap, not the call stack.
+    enum ExprPending {
+        case binary(SQLBinaryOp, lhs: SQLExpr, resumeBP: Int)
+        case unary(SQLUnaryOp, resumeBP: Int)
+        case group(resumeBP: Int)
+    }
+
     mutating func expression() throws(DBError) -> SQLExpr {
         try enterExprNesting()
         defer { exprDepth -= 1 }
-        return try binaryExpr(0)
+        return try climb(minBP: 0)
+    }
+
+    /// Iterative precedence-climbing (Pratt) core. Replaces the former mutually
+    /// recursive `binaryExpr`/`prefixExpr`/`primary` descent: parentheses, prefix
+    /// runs, and binary right-operands are tracked on an explicit heap stack
+    /// (`pending`) instead of the call stack, so hostile input — `((((…))))`,
+    /// `NOT NOT …`, `- - …` — can never overflow it. `pending` depth is still capped
+    /// at `maxExprDepth`, so absurd nesting is rejected with a syntax error rather
+    /// than silently accepted. Structured primaries (CASE, CAST, calls, subqueries,
+    /// IN/BETWEEN/LIKE) re-enter `expression()` for their sub-expressions; that
+    /// recursion is bounded by `exprDepth`.
+    mutating func climb(minBP startBP: Int) throws(DBError) -> SQLExpr {
+        var pending: [ExprPending] = []
+        var minBP = startBP
+        func push(_ frame: ExprPending) throws(DBError) {
+            guard pending.count < Self.maxExprDepth else {
+                throw DBError.sqlSyntax(message: "expression nesting too deep", offset: current.offset)
+            }
+            pending.append(frame)
+        }
+        operand: while true {
+            // Operand position: consume a prefix run, then a primary (or open a group).
+            var value: SQLExpr
+            prefix: while true {
+                if matchKeyword("NOT") {
+                    try push(.unary(.not, resumeBP: minBP))
+                    minBP = Self.bpEquality  // NOT binds its operand at equality precedence
+                    continue prefix
+                }
+                if checkSymbol("-") {
+                    // Fold a negated numeric literal so `-9223372036854775808` is
+                    // Int64.min, not a unary negate of an overflowing positive.
+                    switch tokens[pos + 1].kind {
+                    case .integer(let v):
+                        pos += 2
+                        value = .literal(.integer(0 &- v))
+                    case .real(let d):
+                        pos += 2
+                        value = .literal(.real(-d))
+                    case .bigInteger(let text):
+                        pos += 2
+                        if let v = Int64("-" + text) {
+                            value = .literal(.integer(v))
+                        } else {
+                            value = .literal(.real(-(Double(text) ?? 0)))
+                        }
+                    default:
+                        pos += 1  // consume '-'
+                        try push(.unary(.negate, resumeBP: minBP))
+                        minBP = Self.bpUnary
+                        continue prefix
+                    }
+                    break prefix
+                }
+                if matchSymbol("+") { continue prefix }  // unary plus: no-op
+                if checkSymbol("("), tokens[pos + 1].kind != .keyword("SELECT") {
+                    pos += 1  // consume '('
+                    try push(.group(resumeBP: minBP))
+                    minBP = 0
+                    continue prefix
+                }
+                value = try primary()  // leaves + CASE/CAST/calls + scalar-subquery `( SELECT … )`
+                break prefix
+            }
+            // Operator position: run the infix loop at `minBP`, then settle one frame.
+            infix: while true {
+                if let bp = infixBP(), bp >= minBP {
+                    switch bp {
+                    case Self.bpCollate:
+                        _ = matchKeyword("COLLATE")
+                        value = .collate(value, try collationName())
+                    case Self.bpEquality:
+                        value = try equalitySuffix(value)
+                    case Self.bpAnd:
+                        _ = matchKeyword("AND")
+                        try push(.binary(.and, lhs: value, resumeBP: minBP))
+                        minBP = Self.bpAnd + 1
+                        continue operand
+                    case Self.bpOr:
+                        _ = matchKeyword("OR")
+                        try push(.binary(.or, lhs: value, resumeBP: minBP))
+                        minBP = Self.bpOr + 1
+                        continue operand
+                    default:
+                        let op = try consumeSimpleBinary()
+                        try push(.binary(op, lhs: value, resumeBP: minBP))
+                        minBP = bp + 1
+                        continue operand
+                    }
+                    continue infix
+                }
+                guard let top = pending.popLast() else { return value }
+                switch top {
+                case .binary(let op, let lhs, let resumeBP):
+                    value = .binary(op, lhs, value)
+                    minBP = resumeBP
+                case .unary(let op, let resumeBP):
+                    value = .unary(op, value)
+                    minBP = resumeBP
+                case .group(let resumeBP):
+                    try expectSymbol(")")
+                    minBP = resumeBP
+                }
+                continue infix
+            }
+        }
     }
 
     /// Operand at comparison precedence — for BETWEEN bounds and LIKE patterns.
@@ -19,6 +134,10 @@ extension SQLParser {
     // suffix operators at one level, mirroring SQLite's precedence.
     static let bpOr = 10, bpAnd = 20, bpEquality = 30, bpComparison = 40
     static let bpAdditive = 50, bpMultiplicative = 60, bpConcat = 70, bpCollate = 80
+    /// Binding power for a unary `-`/`+` operand: above every infix level, so the
+    /// operand is a single prefix/primary (`-a * b` is `(-a) * b`), matching the
+    /// former `prefixExpr` recursion.
+    static let bpUnary = 90
 
     /// Binding power of the current token as an infix/postfix operator, or nil.
     /// Pure peek — consumes nothing.
@@ -53,27 +172,10 @@ extension SQLParser {
     /// run of same-precedence operators (`a OP b OP c …`) is a loop, and right-
     /// operand recursion is bounded by the number of precedence levels, not by
     /// expression length — so each nesting level costs ~a third of the stack.
+    /// Operand at `minBP` precedence — used by the equality/BETWEEN/LIKE/MATCH
+    /// suffixes for their right-hand operands. Defers to the iterative `climb`.
     mutating func binaryExpr(_ minBP: Int) throws(DBError) -> SQLExpr {
-        var lhs = try prefixExpr()
-        while let bp = infixBP(), bp >= minBP {
-            switch bp {
-            case Self.bpCollate:
-                _ = matchKeyword("COLLATE")
-                lhs = .collate(lhs, try collationName())
-            case Self.bpEquality:
-                lhs = try equalitySuffix(lhs)
-            case Self.bpAnd:
-                _ = matchKeyword("AND")
-                lhs = .binary(.and, lhs, try binaryExpr(Self.bpAnd + 1))
-            case Self.bpOr:
-                _ = matchKeyword("OR")
-                lhs = .binary(.or, lhs, try binaryExpr(Self.bpOr + 1))
-            default:
-                let op = try consumeSimpleBinary()
-                lhs = .binary(op, lhs, try binaryExpr(bp + 1))
-            }
-        }
-        return lhs
+        try climb(minBP: minBP)
     }
 
     /// Comparison/arithmetic/concat operators (`<=`/`>=` before `<`/`>`).
@@ -124,32 +226,6 @@ extension SQLParser {
             return .like(lhs, pattern: pattern, negated: false)
         }
         throw DBError.sqlSyntax(message: "expected a comparison operator", offset: current.offset)
-    }
-
-    /// Prefix operators: `NOT` (loose — operand at equality precedence) and unary
-    /// `-`/`+` (tight), with the numeric-literal folding the grammar requires.
-    mutating func prefixExpr() throws(DBError) -> SQLExpr {
-        if matchKeyword("NOT") {
-            return .unary(.not, try binaryExpr(Self.bpEquality))
-        }
-        if matchSymbol("-") {
-            if case .integer(let v) = current.kind {
-                pos += 1
-                return .literal(.integer(0 &- v))
-            }
-            if case .real(let d) = current.kind {
-                pos += 1
-                return .literal(.real(-d))
-            }
-            if case .bigInteger(let text) = current.kind {
-                pos += 1
-                if let v = Int64("-" + text) { return .literal(.integer(v)) }
-                return .literal(.real(-(Double(text) ?? 0)))
-            }
-            return .unary(.negate, try prefixExpr())
-        }
-        if matchSymbol("+") { return try prefixExpr() }
-        return try primary()
     }
 
     /// `x BETWEEN a AND b` desugars to `x>=a AND x<=b` (and NOT BETWEEN to
