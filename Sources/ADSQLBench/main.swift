@@ -8,10 +8,13 @@ import Foundation
 #endif
 
 // adsql-bench [--rows N] [--seconds S] [--engine adsql|sqlite] [--dir PATH] [scenarios...]
-// Scenarios: cold get scan concurrent upsert table sql fts strategy
+// Scenarios: cold get scan concurrent upsert table sql fts strategy search
 // Default (no scenario args): cold get scan concurrent upsert table.
-// `sql` and `fts` are opt-in (heavier): the FTS index build is write-amplified
-// today (F6b), so a bare run would otherwise stall on it — pass `fts` explicitly.
+// `sql`, `fts`, and `search` are opt-in (heavier): the FTS index build is
+// write-amplified today (F6b), so a bare run would otherwise stall on it — pass
+// the scenario explicitly. `search` is the RFC 0010 §1 apple-docs `/search`
+// hot-path measurement (ADSQL `searchPagesFramed` vs SQLite, single-thread latency
+// + 1/2/4/8-thread concurrency scaling); it builds its own apple-docs-shaped corpus.
 
 var config = BenchConfig()
 var engines = ["adsql", "sqlite"]
@@ -96,6 +99,12 @@ do {
                 // Self-contained matrix over both engines; run once, on the first engine.
                 if engine == engines.first {
                     try StrategyBench.run(engines: engines, dir: dir, config: config)
+                }
+            case "search":
+                // RFC 0010 §1 apple-docs `/search` hot path — self-contained matrix over
+                // both engines (builds the corpus + runs the read passes); run once.
+                if engine == engines.first {
+                    try SearchPagesScenario.run(engines: engines, dir: dir, config: config)
                 }
             default:
                 print("unknown scenario \(scenario)")

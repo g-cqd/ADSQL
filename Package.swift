@@ -100,8 +100,12 @@ let package = Package(
         // stays link-clean exactly like the read engine.
         .target(
             name: "ADSQLSearch", dependencies: ["ADSQL"], swiftSettings: strictSettings),
+        // ADSQLSearch is a bench dependency so the `search` scenario can call the real
+        // `searchPagesFramed` / `SearchQuery` (RFC 0010 §2) hot path it benchmarks against
+        // system SQLite running the IDENTICAL `SearchQuery.sql` + `SearchQuery.bindings`.
         .executableTarget(
-            name: "ADSQLBench", dependencies: ["ADSQL", "CSQLite"], swiftSettings: benchSettings),
+            name: "ADSQLBench", dependencies: ["ADSQL", "ADSQLSearch", "CSQLite"],
+            swiftSettings: benchSettings),
         .target(
             name: "ADSQLTestSupport",
             dependencies: ["ADSQLKernel"],
