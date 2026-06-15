@@ -88,6 +88,23 @@ final class SearchSQLiteConnection: @unchecked Sendable {
         return rows
     }
 
+    /// Raw `documents_fts MATCH` candidate count (pre-LIMIT, no JOIN/filters) for the
+    /// FTS-import sanity table — the SQLite counterpart of
+    /// `SearchPagesScenario.matchCountADSQL`. Prepared transiently (called only a
+    /// handful of times at startup, never on the hot path).
+    func matchCount(_ term: String) -> Int {
+        var counter: OpaquePointer?
+        defer { sqlite3_finalize(counter) }
+        guard
+            sqlite3_prepare_v2(
+                db, "SELECT COUNT(*) FROM documents_fts WHERE documents_fts MATCH ?1", -1, &counter,
+                nil) == SQLITE_OK
+        else { return 0 }
+        sqlite3_bind_text(counter, 1, term, -1, SearchPagesScenario.transient)
+        guard sqlite3_step(counter) == SQLITE_ROW else { return 0 }
+        return Int(sqlite3_column_int64(counter, 0))
+    }
+
     // MARK: - Binding
 
     private func bind(_ params: SearchPagesParams) {

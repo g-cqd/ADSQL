@@ -52,6 +52,13 @@ enum SearchPagesScenario {
     /// without a multi-minute run.
     static let singleThreadIterations = 200
 
+    /// Per-request iterations for the REAL-corpus single-thread battery. The 4 GB
+    /// corpus answers each `/search` in ~100 ms (vs microseconds on the cache-
+    /// resident synthetic corpus), so the synthetic 200 would take ~10 min; 25 is
+    /// CHURN-RESISTANT — `params.count × 25` requests still give a stable p50/p99
+    /// and keep the whole run to a couple of minutes.
+    static let realSingleThreadIterations = 25
+
     /// Reader-thread counts for the scaling sweep (the RFC 0010 §1 axis).
     static let readerCounts = [1, 2, 4, 8]
 
@@ -59,6 +66,15 @@ enum SearchPagesScenario {
     static let scalingSeconds = 2.0
 
     static func run(engines: [String], dir: String, config: BenchConfig) throws {
+        // REAL-CORPUS mode: both `--corpus` and `--sqlite` given ⇒ skip synthetic
+        // generation entirely and measure against the pre-built 4 GB databases (the
+        // definitive RFC 0010 §1 measurement). The original §2.2 `searchPagesFramed`
+        // is the only path here — the real corpus has no F6 denorm columns.
+        if let adsqlPath = config.realADSQLPath, let sqlitePath = config.realSQLitePath {
+            try runRealCorpus(adsqlPath: adsqlPath, sqlitePath: sqlitePath)
+            return
+        }
+
         let rows = max(1, config.rows == BenchConfig().rows ? defaultRows : config.rows)
         print("  corpus: \(rows) docs · workload: \(SearchWorkload.params.count) queries · limit \(limit)")
         print(
@@ -101,6 +117,188 @@ enum SearchPagesScenario {
             "  engine   threads     req/s        p50          p99       (vs 1-thread)")
         if let adsqlPath { try scaleADSQL(path: adsqlPath, rows: rows) }
         if let sqlitePath { try scaleSQLite(path: sqlitePath, rows: rows) }
+    }
+
+    // MARK: - Real-corpus mode (RFC 0010 §1 — the 4 GB apple-docs measurement)
+
+    /// The definitive `/search` measurement against the pre-built 4 GB corpora:
+    /// ADSQL opens `adsqlPath` (read-only, wait-free MVCC), SQLite opens `sqlitePath`
+    /// (read-only, one connection per worker). No synthetic generation — both engines
+    /// query the SAME imported apple-docs data, so the compare is real end to end.
+    /// Runs the ORIGINAL §2.2 `searchPagesFramed` only (the real corpus has no F6
+    /// denorm columns); the workload is `SearchWorkload.params` whose terms
+    /// (swiftui/view/render/model/…) are real apple-docs API terms.
+    static func runRealCorpus(adsqlPath: String, sqlitePath: String) throws {
+        print("  REAL-CORPUS mode (RFC 0010 §1 — the definitive 4 GB measurement)")
+        print("    adsql:  \(adsqlPath)")
+        print("    sqlite: \(sqlitePath)")
+        print(
+            "    workload: \(SearchWorkload.params.count) queries · limit \(limit) · "
+                + "single-thread iters \(realSingleThreadIterations)")
+
+        // 0. FTS-import sanity: confirm ADSQL's imported `documents_fts` returns sane
+        // row counts vs SQLite for a spread of workload terms. The CLI has no query
+        // path, so this is the FIRST exercise of the imported index — if ADSQL returns
+        // 0 where SQLite returns many, the import is broken: STOP and report.
+        try sanityCheckRealCorpus(adsqlPath: adsqlPath, sqlitePath: sqlitePath)
+
+        // 1. Single-thread per-request latency (p50/p99), original path only.
+        print("\n  -- single-thread latency (per request) --")
+        try singleThreadRealADSQL(path: adsqlPath)
+        try singleThreadRealSQLite(path: sqlitePath)
+
+        // 2. Concurrency scaling: throughput + p99 at 1/2/4/8 reader threads.
+        print("\n  -- concurrency scaling (\(Int(scalingSeconds))s/step, own reader per thread) --")
+        print(
+            "  engine   threads     req/s        p50          p99       (vs 1-thread)")
+        try scaleRealADSQL(path: adsqlPath)
+        try scaleRealSQLite(path: sqlitePath)
+    }
+
+    /// Per-term `documents_fts MATCH` counts for both engines (the §2.2 query's
+    /// framed row count, which already reflects `MATCH + JOIN + filters + LIMIT`,
+    /// plus a raw pre-LIMIT MATCH count so the candidate-set sizes are comparable).
+    /// Aborts via thrown error if ADSQL is empty where SQLite is not — a broken FTS
+    /// import (the read path queries `documents_fts`; a failed import would silently
+    /// return nothing here even though `documents` imported fine).
+    static func sanityCheckRealCorpus(adsqlPath: String, sqlitePath: String) throws {
+        print("\n  -- FTS-import sanity (documents_fts MATCH row counts, adsql vs sqlite) --")
+        let adsql = try Database.open(
+            at: adsqlPath,
+            options: DatabaseOptions(durability: .none, maxMapSize: 32 << 30, readOnly: true))
+        defer { adsql.close() }
+        let sqlite = try SearchSQLiteConnection(path: sqlitePath)
+
+        // A spread of bare anchor terms from the workload (no filters) — the clearest
+        // signal that MATCH itself works on the imported index.
+        let terms = ["swiftui", "view", "render", "model", "context", "buffer", "data"]
+        print("    term         adsql(framed)   sqlite(framed)   adsql(match)   sqlite(match)")
+        var brokenTerms: [String] = []
+        for term in terms {
+            let params = SearchPagesParams(query: term, raw: term, limit: limit)
+            let adsqlFramed = try framedRowCount(adsql, params)
+            let sqliteFramed = sqlite.frameRowCount(params)
+            let adsqlMatch = try matchCountADSQL(adsql, term)
+            let sqliteMatch = sqlite.matchCount(term)
+            print(
+                String(
+                    format: "    %-10@   %12d   %14d   %12d   %13d",
+                    term, adsqlFramed, sqliteFramed, adsqlMatch, sqliteMatch))
+            // Broken-import guard: SQLite finds matches but ADSQL finds none.
+            if sqliteMatch > 0 && adsqlMatch == 0 { brokenTerms.append(term) }
+        }
+        guard brokenTerms.isEmpty else {
+            throw RealCorpusError.brokenFTSImport(terms: brokenTerms)
+        }
+        print(
+            "    OK — ADSQL's documents_fts returns matches for every workload term "
+                + "(import verified)")
+    }
+
+    /// Raw `documents_fts MATCH` candidate count for ADSQL (pre-LIMIT, no JOIN/filters)
+    /// — the import-health signal mirrored by ``SearchSQLiteConnection/matchCount(_:)``.
+    static func matchCountADSQL(_ db: Database, _ term: String) throws -> Int {
+        let rows = try db.prepare("SELECT COUNT(*) FROM documents_fts WHERE documents_fts MATCH ?")
+            .all(.text(term))
+        guard let cell = rows.first?.values.first, case .integer(let n) = cell else { return 0 }
+        return Int(n)
+    }
+
+    // MARK: - Real-corpus single-thread latency (original §2.2 path only)
+
+    static func singleThreadRealADSQL(path: String) throws {
+        let db = try Database.open(
+            at: path,
+            options: DatabaseOptions(durability: .none, maxMapSize: 32 << 30, readOnly: true))
+        defer { db.close() }
+        // Warm: prove the workload hits non-empty results (the framing path is real).
+        // No denorm equivalence guard here — the real corpus has no denorm columns.
+        var warmRows = 0
+        for params in SearchWorkload.params { warmRows += try framedRowCount(db, params) }
+        precondition(warmRows > 0, "adsql real workload returned no rows — corpus/query mismatch")
+
+        var original = LatencyHistogram()
+        original.reserve(SearchWorkload.params.count * realSingleThreadIterations)
+        for _ in 0..<realSingleThreadIterations {
+            for params in SearchWorkload.params {
+                let start = nowNanos()
+                let bytes = try searchPagesFramed(db, params)
+                original.record(nowNanos() - start)
+                blackhole(bytes.count)
+            }
+        }
+        print("  [adsql]  searchPagesFramed        \(original.summary())")
+    }
+
+    static func singleThreadRealSQLite(path: String) throws {
+        let conn = try SearchSQLiteConnection(path: path)
+        var warmRows = 0
+        for params in SearchWorkload.params { warmRows += conn.frameRowCount(params) }
+        precondition(warmRows > 0, "sqlite real workload returned no rows — corpus/query mismatch")
+
+        var histogram = LatencyHistogram()
+        histogram.reserve(SearchWorkload.params.count * realSingleThreadIterations)
+        for _ in 0..<realSingleThreadIterations {
+            for params in SearchWorkload.params {
+                let start = nowNanos()
+                let bytes = conn.frameBytes(params)
+                histogram.record(nowNanos() - start)
+                blackhole(bytes)
+            }
+        }
+        print("  [sqlite] SearchQuery.sql + frame  \(histogram.summary())")
+    }
+
+    // MARK: - Real-corpus concurrency scaling (original §2.2 path only)
+
+    static func scaleRealADSQL(path: String) throws {
+        // One shared handle; each `searchPagesFramed` call opens its OWN wait-free
+        // MVCC `ReadTxn` snapshot per request — the genuine per-request hot path under
+        // N threads, no shared reader/statement to contend on.
+        let db = try Database.open(
+            at: path,
+            options: DatabaseOptions(durability: .none, maxMapSize: 32 << 30, readOnly: true))
+        defer { db.close() }
+        var baseline: Double = 0
+        for threads in readerCounts {
+            let result = runScaling(threads: threads) { stop, histogram in
+                var local = 0
+                var index = 0
+                while !stop.isSet {
+                    let params = SearchWorkload.params[index % SearchWorkload.params.count]
+                    index += 1
+                    let start = nowNanos()
+                    if let bytes = try? searchPagesFramed(db, params) { blackhole(bytes.count) }
+                    histogram.record(nowNanos() - start)
+                    local += 1
+                }
+                return local
+            }
+            printScaling("adsql", threads: threads, result: result, baseline: &baseline)
+        }
+    }
+
+    static func scaleRealSQLite(path: String) throws {
+        var baseline: Double = 0
+        for threads in readerCounts {
+            let result = runScaling(threads: threads) { stop, histogram in
+                // One read-only connection per thread (SQLite's supported pattern).
+                guard let conn = try? SearchSQLiteConnection(path: path) else { return 0 }
+                var local = 0
+                var index = 0
+                while !stop.isSet {
+                    let params = SearchWorkload.params[index % SearchWorkload.params.count]
+                    index += 1
+                    let start = nowNanos()
+                    let bytes = conn.frameBytes(params)
+                    histogram.record(nowNanos() - start)
+                    blackhole(bytes)
+                    local += 1
+                }
+                return local
+            }
+            printScaling("sqlite", threads: threads, result: result, baseline: &baseline)
+        }
     }
 
     // MARK: - Corpus build (ADSQL) — direct DDL, the §2.1 read schema
@@ -442,4 +640,25 @@ final class StopFlag: Sendable {
 @inline(never)
 func blackhole(_ value: Int) {
     if value == Int.min { fatalError("unreachable") }
+}
+
+/// Real-corpus failure modes — surfaced through `main.swift`'s `catch` so a broken
+/// FTS import STOPS the run with a clear message instead of producing meaningless
+/// latency numbers against an empty index.
+enum RealCorpusError: Error, CustomStringConvertible {
+    /// ADSQL's `documents_fts` returned no matches for `terms` where system SQLite
+    /// returned matches — the FTS import did not populate the index.
+    case brokenFTSImport(terms: [String])
+
+    var description: String {
+        switch self {
+        case .brokenFTSImport(let terms):
+            return """
+                FTS IMPORT BROKEN — ADSQL's documents_fts returned 0 rows for \
+                \(terms.joined(separator: ", ")) where SQLite returned many. The \
+                imported index is empty/unqueryable; aborting before producing \
+                meaningless latency numbers.
+                """
+        }
+    }
 }

@@ -25,6 +25,13 @@ struct BenchConfig {
     var joinStrategy: ExecutionOptions.Join = .auto
     /// Insert strategy for the SQL scenarios (`--insert`).
     var insertStrategy: ExecutionOptions.Insert = .standard
+    /// Real-corpus mode for the `search` scenario (`--corpus`): path to a
+    /// pre-built ADSQL database (skips synthetic generation when paired with
+    /// ``realSQLitePath``). RFC 0010 §1 — the 4 GB apple-docs measurement.
+    var realADSQLPath: String?
+    /// Real-corpus mode for the `search` scenario (`--sqlite`): path to the
+    /// system-SQLite database read-only counterpart of ``realADSQLPath``.
+    var realSQLitePath: String?
 }
 
 enum Scenarios {

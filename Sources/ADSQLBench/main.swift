@@ -15,6 +15,11 @@ import Foundation
 // the scenario explicitly. `search` is the RFC 0010 §1 apple-docs `/search`
 // hot-path measurement (ADSQL `searchPagesFramed` vs SQLite, single-thread latency
 // + 1/2/4/8-thread concurrency scaling); it builds its own apple-docs-shaped corpus.
+//
+// REAL-CORPUS mode for `search`: pass `--corpus <adsql-path> --sqlite <sqlite-path>`
+// to SKIP synthetic generation and measure against pre-built databases instead (the
+// definitive RFC 0010 §1 measurement at the real 4 GB apple-docs scale). Runs the
+// ORIGINAL `searchPagesFramed` only (the real corpus has no F6 denorm columns).
 
 var config = BenchConfig()
 var engines = ["adsql", "sqlite"]
@@ -51,6 +56,10 @@ while let argument = iterator.next() {
         config.concurrentSeconds = Double(iterator.next() ?? "") ?? config.concurrentSeconds
     case "--engine":
         if let engine = iterator.next() { engines = [engine] }
+    case "--corpus":
+        config.realADSQLPath = iterator.next()
+    case "--sqlite":
+        config.realSQLitePath = iterator.next()
     case "--dir":
         dir = iterator.next() ?? dir
     case "--full":
