@@ -318,6 +318,16 @@ first; the **perf features** then make it *beat* SQLite — the reason for the s
   and where wait-free MVCC wins. The **definitive** "beat SQLite" test is the real apple-docs `load.mjs`
   bench at the **4 GB** corpus with ADSQL wired in (the `INT` cross-repo step) — not more small-scale
   micro-benching. ✅ **F4** covering engine landed.
+
+  **Real-scale verdict (DEFINITIVE — 4 GB / 358k docs, 8-way, `--corpus-denorm`):** ADSQL(F6-denorm)
+  **BEATS SQLite** — **179 vs 101 req/s** at 8-way (ADSQL scales 6.3×; SQLite ceilings 1.4×, peak 131@4
+  then regresses on memory-bandwidth contention — §1 confirmed); the crossover is between 4 and 8 threads
+  and widens with cores. The ORIGINAL no-F6 query loses (65 vs 101). Single-thread ADSQL(denorm) is still
+  ~3.5× slower (29 vs 8.4 ms) — so the swap wins on **throughput at production concurrency**, not
+  per-query latency: the wait-free-MVCC thesis, vindicated. Denorm-equivalence verified (16/16 queries ==
+  the original) + the import byte-parity-clean. **The apple-docs swap premise is CONFIRMED with F6.**
+  Remaining to ship: productionize F6 (the test used source-side SQL denorm — fold it into the importer
+  or apple-docs' corpus build) + the cross-repo `INT` wiring.
 - **P1 — boundary collapse:** **A1** search primitive → **A2** caller encoder → **A3** one-call framed
   (= the `INT` ABI body) → **A4** mmap→out single-copy.
 - **P2 — polish:** **A5** pushed filters, **A6** snapshot/plan-cache wiring, **A7** vectorized.

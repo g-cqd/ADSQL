@@ -113,7 +113,7 @@ seeded op generator, simulated disk for crash injection). Tests in `ADSQLKernelT
 | **FTS MATCH** (membership) | **~3.3× slower** ⚠️ | rides the general per-row path |
 | **FTS index build** | **~7× slower** ⚠️ | constant factor vs FTS5 segments |
 | **FTS delete / churn** | **~390× slower** ⚠️ | re-encodes postings per doc → O(corpus); the standout gap |
-| **apple-docs `/search`** (real 4 GB, 8-way) | **~1.55× slower** ⚠️ | DEFINITIVE test (`ADSQLBench --corpus … --sqlite … search`): ADSQL's wait-free MVCC **scales 5.4×** (1→8 threads) while SQLite **ceilings** (1.6× peak → 1.27× regress at 8 — the §1 contention signature, confirmed), **but** ADSQL's ~6× per-query latency (original query, no F6) → **65 vs 101 req/s** at 8-way. Import **byte-parity-verified** at 358k docs. **F6-in-importer** (×2.6 per-query) projects ~169 vs 101 — the decisive re-test |
+| **apple-docs `/search`** (real 4 GB, 8-way) | **~1.77× faster** ✅ (with F6) | DEFINITIVE test: ADSQL(F6-denorm) **wins at production concurrency — 179 vs 101 req/s** at 8-way (ADSQL scales **6.3×**; SQLite ceilings **1.4×**, peak 131@4 then regresses — the §1 signature, confirmed). Crosses SQLite between 4–8 threads; gap widens with cores. Single-thread still ~3.5× slower (the wait-free-MVCC thesis: wins *throughput*, not per-query latency). Denorm-equivalence + import byte-parity-verified at 358k docs |
 
 > **apple-docs read path (M8) — measured, not assumed:** the `ADSQLBench search` scenario shows the
 > as-built composed `/search` query is **~26× slower than SQLite** (the `ORDER BY tier, rank` shape
