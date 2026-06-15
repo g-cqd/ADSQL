@@ -51,14 +51,22 @@ public struct ImportManifest: Sendable, Codable {
     public enum Detail: String, Sendable, Codable { case full, column, none }
 
     public var ftsTables: [FTSTable]
-    public init(ftsTables: [FTSTable] = []) { self.ftsTables = ftsTables }
+    /// Regular source tables to NOT import (beyond the auto-skipped FTS shadow
+    /// tables): irrelevant/large tables a consumer doesn't need (e.g. a vectors or
+    /// zstd-payload table). Auto-introspection imports every regular table except
+    /// these + the FTS shadows.
+    public var skipTables: [String]
+    public init(ftsTables: [FTSTable] = [], skipTables: [String] = []) {
+        self.ftsTables = ftsTables
+        self.skipTables = skipTables
+    }
 
     public static let empty = ImportManifest()
 
-    /// FTS table names + their shadow-table names, to skip during the regular
-    /// (auto-introspected) table pass.
+    /// The explicit `skipTables` plus every declared FTS table's name + shadow-table
+    /// names, to skip during the regular (auto-introspected) table pass.
     var skipTableNames: Set<String> {
-        var skip = Set<String>()
+        var skip = Set(skipTables)
         for table in ftsTables {
             skip.insert(table.name)
             for suffix in ["_data", "_idx", "_content", "_docsize", "_config"] {

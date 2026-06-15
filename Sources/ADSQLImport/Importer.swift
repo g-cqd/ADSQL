@@ -94,11 +94,19 @@ extension Database {
         try flush()
 
         // Port explicit secondary indexes (each backfills from the rows just copied).
+        // An index whose widest key exceeds ADSQL's B-tree key limit (e.g. a long
+        // `usr`) cannot be built — skip it with a warning rather than failing the whole
+        // import: the table data is intact and only that secondary index is omitted.
+        // Other failures (e.g. a UNIQUE violation) still propagate.
         for index in try source.indexes(of: tableName) {
-            try writeSync { (txn) throws(DBError) in
-                try txn.createIndex(
-                    IndexDefinition(
-                        index.name, on: tableName, columns: index.columns, unique: index.unique))
+            do {
+                try writeSync { (txn) throws(DBError) in
+                    try txn.createIndex(
+                        IndexDefinition(
+                            index.name, on: tableName, columns: index.columns, unique: index.unique))
+                }
+            } catch DBError.indexKeyTooLarge(_, let size) {
+                print("import: skipped index \(index.name) on \(tableName): key \(size) B over the limit")
             }
         }
     }
