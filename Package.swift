@@ -74,6 +74,7 @@ let package = Package(
     products: [
         .library(name: "ADSQL", targets: ["ADSQL"]),
         .library(name: "ADSQLImport", targets: ["ADSQLImport"]),
+        .library(name: "ADSQLSearch", targets: ["ADSQLSearch"]),
         .executable(name: "adsql", targets: ["ADSQLTool"]),
     ],
     dependencies: packageDependencies,
@@ -93,6 +94,12 @@ let package = Package(
         // ADSQL database. Kept out of ADSQLKernel so the read-only engine never links sqlite3.
         .target(
             name: "ADSQLImport", dependencies: ["ADSQLKernel", "CSQLite"], swiftSettings: strictSettings),
+        // apple-docs search-pages serving (M8 INT, RFC 0010 §2): builds the §2.2 main query, binds the
+        // §2.4 filter bag, and frames the §2.3 projection into the §2.5 response bytes — the Swift body
+        // of apple-docs' frozen `ad_storage_search_pages` ABI. Depends on ADSQL only (NOT CSQLite), so it
+        // stays link-clean exactly like the read engine.
+        .target(
+            name: "ADSQLSearch", dependencies: ["ADSQL"], swiftSettings: strictSettings),
         .executableTarget(
             name: "ADSQLBench", dependencies: ["ADSQL", "CSQLite"], swiftSettings: benchSettings),
         .target(
@@ -108,7 +115,7 @@ let package = Package(
         ),
         .testTarget(
             name: "ADSQLImportTests",
-            dependencies: ["ADSQLImport", "ADSQLTestSupport", "CSQLite"],
+            dependencies: ["ADSQLImport", "ADSQLSearch", "ADSQLTestSupport", "CSQLite"],
             swiftSettings: testSettings
         ),
 
