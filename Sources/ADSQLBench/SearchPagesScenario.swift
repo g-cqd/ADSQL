@@ -87,7 +87,10 @@ enum SearchPagesScenario {
             }
         }
 
-        // 1. Single-thread per-request latency (p50/p99), per engine.
+        // 1. Single-thread per-request latency (p50/p99), per engine. The ADSQL arm
+        // runs BOTH the original §2.2 framed path and the F6 DENORM framed path
+        // (`searchPagesFramedDenorm`) so the perf gate shows the before/after on the
+        // same corpus alongside the SQLite baseline.
         print("\n  -- single-thread latency (per request) --")
         if let adsqlPath { try singleThreadADSQL(path: adsqlPath, rows: rows) }
         if let sqlitePath { try singleThreadSQLite(path: sqlitePath, rows: rows) }
@@ -202,22 +205,45 @@ enum SearchPagesScenario {
             at: path,
             options: DatabaseOptions(durability: .none, maxMapSize: 32 << 30, readOnly: true))
         defer { db.close() }
-        // Warm: prove the workload hits non-empty results (the framing path is real).
+        // Warm: prove the workload hits non-empty results (the framing path is real)
+        // AND that the F6 denorm path returns BYTE-IDENTICAL bytes to the original —
+        // a per-run guard that the denorm arm is not silently diverging.
         var warmRows = 0
-        for params in SearchWorkload.params { warmRows += try framedRowCount(db, params) }
+        for params in SearchWorkload.params {
+            warmRows += try framedRowCount(db, params)
+            let original = try searchPagesFramed(db, params)
+            let denorm = try searchPagesFramedDenorm(db, params)
+            precondition(
+                original == denorm,
+                "F6 denorm framed bytes differ from original for query='\(params.query)'")
+        }
         precondition(warmRows > 0, "adsql workload returned no rows — corpus/query mismatch")
 
-        var histogram = LatencyHistogram()
-        histogram.reserve(SearchWorkload.params.count * singleThreadIterations)
+        // Original §2.2 framed path.
+        var original = LatencyHistogram()
+        original.reserve(SearchWorkload.params.count * singleThreadIterations)
         for _ in 0..<singleThreadIterations {
             for params in SearchWorkload.params {
                 let start = nowNanos()
                 let bytes = try searchPagesFramed(db, params)
-                histogram.record(nowNanos() - start)
+                original.record(nowNanos() - start)
                 blackhole(bytes.count)
             }
         }
-        print("  [adsql]  searchPagesFramed   \(histogram.summary())")
+        print("  [adsql]  searchPagesFramed        \(original.summary())")
+
+        // F6 denorm framed path (`searchPagesFramedDenorm`) — the before/after arm.
+        var denorm = LatencyHistogram()
+        denorm.reserve(SearchWorkload.params.count * singleThreadIterations)
+        for _ in 0..<singleThreadIterations {
+            for params in SearchWorkload.params {
+                let start = nowNanos()
+                let bytes = try searchPagesFramedDenorm(db, params)
+                denorm.record(nowNanos() - start)
+                blackhole(bytes.count)
+            }
+        }
+        print("  [adsql]  searchPagesFramedDenorm  \(denorm.summary())")
     }
 
     static func singleThreadSQLite(path: String, rows: Int) throws {
@@ -250,6 +276,7 @@ enum SearchPagesScenario {
             at: path,
             options: DatabaseOptions(durability: .none, maxMapSize: 32 << 30, readOnly: true))
         defer { db.close() }
+        // Original §2.2 framed path.
         var baseline: Double = 0
         for threads in readerCounts {
             let result = runScaling(threads: threads) { stop, histogram in
@@ -266,6 +293,24 @@ enum SearchPagesScenario {
                 return local
             }
             printScaling("adsql", threads: threads, result: result, baseline: &baseline)
+        }
+        // F6 denorm framed path — the same scaling axis for the before/after compare.
+        var denormBaseline: Double = 0
+        for threads in readerCounts {
+            let result = runScaling(threads: threads) { stop, histogram in
+                var local = 0
+                var index = 0
+                while !stop.isSet {
+                    let params = SearchWorkload.params[index % SearchWorkload.params.count]
+                    index += 1
+                    let start = nowNanos()
+                    if let bytes = try? searchPagesFramedDenorm(db, params) { blackhole(bytes.count) }
+                    histogram.record(nowNanos() - start)
+                    local += 1
+                }
+                return local
+            }
+            printScaling("adsql/d", threads: threads, result: result, baseline: &denormBaseline)
         }
     }
 

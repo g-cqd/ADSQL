@@ -77,6 +77,102 @@ public enum SearchQuery {
         ORDER BY tier, rank LIMIT $limit
         """
 
+    // MARK: - F6 denormalized variant (RFC 0010 §2.2-2.4 "F6")
+
+    /// The §2.3 projection for the F6 DENORMALIZED query. Byte-identical output to
+    /// ``projection``, but the two framework-fold columns read the precomputed
+    /// `root_display` / `root_slug` columns instead of `COALESCE(r.…, d.framework)`
+    /// (so the `LEFT JOIN roots` is dropped), and the tier `CASE` compares the
+    /// precomputed `title_lc` / `key_lc` against a SINGLE bound `$raw_lc` (the raw
+    /// term lowered ONCE in Swift) rather than recomputing `LOWER(d.title)` /
+    /// `LOWER(d.key)` / `LOWER($raw)` for EVERY match. Every other column is the
+    /// same base-column read as ``projection``, so the framed rows are identical.
+    public static let denormProjection = """
+        d.key AS path, d.title, d.role, d.role_heading, d.abstract_text AS abstract,
+        d.declaration_text AS declaration, d.platforms_json AS platforms,
+        d.min_ios, d.min_macos, d.min_watchos, d.min_tvos, d.min_visionos,
+        d.root_display AS framework,
+        d.root_slug AS root_slug,
+        d.source_type, d.source_metadata, d.url_depth, d.is_release_notes,
+        d.is_deprecated, d.is_beta, d.kind AS doc_kind, d.language,
+        bm25(documents_fts, 10.0, 5.0, 3.0, 2.0, 1.0) AS rank,
+        CASE WHEN d.title_lc = $raw_lc THEN 0
+             WHEN d.key_lc = $raw_lc THEN 0
+             WHEN d.title_lc LIKE $raw_lc || '%' THEN 1
+             WHEN INSTR(d.title_lc, $raw_lc) > 0 THEN 2
+             ELSE 3 END AS tier
+        """
+
+    /// The 13 §2.4 filter predicates for the F6 DENORMALIZED query. Identical to
+    /// ``filters`` except the two JSON predicates read precomputed columns: `year`
+    /// is `d.year_num = $year` (the `CAST(json_extract(…,'$.year') AS INTEGER)`
+    /// folded into `year_num`), and `track_like` is `d.track_lc LIKE $track_like`
+    /// (the `LOWER(COALESCE(json_extract(…,'$.track'),''))` folded into `track_lc`,
+    /// never NULL). The other 11 predicates read base columns and are unchanged, so
+    /// they bite identically.
+    public static let denormFilters = """
+        AND ($framework IS NULL OR d.framework = $framework)
+        AND ($source_type IS NULL OR d.source_type = $source_type)
+        AND ($sources_json IS NULL
+             OR d.source_type IN (SELECT value FROM json_each($sources_json)))
+        AND ($kind IS NULL
+             OR LOWER(d.role_heading) = LOWER($kind)
+             OR LOWER(d.kind) = LOWER($kind)
+             OR LOWER(d.role) = LOWER($kind))
+        AND ($language IS NULL OR $language = 'both' OR d.language = $language)
+        AND ($year IS NULL OR d.year_num = $year)
+        AND ($track_like IS NULL OR d.track_lc LIKE $track_like)
+        AND ($dep_exclude IS NULL OR d.is_deprecated = 0)
+        AND ($dep_only IS NULL OR d.is_deprecated = 1)
+        AND ($min_ios IS NULL OR d.min_ios_num IS NULL OR d.min_ios_num <= $min_ios)
+        AND ($min_macos IS NULL OR d.min_macos_num IS NULL OR d.min_macos_num <= $min_macos)
+        AND ($min_watchos IS NULL OR d.min_watchos_num IS NULL OR d.min_watchos_num <= $min_watchos)
+        AND ($min_tvos IS NULL OR d.min_tvos_num IS NULL OR d.min_tvos_num <= $min_tvos)
+        AND ($min_visionos IS NULL OR d.min_visionos_num IS NULL OR d.min_visionos_num <= $min_visionos)
+        """
+
+    /// The F6 DENORMALIZED statement: the ``denormProjection`` over `documents_fts`
+    /// joined to `documents` (NO `LEFT JOIN roots` — folded into `root_display` /
+    /// `root_slug`), `WHERE documents_fts MATCH $query` plus ``denormFilters``,
+    /// `ORDER BY tier, rank LIMIT $limit`. A faithful rewrite of ``sql`` proven
+    /// byte-identical by `SearchDenormEquivalenceTests`; it does NOT replace ``sql``
+    /// (the original §2.2 form stays for the SQLite-oracle equivalence proof).
+    public static let denormSQL = """
+        SELECT \(denormProjection)
+        FROM documents_fts
+        JOIN documents d ON documents_fts.rowid = d.id
+        WHERE documents_fts MATCH $query
+        \(denormFilters)
+        ORDER BY tier, rank LIMIT $limit
+        """
+
+    /// Builds the bind bag for the F6 ``denormSQL``. Identical to ``bindings(for:)``
+    /// except the verbatim `$raw` is replaced by `$raw_lc` — the raw term lowered
+    /// ONCE here (via ``SearchDenorm/lower(_:)``, the same ASCII fold SQLite `LOWER`
+    /// applies) and bound, so the tier `CASE` never calls `LOWER($raw)` per row.
+    public static func denormBindings(for params: SearchPagesParams) -> [String: Value] {
+        let (depExclude, depOnly) = depGuards(params.deprecatedMode)
+        return [
+            "query": .text(params.query),
+            "raw_lc": .text(SearchDenorm.lower(params.raw)),
+            "limit": .integer(params.limit),
+            "framework": optionalText(params.framework),
+            "source_type": optionalText(params.sourceType),
+            "sources_json": optionalText(params.sourcesJSON),
+            "kind": optionalText(params.kind),
+            "language": optionalText(params.language),
+            "year": optionalInt(params.year),
+            "track_like": optionalText(params.trackLike),
+            "dep_exclude": depExclude,
+            "dep_only": depOnly,
+            "min_ios": optionalInt(params.minIOS),
+            "min_macos": optionalInt(params.minMacOS),
+            "min_watchos": optionalInt(params.minWatchOS),
+            "min_tvos": optionalInt(params.minTVOS),
+            "min_visionos": optionalInt(params.minVisionOS),
+        ]
+    }
+
     /// Builds the §2.5 named-parameter bind bag from a request. Every param the
     /// statement references is supplied (NULL when the filter is a passthrough),
     /// and `deprecated_mode` is lowered to the `$dep_exclude` / `$dep_only` guard
@@ -139,6 +235,21 @@ extension Database {
         let rows = try prepare(SearchQuery.sql).all(SearchQuery.bindings(for: params)).map(\.values)
         return ResponseFraming.frame(rows: rows, columnCount: SearchQuery.columnCount)
     }
+
+    /// The F6 DENORMALIZED counterpart of ``searchPagesFramed(_:)``: runs
+    /// ``SearchQuery/denormSQL`` (which reads the precomputed `title_lc`/`key_lc`/
+    /// `year_num`/`track_lc`/`root_display`/`root_slug` columns and drops the
+    /// `LEFT JOIN roots`) with ``SearchQuery/denormBindings(for:)``, then frames the
+    /// SAME §2.3 24-column projection into the SAME §2.5 bytes. Proven to produce
+    /// byte-identical output to ``searchPagesFramed(_:)`` by
+    /// `SearchDenormEquivalenceTests`; the perf gate runs both arms in `ADSQLBench
+    /// search`. Requires the denorm columns to be populated (the importer's F6 step,
+    /// prototyped here in the bench corpus + the test fixture).
+    public func searchPagesFramedDenorm(_ params: SearchPagesParams) throws(DBError) -> [UInt8] {
+        let rows = try prepare(SearchQuery.denormSQL)
+            .all(SearchQuery.denormBindings(for: params)).map(\.values)
+        return ResponseFraming.frame(rows: rows, columnCount: SearchQuery.columnCount)
+    }
 }
 
 /// Free-function form of ``Database/searchPagesFramed(_:)`` matching the task's
@@ -148,4 +259,12 @@ public func searchPagesFramed(
     _ db: Database, _ params: SearchPagesParams
 ) throws(DBError) -> [UInt8] {
     try db.searchPagesFramed(params)
+}
+
+/// Free-function form of ``Database/searchPagesFramedDenorm(_:)`` matching the
+/// `searchPagesFramedDenorm(_ db:_ params:)` shape. Delegates to the method.
+public func searchPagesFramedDenorm(
+    _ db: Database, _ params: SearchPagesParams
+) throws(DBError) -> [UInt8] {
+    try db.searchPagesFramedDenorm(params)
 }

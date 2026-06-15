@@ -101,7 +101,9 @@ enum AppleDocsFixture {
               min_ios TEXT, min_macos TEXT, min_watchos TEXT, min_tvos TEXT, min_visionos TEXT,
               framework TEXT, source_type TEXT, source_metadata TEXT,
               is_deprecated INTEGER, is_beta INTEGER, is_release_notes INTEGER,
-              kind TEXT, language TEXT, url_depth INTEGER)
+              kind TEXT, language TEXT, url_depth INTEGER,
+              title_lc TEXT, key_lc TEXT, year_num INTEGER, track_lc TEXT,
+              root_display TEXT, root_slug TEXT)
             """)
         try exec(db, "CREATE TABLE roots(slug TEXT PRIMARY KEY, display_name TEXT)")
         // roots covers some frameworks (so the LEFT JOIN hits) and deliberately
@@ -116,6 +118,24 @@ enum AppleDocsFixture {
         for doc in seedRows() {
             try exec(db, doc.insertSQL())
         }
+
+        // F6 build-time denormalization: populate the 6 denorm columns using SQLite's
+        // OWN scalar functions (`LOWER`/`CAST`/`json_extract`/`COALESCE`), so the
+        // stored values are byte-exact to the §2.2 read-query expressions they fold
+        // away — then the importer ports these columns into ADSQL verbatim. This is
+        // the same shape `SearchCorpus` computes in Swift via `SearchDenorm`; the
+        // equivalence test proves both forms produce identical rows.
+        try exec(
+            db,
+            """
+            UPDATE documents SET
+              title_lc = LOWER(title),
+              key_lc = LOWER(key),
+              year_num = CAST(json_extract(source_metadata, '$.year') AS INTEGER),
+              track_lc = LOWER(COALESCE(json_extract(source_metadata, '$.track'), '')),
+              root_display = COALESCE((SELECT display_name FROM roots WHERE slug = documents.framework), framework),
+              root_slug = COALESCE((SELECT slug FROM roots WHERE slug = documents.framework), framework)
+            """)
 
         try exec(
             db,

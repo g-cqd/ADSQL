@@ -33,6 +33,13 @@ enum SearchCorpus {
         // intentionally NOT in roots — their docs exercise the COALESCE fallback.
     ]
 
+    /// The `roots` row whose `slug` matches `framework` (the LEFT JOIN
+    /// `r.slug = d.framework`), or `nil` when no roots row matches (the COALESCE
+    /// fallback) — the input to the F6 `root_display` / `root_slug` fold.
+    static func rootEntry(_ framework: String) -> (slug: String, displayName: String)? {
+        roots.first { $0.slug == framework }
+    }
+
     /// The full §2.1 `documents` columns the read path reads (TEXT `min_*` mirrors
     /// plus the INTEGER `min_*_num` filter columns), `roots`, and the porter
     /// `documents_fts`. Built directly via ADSQL DDL.
@@ -48,7 +55,9 @@ enum SearchCorpus {
           min_ios TEXT, min_macos TEXT, min_watchos TEXT, min_tvos TEXT, min_visionos TEXT,
           framework TEXT, source_type TEXT, source_metadata TEXT,
           is_deprecated INTEGER, is_beta INTEGER, is_release_notes INTEGER,
-          kind TEXT, language TEXT, url_depth INTEGER)
+          kind TEXT, language TEXT, url_depth INTEGER,
+          title_lc TEXT, key_lc TEXT, year_num INTEGER, track_lc TEXT,
+          root_display TEXT, root_slug TEXT)
         """,
         "CREATE TABLE roots(slug TEXT PRIMARY KEY, display_name TEXT)",
         """
@@ -61,28 +70,33 @@ enum SearchCorpus {
     /// parses the same text).
     static let sqliteDDL = adsqlDDL
 
-    /// The 28 §2.1 `documents` columns, in the fixed bind order both engines use.
+    /// The 34 §2.1 `documents` columns, in the fixed bind order both engines use —
+    /// the 28 base columns plus the 6 F6 denormalized columns (`title_lc`, `key_lc`,
+    /// `year_num`, `track_lc`, `root_display`, `root_slug`) the denorm query reads.
     private static let insertColumns = """
         id, key, title, role, role_heading, abstract_text, declaration_text, headings,
         platforms_json, min_ios_num, min_macos_num, min_watchos_num, min_tvos_num,
         min_visionos_num, min_ios, min_macos, min_watchos, min_tvos, min_visionos,
         framework, source_type, source_metadata, is_deprecated, is_beta,
-        is_release_notes, kind, language, url_depth
+        is_release_notes, kind, language, url_depth,
+        title_lc, key_lc, year_num, track_lc, root_display, root_slug
         """
 
-    /// The SQLite build INSERT — 28 numbered `?N` binds (SQLite's positional form).
+    /// The SQLite build INSERT — 34 numbered `?N` binds (SQLite's positional form).
     static let sqliteInsertSQL = """
         INSERT INTO documents(\(insertColumns))
         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14,
-          ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28)
+          ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28,
+          ?29, ?30, ?31, ?32, ?33, ?34)
         """
 
-    /// The ADSQL build INSERT — 28 bare `?` binds (ADSQL numbers `?` 1-based by
+    /// The ADSQL build INSERT — 34 bare `?` binds (ADSQL numbers `?` 1-based by
     /// appearance; it does not accept the `?N` numbered form).
     static let adsqlInsertSQL = """
         INSERT INTO documents(\(insertColumns))
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-          ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+          ?, ?, ?, ?, ?, ?)
         """
 
     /// Every `$name` the §2.2 statement (`SearchQuery.sql`) references — so the
@@ -176,6 +190,14 @@ enum SearchCorpus {
         var kind: String
         var language: String
         var urlDepth: Int64
+        // F6 denormalized columns (computed by `SearchDenorm`, byte-identical to the
+        // SQLite expressions they replace in the read query).
+        var titleLC: String
+        var keyLC: String
+        var yearNum: Int64?
+        var trackLC: String
+        var rootDisplay: String
+        var rootSlug: String
 
         /// INSERT into the ADSQL `documents` table (bare-`?` positional binds).
         func insertADSQL(_ tx: SQLTransaction) throws(DBError) {
@@ -187,10 +209,12 @@ enum SearchCorpus {
                 num(minVisionOSNum), .text(minIOS), .text(minMacOS), .text(minWatchOS),
                 .text(minTVOS), .text(minVisionOS), .text(framework), .text(sourceType),
                 .text(sourceMetadata), .integer(isDeprecated), .integer(isBeta),
-                .integer(isReleaseNotes), .text(kind), .text(language), .integer(urlDepth))
+                .integer(isReleaseNotes), .text(kind), .text(language), .integer(urlDepth),
+                .text(titleLC), .text(keyLC), num(yearNum), .text(trackLC),
+                .text(rootDisplay), .text(rootSlug))
         }
 
-        /// Bind the same 28 columns positionally into a SQLite INSERT statement.
+        /// Bind the same 34 columns positionally into a SQLite INSERT statement.
         func bindSQLite(_ stmt: OpaquePointer?) {
             let transient = SearchPagesScenario.transient
             sqlite3_bind_int64(stmt, 1, id)
@@ -221,6 +245,12 @@ enum SearchCorpus {
             sqlite3_bind_text(stmt, 26, kind, -1, transient)
             sqlite3_bind_text(stmt, 27, language, -1, transient)
             sqlite3_bind_int64(stmt, 28, urlDepth)
+            sqlite3_bind_text(stmt, 29, titleLC, -1, transient)
+            sqlite3_bind_text(stmt, 30, keyLC, -1, transient)
+            bindNum(stmt, 31, yearNum)
+            sqlite3_bind_text(stmt, 32, trackLC, -1, transient)
+            sqlite3_bind_text(stmt, 33, rootDisplay, -1, transient)
+            sqlite3_bind_text(stmt, 34, rootSlug, -1, transient)
         }
 
         private func num(_ v: Int64?) -> Value { v.map(Value.integer) ?? .null }
@@ -287,6 +317,11 @@ enum SearchCorpus {
             let kind = pick(kinds)
             let roleHeading = kind == "article" ? "Article" : "Symbol"
             let docRole = kind == "symbol" ? "symbol" : kind
+            // F6 denorm: fold the tier-string / year / track / roots scalars the §2.2
+            // read query computes per match into precomputed columns. `roots` covers
+            // the first 14 frameworks (LEFT JOIN hit ⇒ display_name); the last 6 miss
+            // (COALESCE falls back to `framework`) — `SearchCorpus.rootEntry` resolves it.
+            let rootHit = SearchCorpus.rootEntry(framework)
             return Document(
                 id: id, key: key, title: title, role: docRole, roleHeading: roleHeading,
                 abstract: abstract, declaration: declaration, headings: headings,
@@ -299,7 +334,11 @@ enum SearchCorpus {
                 framework: framework, sourceType: pick(sourceTypes), sourceMetadata: metadata,
                 isDeprecated: next() % 6 == 0 ? 1 : 0, isBeta: next() % 8 == 0 ? 1 : 0,
                 isReleaseNotes: next() % 50 == 0 ? 1 : 0, kind: kind, language: pick(languages),
-                urlDepth: 2 + Int64(next() % 4))
+                urlDepth: 2 + Int64(next() % 4),
+                titleLC: SearchDenorm.lower(title), keyLC: SearchDenorm.lower(key),
+                yearNum: SearchDenorm.yearNum(year), trackLC: SearchDenorm.trackLC(track),
+                rootDisplay: SearchDenorm.rootDisplay(framework: framework, displayName: rootHit?.displayName),
+                rootSlug: SearchDenorm.rootSlug(framework: framework, slug: rootHit?.slug))
         }
 
         /// An iOS-style major version floor, biased so different platforms cluster
