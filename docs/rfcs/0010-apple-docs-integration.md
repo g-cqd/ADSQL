@@ -134,12 +134,12 @@ cell `[u8 tag][payload]`: `0`=NULL, `1`=INT `[i64 LE]`, `2`=REAL `[f64 LE]`, `3`
 | **F1** SQLite importer **[GATE]** | **✅ DONE** | `ADSQLImport` target: `Database.importSQLite(from:manifest:)` + `adsql import`; schema port + coercion + index/PK/UNIQUE port + manifest FTS5 rebuild + deep integrity; idempotent, deterministic |
 | **F2** FTS byte-parity | **✅ LANDED** | bm25f score parity **+ ranked-order parity** (ties → ascending rowid via the bounded-top-N upper-bound fix) proven through the importer vs SQLite FTS5 — `ImportedFTSParityTests.swift`, default + 5-weight |
 | **F3** scalar + main-query surface | **✅ PROVEN** | full §2.2–2.4 main query byte-parity vs SQLite — `AppleDocsMainQueryTests`; `json_each` covered by the contracted `inJSONEach` shape (not RFC 0011's FROM-clause TVF) |
-| **F4** covering/INCLUDE serving | **⏳ IN PROGRESS** | machinery exists; wiring `Planner` covering-detection (required-cols ⊆ index key ∪ includes) + executor activation + differential tests underway |
-| **F5** streaming zero-copy scan | **PARTIAL** | `RowView` (~Escapable) + `RowCursor.forEachRow/forEachRecordSpan` exist package-internal; `Statement` only exposes `.all()` |
-| **F6** build-time denormalization | **ABSENT** | inside F1 |
+| **F4** covering/INCLUDE serving | **✅ DONE** | binder proves required-cols ⊆ {rowid-alias} ∪ {INCLUDE} (stricter than key∪includes — a non-rowid key col is not in the entry value, so it forces a descent), stamps the `.index` plan `covering`, executor serves via `RowCursor(coveringIncludes:)` with no descent; pinned by `SQLCoveringIndexTests` (7 cases: positive/negative/reversed-INCLUDE/direct binder-decision) vs the no-index scan oracle + SQLite |
+| **F5** streaming zero-copy scan | **PARTIAL** (next) | `RowView` (~Escapable) + `RowCursor.forEachRow/forEachRecordSpan` exist package-internal; `Statement` only exposes `.all()` (full materialization). Design: a sink-based `forEach` that streams the **non-barrier** single-table path (ordered/no-ORDER-BY, no DISTINCT) row-by-row with bounded memory + early-exit, materializing-then-iterating the sort/dedup/aggregate barriers. `SQLRow` is owned/`Sendable` (not `~Escapable`), so yielding it to a caller closure carries no lifetime constraint — the work is a streaming projection pipeline, not a lifetime puzzle |
+| **F6** build-time denormalization | **✅ PROVEN** (importer productionization pending) | the denorm schema (title_lc/key_lc/year_num/track_lc/root_display/root_slug) + `ADSQLSearch.searchPagesFramedDenorm` collapse the JOIN + per-row LOWER/LIKE/json_extract; the ~2.2×-at-8-way win rides this. Remaining: fold the denorm projection into the importer (the bench built it via source-side SQL) |
 | **A1** compiled FTS-search primitive | **seams PRESENT** | `StatementCache` + per-`Statement` bound-plan cache + WAND; add typed `FTSSearchPlan` |
 | **A2 / A4** caller row encoder / mmap→out | **bytes PRESENT** | `RecordCodec.withText/withBlob`, `RowSlot.withTextBytes/withBlobBytes` (in-place `RawSpan`); add projection API |
-| **A3** one-call `searchFramed(into:)` | **ABSENT** (capstone) | composes A1+A2+F4+F5 |
+| **A3** one-call `searchFramed` | **⏳ Swift side DONE** | `ADSQLSearch.searchPagesFramed`/`…Denorm` compose the §2.2 query + §2.5 framing (byte-parity-proven, independent decoder). The remaining optimization is the zero-copy `into:&out` form (A2/A4: no intermediate `[SQLRow]`), not new surface |
 | **A5** filters pushed into scan | **POST-FILTER today** | `Executor` residual WHERE after the FTS source yields |
 | **A6** per-request snapshot + plan cache | **snapshot PRESENT** | pin one `ReadTxn`/request; cache `FTSSearchPlan` on the connection |
 | **A7** vectorized top-k projection | **ABSENT** (optional) | free once A2 |
@@ -239,13 +239,19 @@ run the query corpus against both engines and diff row order (gate:
 Verify byte-parity of `COLLATE NOCASE` equality (title-exact tier) and `LIKE LOWER($raw)||'%'`. No new
 functions expected; if F6 lands, the read query uses none of these at runtime anyway.
 
-### F4 — covering / `INCLUDE`-index serving **[the memory-bandwidth fix]** · PARTIAL
-Answer the ranked top-k **index-only**: the §2.3 projection + §2.4 filter columns stored as covering
-columns on the FTS index, so `MATCH … ORDER BY rank LIMIT k` is served straight off the index cursor
-with **no descent into the 4 GB `documents` table** — the working set shrinks from 4 GB to the covering
-postings + stored columns. The data structures exist (`IndexDefinition.includes`,
-`RowView.coveringIncludes`); the work is wiring `Planner.chooseIndex` to detect "projection ⊆ columns ∪
-includes" and the executor to pass `coveringIncludes` to `RowCursor` instead of reading the base table.
+### F4 — covering / `INCLUDE`-index serving **[the memory-bandwidth fix]** · ✅ DONE
+Answer queries **index-only** — straight off the index cursor with **no descent into the base table** —
+when every still-needed base-table column is served by the index entry. The binder (`Binder.swift`)
+proves "required cols (bound projection ∪ residual WHERE ∪ HAVING ∪ ORDER BY ∪ GROUP BY ∪ probe values)
+⊆ {rowid-alias} ∪ {INCLUDE}" on the single-table, non-aggregated, no-correlated-ref path, stamps the
+`.index` plan's `covering`, and the executor serves rows via `RowCursor(coveringIncludes:)`. The served
+set is **stricter than "key ∪ includes"**: a non-rowid KEY column is not stored in the entry value, so it
+forces a descent (correctness over optimization). `SQLCoveringIndexTests` (7 cases) pins it vs the
+no-index scan oracle and SQLite. *Note for the apple-docs read path:* the §2.3 projection is 24 columns —
+too wide for a covering index — so F4 does **not** serve `/search` (the win there came from F6 + WAND +
+invariant-fold). F4 is a general engine capability for narrow-projection filtered queries. *Follow-on:* an
+equality-probed key-column value is statically known (= the probe constant) and could be served without a
+descent — a future widening.
 
 ### F5 — streaming, zero-copy scan API · PARTIAL
 Replace `.all() → [SQLRow]` materialization with a **scan callback** (or `~Escapable` cursor) yielding
