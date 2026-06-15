@@ -135,7 +135,7 @@ cell `[u8 tag][payload]`: `0`=NULL, `1`=INT `[i64 LE]`, `2`=REAL `[f64 LE]`, `3`
 | **F2** FTS byte-parity | **✅ LANDED** | bm25f score parity **+ ranked-order parity** (ties → ascending rowid via the bounded-top-N upper-bound fix) proven through the importer vs SQLite FTS5 — `ImportedFTSParityTests.swift`, default + 5-weight |
 | **F3** scalar + main-query surface | **✅ PROVEN** | full §2.2–2.4 main query byte-parity vs SQLite — `AppleDocsMainQueryTests`; `json_each` covered by the contracted `inJSONEach` shape (not RFC 0011's FROM-clause TVF) |
 | **F4** covering/INCLUDE serving | **✅ DONE** | binder proves required-cols ⊆ {rowid-alias} ∪ {INCLUDE} (stricter than key∪includes — a non-rowid key col is not in the entry value, so it forces a descent), stamps the `.index` plan `covering`, executor serves via `RowCursor(coveringIncludes:)` with no descent; pinned by `SQLCoveringIndexTests` (7 cases: positive/negative/reversed-INCLUDE/direct binder-decision) vs the no-index scan oracle + SQLite |
-| **F5** streaming zero-copy scan | **PARTIAL** (next) | `RowView` (~Escapable) + `RowCursor.forEachRow/forEachRecordSpan` exist package-internal; `Statement` only exposes `.all()` (full materialization). Design: a sink-based `forEach` that streams the **non-barrier** single-table path (ordered/no-ORDER-BY, no DISTINCT) row-by-row with bounded memory + early-exit, materializing-then-iterating the sort/dedup/aggregate barriers. `SQLRow` is owned/`Sendable` (not `~Escapable`), so yielding it to a caller closure carries no lifetime constraint — the work is a streaming projection pipeline, not a lifetime puzzle |
+| **F5** streaming scan API | **✅ DONE** | `Statement.forEach` streams rows one at a time (SQLite's `sqlite3_step` model), `body` returns false to stop early. The **unbounded single-table** path (no LIMIT/OFFSET, no sort, no top-N/aggregate/join) emits each row through a non-escaping sink in `Accumulator.consume` — no full-result `[SQLRow]` materialization, so memory is bounded to one row (+ the DISTINCT seen-key set) and an early stop ends the scan immediately; sort/top-N/limit/aggregate/join/compound materialize then stream the finished rows. The `.all()` path is unchanged but for one nil-check/row. `SQLStreamingTests`: `forEach ≡ all()` across 13 shapes + early-exit |
 | **F6** build-time denormalization | **✅ PROVEN** (importer productionization pending) | the denorm schema (title_lc/key_lc/year_num/track_lc/root_display/root_slug) + `ADSQLSearch.searchPagesFramedDenorm` collapse the JOIN + per-row LOWER/LIKE/json_extract; the ~2.2×-at-8-way win rides this. Remaining: fold the denorm projection into the importer (the bench built it via source-side SQL) |
 | **A1** compiled FTS-search primitive | **seams PRESENT** | `StatementCache` + per-`Statement` bound-plan cache + WAND; add typed `FTSSearchPlan` |
 | **A2 / A4** caller row encoder / mmap→out | **bytes PRESENT** | `RecordCodec.withText/withBlob`, `RowSlot.withTextBytes/withBlobBytes` (in-place `RawSpan`); add projection API |
@@ -253,11 +253,17 @@ invariant-fold). F4 is a general engine capability for narrow-projection filtere
 equality-probed key-column value is statically known (= the probe constant) and could be served without a
 descent — a future widening.
 
-### F5 — streaming, zero-copy scan API · PARTIAL
-Replace `.all() → [SQLRow]` materialization with a **scan callback** (or `~Escapable` cursor) yielding
-one `RowView` at a time with `RawSpan` column access, bounded by `LIMIT k`, early-terminating after k.
-The machinery exists (`RowView`, `RowCursor.forEachRow`); the work is exposing it on the **public**
-`Statement` API.
+### F5 — streaming scan API · ✅ DONE
+`Statement.forEach(_:_:)` streams result rows one at a time (SQLite's `sqlite3_step` row-at-a-time
+model); the body returns `false` to stop early. The **unbounded single-table** path emits each surviving
+row through a non-escaping sink in `Accumulator.consume` with **no full-result `[SQLRow]` materialization**
+— memory bounded to one row (plus the DISTINCT seen-key set), early-exit ends the scan immediately.
+Sort / bounded-top-N / LIMIT / aggregate / join / compound (already memory-bounded, or needing the full
+set to sort) materialize internally, then stream the finished rows; so `forEach` is correct for every
+shape and the `.all()` path is unchanged (one nil-check per row). The follow-on (A2/A4) layers a
+zero-copy *byte* encoder on top — projecting straight from the mapped span into the response buffer with
+no intermediate `[Value]` — which is the boundary-collapse work, not this row-level API. Pinned by
+`SQLStreamingTests` (`forEach ≡ all()` across 13 shapes, early-exit, full-scan-once, non-SELECT throws).
 
 ---
 
