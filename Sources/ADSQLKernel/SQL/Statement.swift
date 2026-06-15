@@ -136,6 +136,59 @@ public final class Statement: Sendable {
         try execute(parameters).rows.first
     }
 
+    /// Streams result rows to `body` one at a time, returning `false` from `body`
+    /// to stop early — SQLite's `sqlite3_step` row-at-a-time model. The **unbounded
+    /// single-table** read path (no ORDER BY sort, no LIMIT/OFFSET, no GROUP BY /
+    /// aggregate / join) never materializes the full result set: memory stays
+    /// bounded to one row (plus, for DISTINCT, the seen-key set), and an early
+    /// `false` stops the scan immediately rather than after building every row.
+    /// Sorted / grouped / joined / limited queries (already memory-bounded, or
+    /// needing the full set to sort) are materialized internally, then their
+    /// finished rows are streamed to `body`. `body` runs inside the read snapshot;
+    /// each `SQLRow` owns its `Value`s, so copying values out is safe.
+    public func forEach(
+        _ parameters: SQLParameters = SQLParameters(),
+        _ body: @escaping (SQLRow) throws(DBError) -> Bool
+    ) throws(DBError) {
+        guard case .select(let select) = ast else {
+            throw DBError.sqlUnsupported("statement does not return rows")
+        }
+        let execution = effectiveExecution
+        try database.read { (txn) throws(DBError) in
+            switch try self.boundQuery(
+                select, schema: try txn.schema(), planningTag: execution.planningTag)
+            {
+            case .select(let plan):
+                let header = plan.header
+                // A streamable single-table plan emits each row through `sink` and
+                // returns []; any other plan ignores `sink` and returns its materialized
+                // rows, which we stream to `body` here. Either way `body` is invoked
+                // exactly once per result row, in order.
+                let materialized = try Self.runSelect(
+                    plan, txn: txn, params: parameters, execution: execution,
+                    sink: { (values) throws(DBError) -> Bool in
+                        try body(SQLRow(header: header, values: values))
+                    })
+                for row in materialized {
+                    if try !body(row) { return }
+                }
+            case .compound(let compound):
+                let rows = try Self.runCompound(
+                    compound, txn: txn, params: parameters, execution: execution)
+                for row in rows {
+                    if try !body(row) { return }
+                }
+            }
+        }
+    }
+
+    /// `forEach` with positional parameters.
+    public func forEach(
+        _ parameters: [Value], _ body: @escaping (SQLRow) throws(DBError) -> Bool
+    ) throws(DBError) {
+        try forEach(SQLParameters(positional: parameters), body)
+    }
+
     /// Executes for effect; any rows (e.g. RETURNING) are discarded.
     @discardableResult
     public func run(_ parameters: Value...) throws(DBError) -> RunResult {
@@ -184,28 +237,38 @@ public final class Statement: Sendable {
             case .select(let plan):
                 return try Self.runSelect(plan, txn: txn, params: parameters, execution: execution)
             case .compound(let compound):
-                var combined: [[Value]] = []
-                for (position, arm) in compound.arms.enumerated() {
-                    let armRows = try Self.runSelect(
-                        arm.select, txn: txn, params: parameters, execution: execution
-                    ).map(\.values)
-                    if position == 0 {
-                        combined = armRows
-                    } else if arm.op == .unionAll {
-                        combined += armRows
-                    } else {
-                        combined = SelectExecutor.distinctRows(
-                            combined + armRows, collations: compound.outputCollations)
-                    }
-                }
-                return try SelectExecutor.finishCompound(combined, compound: compound, params: parameters)
+                return try Self.runCompound(compound, txn: txn, params: parameters, execution: execution)
             }
         }
     }
 
+    /// Combines a compound (UNION / UNION ALL) by running each arm and applying the
+    /// compound's dedup/ORDER BY/LIMIT — always materialized (the dedup/sort spans arms).
+    private static func runCompound(
+        _ compound: BoundCompound, txn: borrowing ReadTxn, params: SQLParameters,
+        execution: ExecutionOptions
+    ) throws(DBError) -> [SQLRow] {
+        var combined: [[Value]] = []
+        for (position, arm) in compound.arms.enumerated() {
+            let armRows = try runSelect(
+                arm.select, txn: txn, params: params, execution: execution
+            ).map(\.values)
+            if position == 0 {
+                combined = armRows
+            } else if arm.op == .unionAll {
+                combined += armRows
+            } else {
+                combined = SelectExecutor.distinctRows(
+                    combined + armRows, collations: compound.outputCollations)
+            }
+        }
+        return try SelectExecutor.finishCompound(combined, compound: compound, params: params)
+    }
+
     private static func runSelect(
         _ plan: BoundSelect, txn: borrowing ReadTxn, params: SQLParameters,
-        execution: ExecutionOptions = .default
+        execution: ExecutionOptions = .default,
+        sink: (([Value]) throws(DBError) -> Bool)? = nil
     ) throws(DBError) -> [SQLRow] {
         // An FTS binding has no schema table; model it to the executor as a
         // rowid-keyed table whose handle is `.empty` (never scanned — its access is
@@ -257,7 +320,7 @@ public final class Statement: Sendable {
         return try SelectExecutor.run(
             plan, tables: tables, index: index, joinIndexes: joinIndexes, ftsRecords: ftsRecords,
             resolver: txn.resolver, params: params, subquery: runner, execution: execution,
-            mergeIndexes: mergeIndexes)
+            mergeIndexes: mergeIndexes, sink: sink)
     }
 
     /// Runs one correlated scalar subquery against the current outer row,

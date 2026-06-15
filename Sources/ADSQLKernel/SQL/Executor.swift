@@ -14,7 +14,14 @@ enum SelectExecutor {
         outer: (context: RowContext, binding: QueryBinding)? = nil,
         subquery: @escaping SubqueryRunner = rejectSubquery,
         execution: ExecutionOptions = .default,
-        mergeIndexes: (outer: Catalog.IndexRecord, inner: Catalog.IndexRecord)? = nil
+        mergeIndexes: (outer: Catalog.IndexRecord, inner: Catalog.IndexRecord)? = nil,
+        // F5 streaming: when set, the **unbounded single-table** path (no LIMIT/OFFSET,
+        // no sort, no bounded-top-N) emits each surviving row to this sink as it is
+        // produced — no full-result materialization — and returns `[]`. `sink` returns
+        // false to stop early. Every other shape (sort/top-N/aggregate/join/distinct-
+        // index) ignores it and returns the materialized `[SQLRow]` for the caller to
+        // iterate; so a non-streamable query is still correct, just not bounded-memory.
+        sink: (([Value]) throws(DBError) -> Bool)? = nil
     ) throws(DBError) -> [SQLRow] {
         let evaluator = execution.evaluator
         if plan.isAggregated {
@@ -161,6 +168,12 @@ enum SelectExecutor {
             }
             return { () throws(DBError) -> Value in try SQLEval.evaluate(expr, env) }
         }
+        // F5: stream row-by-row only when nothing downstream needs the full set first —
+        // no LIMIT/OFFSET slice (`bounds`), no post-scan sort (`collectKeys`), no bounded
+        // top-N. (A LIMIT query is already memory-bounded, so it materializes-then-iterates.)
+        let canStream = sink != nil && bounds == nil && !collectKeys && topN == nil
+        // Pass the sink to `consume` (non-escaping) only when streamable; nil otherwise.
+        let streamSink = canStream ? sink : nil
         let accumulator = Accumulator(
             context: context,
             residualThunk: foldedResidual.map(makeThunk),
@@ -176,8 +189,12 @@ enum SelectExecutor {
             ftsScoreNeeded: ftsScoreNeeded
         ) {
             rowid, span, score throws(DBError) in
-            unsafe try accumulator.consume(rowid: rowid, span: span, score: score)
+            unsafe try accumulator.consume(
+                rowid: rowid, span: span, score: score, sink: streamSink)
         }
+
+        // F5: rows were emitted to `sink` as produced — nothing to materialize/slice.
+        if canStream { return [] }
 
         var rows = accumulator.rows
         var sortKeys = accumulator.sortKeys
@@ -323,7 +340,10 @@ enum SelectExecutor {
             self.covering = covering
         }
 
-        func consume(rowid: Int64, span: UnsafeRawBufferPointer, score: Double) throws(DBError) -> Bool {
+        func consume(
+            rowid: Int64, span: UnsafeRawBufferPointer, score: Double,
+            sink: (([Value]) throws(DBError) -> Bool)? = nil
+        ) throws(DBError) -> Bool {
             if seenRowids != nil {
                 if seenRowids!.contains(rowid) { return true }
                 seenRowids!.insert(rowid)
@@ -358,6 +378,9 @@ enum SelectExecutor {
             if distinct, !seenOutputs.insert(GroupKey(projected, collations: distinctCollations)).inserted {
                 return true
             }
+            // F5: emit straight to the sink (no `rows` growth). `canStream` guarantees
+            // there is no LIMIT/OFFSET/sort/top-N here, so scan order is the final order.
+            if let sink { return try sink(projected) }
             rows.append(projected)
             if collectKeys {
                 var keys: [Value] = []
