@@ -391,7 +391,10 @@ enum SelectExecutor {
             var hi = rows.count
             while lo < hi {
                 let mid = (lo + hi) / 2
-                if orderBefore(sortKeys[mid], keys) { lo = mid + 1 } else { hi = mid }
+                // Upper bound: a key equal to an existing entry inserts AFTER it, so a
+                // run of tied sort keys keeps scan order (ascending rowid) — matching
+                // SQLite and the WAND path — instead of reversing each equal-key run.
+                if orderBefore(keys, sortKeys[mid]) { hi = mid } else { lo = mid + 1 }
             }
             rows.insert(row, at: lo)
             sortKeys.insert(keys, at: lo)
