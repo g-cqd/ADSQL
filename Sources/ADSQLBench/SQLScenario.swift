@@ -1,7 +1,12 @@
 import ADSQL
 import CSQLite
-import Darwin
 import Foundation
+
+#if canImport(Darwin)
+    import Darwin
+#elseif canImport(Glibc)
+    import Glibc
+#endif
 
 /// SQL-vs-SQL benchmark on the apple-docs `documents` shape: the same DDL,
 /// batched INSERT, point SELECT by unique key, and filtered search-shaped

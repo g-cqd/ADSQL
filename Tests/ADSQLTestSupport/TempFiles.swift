@@ -1,4 +1,8 @@
-import Darwin
+#if canImport(Darwin)
+    import Darwin
+#elseif canImport(Glibc)
+    import Glibc
+#endif
 
 /// Creates a fresh private temp directory and returns paths inside it.
 package struct TempDir: Sendable {

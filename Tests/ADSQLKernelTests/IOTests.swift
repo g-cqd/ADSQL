@@ -1,8 +1,13 @@
 import ADSQLTestSupport
-import Darwin
 import Testing
 
 @testable import ADSQLKernel
+
+#if canImport(Darwin)
+    import Darwin
+#elseif canImport(Glibc)
+    import Glibc
+#endif
 
 @Suite("FileChannel")
 struct FileChannelTests {

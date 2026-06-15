@@ -1,7 +1,12 @@
 import ADSQL
 import ADSQLImport
-import Darwin
 import Foundation
+
+#if canImport(Darwin)
+    import Darwin
+#elseif canImport(Glibc)
+    import Glibc
+#endif
 
 let usage = """
     adsql — ADSQL database tool

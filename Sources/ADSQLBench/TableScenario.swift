@@ -1,7 +1,12 @@
 import ADSQL
 import CSQLite
-import Darwin
 import Foundation
+
+#if canImport(Darwin)
+    import Darwin
+#elseif canImport(Glibc)
+    import Glibc
+#endif
 
 /// Relational benchmark on the literal apple-docs `documents` shape:
 /// rowid-alias PK + 5 secondary indexes (one unique, one NOCASE, one

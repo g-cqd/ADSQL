@@ -1,8 +1,13 @@
 import ADSQL
-import Darwin
 import Dispatch
 import Foundation
 import Synchronization
+
+#if canImport(Darwin)
+    import Darwin
+#elseif canImport(Glibc)
+    import Glibc
+#endif
 
 struct BenchConfig {
     var rows = 200_000

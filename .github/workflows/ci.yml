@@ -52,6 +52,55 @@ jobs:
       - name: Test (SQLite-differential suite)
         run: swift test
 
+  # Linux build lane (port Phase 1, RFC 0011). ADSQL was Darwin-only; this lane is the actual
+  # Linux verification (the port is developed on macOS, which cannot build for Linux locally).
+  #
+  # NON-BLOCKING FOR NOW (`continue-on-error: true`): the Glibc forks are best-effort against a
+  # portability audit and residual compile errors are expected to be iterated here. Keeping the
+  # lane advisory means an in-progress port never reddens the overall CI signal.
+  # TODO(RFC 0011 Phase 2): once this is reliably green, drop `continue-on-error` so Linux builds
+  # become a required gate, then add `swift test` (durability validation is Phase 2).
+  #
+  # Toolchain: the manifest is `swift-tools-version: 6.3` and uses `.strictMemorySafety()` (SE-0458)
+  # plus the experimental `Lifetimes` feature (SE-0446/0456), so the Linux toolchain must be recent
+  # enough to parse and honor them. The released `swift:6.0`/`6.1` images predate the 6.3 manifest
+  # version and cannot even parse Package.swift; the nightly image tracks the development toolchain
+  # that ships these features. Pin to a dated nightly tag once the features land in a stable release.
+  linux:
+    name: Build (Linux, ${{ matrix.arch }})
+    continue-on-error: true
+    runs-on: ${{ matrix.runner }}
+    container: swiftlang/swift:nightly-jammy
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { arch: x64, runner: ubuntu-latest }
+          - { arch: arm64, runner: ubuntu-24.04-arm }
+    steps:
+      - uses: actions/checkout@v6
+      - name: Show toolchain
+        run: swift --version
+      # CSQLite (a system-library target) links libsqlite3; its dev headers back the SQLite-file
+      # importer, the benchmark harness, and the differential tests. The read-only engine
+      # (ADSQLKernel) does not link sqlite3, but `swift build` resolves the whole graph.
+      - name: Install libsqlite3-dev
+        run: |
+          apt-get update
+          apt-get install -y libsqlite3-dev
+      - name: Cache SwiftPM
+        uses: actions/cache@v5
+        with:
+          path: |
+            .build
+            ~/.cache/org.swift.swiftpm
+          key: spm-linux-${{ matrix.arch }}-${{ hashFiles('Package.swift') }}-${{ hashFiles('Sources/**', 'Tests/**', 'Plugins/**') }}
+          restore-keys: |
+            spm-linux-${{ matrix.arch }}-${{ hashFiles('Package.swift') }}-
+            spm-linux-${{ matrix.arch }}-
+      - name: Build
+        run: swift build
+
   platforms:
     name: Build (${{ matrix.platform }})
     needs: build-test

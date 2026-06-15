@@ -1,4 +1,8 @@
-import Darwin
+#if canImport(Darwin)
+    import Darwin
+#elseif canImport(Glibc)
+    import Glibc
+#endif
 
 /// Complete error taxonomy for the kernel. Every fallible kernel API uses
 /// `throws(DBError)` — there are no untyped throws below the façade.
@@ -49,10 +53,24 @@ extension DBError: CustomStringConvertible {
         case .io(let errno, let op):
             // strerror returns a shared static buffer; strerror_r writes into a
             // caller-owned buffer, so concurrent error formatting cannot corrupt it.
+            //
+            // Two incompatible `strerror_r` contracts exist. The XSI/POSIX variant
+            // (Darwin, and glibc when _GNU_SOURCE is off) returns an `Int` (0 on
+            // success) and always writes the message into the caller's buffer. The
+            // GNU variant (glibc's default, which Swift's Glibc overlay imports)
+            // returns a `char *` that MAY point at an immutable static string and
+            // MAY leave the supplied buffer untouched — so the result must be read
+            // from the returned pointer, not the buffer. Reading the buffer under
+            // the GNU contract is the silent-wrong-error bug this fork avoids.
             let detail = withUnsafeTemporaryAllocation(of: CChar.self, capacity: 256) {
                 buffer in
-                _ = unsafe strerror_r(errno, buffer.baseAddress!, buffer.count)
-                return unsafe String(cString: buffer.baseAddress!)
+                #if canImport(Glibc)
+                    let resolved = unsafe strerror_r(errno, buffer.baseAddress!, buffer.count)
+                    return unsafe String(cString: resolved)
+                #else
+                    _ = unsafe strerror_r(errno, buffer.baseAddress!, buffer.count)
+                    return unsafe String(cString: buffer.baseAddress!)
+                #endif
             }
             return "I/O error in \(op): \(detail) (errno \(errno))"
         case .badMagic: return "not an ADSQL database (bad magic)"

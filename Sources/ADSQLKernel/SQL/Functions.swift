@@ -1,4 +1,8 @@
-import Darwin
+#if canImport(Darwin)
+    import Darwin
+#elseif canImport(Glibc)
+    import Glibc
+#endif
 
 /// Scalar functions and value coercions, matching SQLite's core behavior:
 /// ASCII-only LOWER/UPPER, character-based LENGTH/INSTR/SUBSTR (1-based),

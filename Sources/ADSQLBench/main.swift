@@ -1,6 +1,11 @@
 import ADSQL
-import Darwin
 import Foundation
+
+#if canImport(Darwin)
+    import Darwin
+#elseif canImport(Glibc)
+    import Glibc
+#endif
 
 // adsql-bench [--rows N] [--seconds S] [--engine adsql|sqlite] [--dir PATH] [scenarios...]
 // Scenarios: cold get scan concurrent upsert table sql fts strategy

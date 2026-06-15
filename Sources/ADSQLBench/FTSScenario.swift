@@ -1,7 +1,12 @@
 import ADSQL
 import CSQLite
-import Darwin
 import Foundation
+
+#if canImport(Darwin)
+    import Darwin
+#elseif canImport(Glibc)
+    import Glibc
+#endif
 
 /// F6b — the FTS *measurement* slice. FTS is already correctness-complete and
 /// SQLite-FTS5-parity-verified (F6a); this benchmarks the apple-docs

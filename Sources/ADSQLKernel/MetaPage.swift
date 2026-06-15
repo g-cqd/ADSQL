@@ -1,4 +1,8 @@
-import Darwin
+#if canImport(Darwin)
+    import Darwin
+#elseif canImport(Glibc)
+    import Glibc
+#endif
 
 /// The database meta state, persisted in the two ping-pong meta pages
 /// (page 0 and page 1). Commit N+1 writes to page `(N+1) % 2`; recovery

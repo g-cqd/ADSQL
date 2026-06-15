@@ -1,5 +1,10 @@
-import Darwin
 import Foundation
+
+#if canImport(Darwin)
+    import Darwin
+#elseif canImport(Glibc)
+    import Glibc
+#endif
 
 struct BenchRNG: RandomNumberGenerator {
     private var state: UInt64
@@ -15,7 +20,16 @@ struct BenchRNG: RandomNumberGenerator {
 
 @inline(__always)
 func nowNanos() -> UInt64 {
-    clock_gettime_nsec_np(CLOCK_UPTIME_RAW)
+    #if canImport(Darwin)
+        return clock_gettime_nsec_np(CLOCK_UPTIME_RAW)
+    #else
+        // `clock_gettime_nsec_np` is a Darwin extension. The portable equivalent for
+        // a monotonic, sleep-immune benchmark timer is `CLOCK_MONOTONIC` via
+        // `clock_gettime`, converted to nanoseconds.
+        var ts = timespec()
+        _ = clock_gettime(CLOCK_MONOTONIC, &ts)
+        return UInt64(ts.tv_sec) &* 1_000_000_000 &+ UInt64(ts.tv_nsec)
+    #endif
 }
 
 struct LatencyHistogram {

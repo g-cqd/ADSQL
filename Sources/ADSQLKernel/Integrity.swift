@@ -1,4 +1,8 @@
-import Darwin
+#if canImport(Darwin)
+    import Darwin
+#elseif canImport(Glibc)
+    import Glibc
+#endif
 
 public struct IntegrityReport: Sendable {
     public var generation: UInt64
@@ -168,24 +172,89 @@ extension Database {
             meta: meta, deep: deep)
     }
 
-    /// O(1) atomic snapshot via APFS clonefile(2). Quiesces the writer for
-    /// the (instant) duration of the clone, so the snapshot is exactly the
-    /// newest committed generation.
+    /// Atomic snapshot of the newest committed generation. Quiesces the writer
+    /// for the duration of the copy, so the snapshot is exactly that generation.
+    ///
+    /// On Darwin this is an O(1) APFS `clonefile(2)` (copy-on-write); on Linux,
+    /// which has no copy-on-write clone in its portable syscall surface, it is a
+    /// plain byte copy. The two differ only in cost: Linux loses the O(1)
+    /// guarantee (the copy is O(file size)) but the resulting snapshot is
+    /// byte-for-byte identical. This is the one genuine macOS↔Linux semantic
+    /// difference in the port; it is isolated entirely to this method.
     public func snapshot(to destination: String) throws(DBError) {
         var result: Result<Void, DBError> = .success(())
         writerThread.sync {
-            let status = path.withCString { src in
-                destination.withCString { dst in
-                    unsafe clonefile(src, dst, 0)
+            #if canImport(Darwin)
+                let status = path.withCString { src in
+                    destination.withCString { dst in
+                        unsafe clonefile(src, dst, 0)
+                    }
                 }
-            }
-            if status != 0 {
-                result = .failure(
-                    errno == EEXIST
-                        ? DBError.snapshotDestinationExists
-                        : DBError.io(errno: errno, op: "clonefile(\(destination))"))
-            }
+                if status != 0 {
+                    result = .failure(
+                        errno == EEXIST
+                            ? DBError.snapshotDestinationExists
+                            : DBError.io(errno: errno, op: "clonefile(\(destination))"))
+                }
+            #else
+                result = Self.byteCopySnapshot(from: path, to: destination)
+            #endif
         }
         try result.get()
     }
+
+    #if !canImport(Darwin)
+        /// Linux fallback for `snapshot`: a fresh `O_EXCL` destination plus a
+        /// read/write copy loop. `O_EXCL` reproduces `clonefile`'s "destination must
+        /// not exist" contract (`EEXIST` → `snapshotDestinationExists`). Runs inside
+        /// the writer-quiesced critical section, so the source is a stable image of
+        /// the newest committed generation for the duration of the copy.
+        private static func byteCopySnapshot(
+            from source: String, to destination: String
+        ) -> Result<Void, DBError> {
+            let src = source.withCString { unsafe open($0, O_RDONLY | O_CLOEXEC) }
+            guard src >= 0 else {
+                return .failure(DBError.io(errno: errno, op: "open(\(source))"))
+            }
+            defer { _ = Glibc.close(src) }
+
+            let dst = destination.withCString {
+                unsafe open($0, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0o644)
+            }
+            guard dst >= 0 else {
+                let err = errno
+                return .failure(
+                    err == EEXIST
+                        ? DBError.snapshotDestinationExists
+                        : DBError.io(errno: err, op: "open(\(destination))"))
+            }
+            defer { _ = Glibc.close(dst) }
+
+            let bufferSize = 1 << 20
+            let copyResult: Result<Void, DBError> = withUnsafeTemporaryAllocation(
+                of: UInt8.self, capacity: bufferSize
+            ) { buffer in
+                let base = unsafe buffer.baseAddress!
+                while true {
+                    let readN = unsafe Glibc.read(src, base, bufferSize)
+                    if readN < 0 {
+                        if errno == EINTR { continue }
+                        return .failure(DBError.io(errno: errno, op: "read(\(source))"))
+                    }
+                    if readN == 0 { break }
+                    var written = 0
+                    while written < readN {
+                        let wrote = unsafe Glibc.write(dst, base + written, readN - written)
+                        if wrote < 0 {
+                            if errno == EINTR { continue }
+                            return .failure(DBError.io(errno: errno, op: "write(\(destination))"))
+                        }
+                        written += wrote
+                    }
+                }
+                return .success(())
+            }
+            return copyResult
+        }
+    #endif
 }

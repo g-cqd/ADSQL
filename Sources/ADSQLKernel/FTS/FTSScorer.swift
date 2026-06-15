@@ -1,4 +1,8 @@
-import Darwin
+#if canImport(Darwin)
+    import Darwin
+#elseif canImport(Glibc)
+    import Glibc
+#endif
 
 /// bm25 / bm25f relevance scoring (M5/F4a). Turns an `FTSQuery` (F3a) plus the
 /// F2 index statistics into a single relevance score per matching document,

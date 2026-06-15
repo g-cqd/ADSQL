@@ -1,4 +1,8 @@
-import Darwin
+#if canImport(Darwin)
+    import Darwin
+#elseif canImport(Glibc)
+    import Glibc
+#endif
 
 /// Byte-level cell operations on slotted node pages. Purely mechanical —
 /// COW, allocation, and tree structure live in `BTree`.

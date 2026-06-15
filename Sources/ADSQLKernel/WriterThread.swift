@@ -1,6 +1,11 @@
-import Darwin
 import Dispatch
 import Synchronization
+
+#if canImport(Darwin)
+    import Darwin
+#elseif canImport(Glibc)
+    import Glibc
+#endif
 
 /// A serial executor backed by ONE dedicated pthread running on a large,
 /// controlled stack. It is a drop-in replacement for the `adsql.writer`
@@ -92,8 +97,13 @@ import Synchronization
         // (`.userInitiated`). Without this the thread inherits a lower default QoS,
         // so the scheduler is slower to wake it on `sync` hand-off — measurably
         // inflating writeSync latency. Best-effort: ignore failure (QoS is an
-        // optimization, not a correctness requirement).
-        _ = unsafe pthread_attr_set_qos_class_np(&attr, QOS_CLASS_USER_INITIATED, 0)
+        // optimization, not a correctness requirement). The QoS attribute is a
+        // Darwin extension (`_np`); Glibc has no equivalent, so the thread simply
+        // runs at the default scheduling class there — a latency knob, not a
+        // correctness difference.
+        #if canImport(Darwin)
+            _ = unsafe pthread_attr_set_qos_class_np(&attr, QOS_CLASS_USER_INITIATED, 0)
+        #endif
 
         var tid: pthread_t?
         let rc = unsafe pthread_create(&tid, &attr, writerThreadMain, opaque)
@@ -247,10 +257,20 @@ private struct UncheckedSendableBox<T>: @unchecked Sendable {
 /// C trampoline for `pthread_create`. Reclaims the retain handed out in
 /// `WriterThread.init` and enters the serial loop. Returns `nil` per the
 /// `@convention(c)` start-routine signature when the loop ends (at shutdown).
-/// The Darwin start routine receives a non-optional `UnsafeMutableRawPointer`
-/// (`pthread_create`'s arg is passed straight through).
-private func writerThreadMain(_ arg: UnsafeMutableRawPointer) -> UnsafeMutableRawPointer? {
-    let instance = unsafe Unmanaged<WriterThread>.fromOpaque(arg).takeRetainedValue()
-    instance.runLoop()
-    return nil
-}
+/// The argument type differs by platform: Darwin imports the start routine's
+/// `void *` as a non-optional `UnsafeMutableRawPointer`, whereas Glibc imports
+/// it as an optional. Both receive the exact same non-nil `opaque` pointer
+/// `pthread_create` was handed, so the Linux branch force-unwraps it.
+#if canImport(Darwin)
+    private func writerThreadMain(_ arg: UnsafeMutableRawPointer) -> UnsafeMutableRawPointer? {
+        let instance = unsafe Unmanaged<WriterThread>.fromOpaque(arg).takeRetainedValue()
+        instance.runLoop()
+        return nil
+    }
+#elseif canImport(Glibc)
+    private func writerThreadMain(_ arg: UnsafeMutableRawPointer?) -> UnsafeMutableRawPointer? {
+        let instance = unsafe Unmanaged<WriterThread>.fromOpaque(arg!).takeRetainedValue()
+        instance.runLoop()
+        return nil
+    }
+#endif

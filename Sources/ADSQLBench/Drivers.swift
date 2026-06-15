@@ -1,6 +1,11 @@
 import ADSQL
 import CSQLite
-import Darwin
+
+#if canImport(Darwin)
+    import Darwin
+#elseif canImport(Glibc)
+    import Glibc
+#endif
 
 /// Common surface over both engines. Each engine uses its *intended*
 /// concurrency model: ADSQL shares one handle across reader threads

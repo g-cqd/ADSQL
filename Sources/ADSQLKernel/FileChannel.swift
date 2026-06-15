@@ -1,5 +1,10 @@
-import Darwin
 import Synchronization
+
+#if canImport(Darwin)
+    import Darwin
+#elseif canImport(Glibc)
+    import Glibc
+#endif
 
 /// POSIX-backed storage channel. All calls are stateless per-fd operations
 /// (`pread`/`pwrite`/`fcntl`), safe to issue from any thread.
@@ -49,8 +54,15 @@ package final class FileChannel: StorageChannel, @unchecked Sendable {
     package func pread(into buffer: UnsafeMutableRawBufferPointer, at offset: Int) throws(DBError) {
         var done = 0
         while done < buffer.count {
-            let n = unsafe Darwin.pread(
-                fileDescriptor, buffer.baseAddress! + done, buffer.count - done, off_t(offset + done))
+            // Module-qualified to disambiguate the libc syscall from this type's own
+            // `pread` method; the module name is the only thing that differs by platform.
+            #if canImport(Darwin)
+                let n = unsafe Darwin.pread(
+                    fileDescriptor, buffer.baseAddress! + done, buffer.count - done, off_t(offset + done))
+            #else
+                let n = unsafe Glibc.pread(
+                    fileDescriptor, buffer.baseAddress! + done, buffer.count - done, off_t(offset + done))
+            #endif
             if n < 0 {
                 if errno == EINTR { continue }
                 try throwErrno("pread")
@@ -63,8 +75,13 @@ package final class FileChannel: StorageChannel, @unchecked Sendable {
     package func pwrite(_ buffer: UnsafeRawBufferPointer, at offset: Int) throws(DBError) {
         var done = 0
         while done < buffer.count {
-            let n = unsafe Darwin.pwrite(
-                fileDescriptor, buffer.baseAddress! + done, buffer.count - done, off_t(offset + done))
+            #if canImport(Darwin)
+                let n = unsafe Darwin.pwrite(
+                    fileDescriptor, buffer.baseAddress! + done, buffer.count - done, off_t(offset + done))
+            #else
+                let n = unsafe Glibc.pwrite(
+                    fileDescriptor, buffer.baseAddress! + done, buffer.count - done, off_t(offset + done))
+            #endif
             if n < 0 {
                 if errno == EINTR { continue }
                 try throwErrno("pwrite")
@@ -86,7 +103,11 @@ package final class FileChannel: StorageChannel, @unchecked Sendable {
                     iov_len: buf.count)
             }
             let n = iov.withUnsafeMutableBufferPointer { ptr in
-                unsafe Darwin.pwritev(fileDescriptor, ptr.baseAddress, Int32(count), off_t(at))
+                #if canImport(Darwin)
+                    unsafe Darwin.pwritev(fileDescriptor, ptr.baseAddress, Int32(count), off_t(at))
+                #else
+                    unsafe Glibc.pwritev(fileDescriptor, ptr.baseAddress, Int32(count), off_t(at))
+                #endif
             }
             if n < 0 {
                 if errno == EINTR { continue }
@@ -118,30 +139,56 @@ package final class FileChannel: StorageChannel, @unchecked Sendable {
         case .none:
             return
         case .barrier:
-            if fcntl(fileDescriptor, F_BARRIERFSYNC) == -1 {
-                guard fsync(fileDescriptor) == 0 else { try throwErrno("fsync(barrier fallback)") }
-            }
+            #if canImport(Darwin)
+                if fcntl(fileDescriptor, F_BARRIERFSYNC) == -1 {
+                    guard fsync(fileDescriptor) == 0 else { try throwErrno("fsync(barrier fallback)") }
+                }
+            #else
+                // Linux has no `F_BARRIERFSYNC`. `fdatasync` is the closest analogue:
+                // it forces the data (and the size metadata needed to read it back)
+                // to the storage stack, which is the ordering guarantee the barrier
+                // profile relies on. It does not issue a device cache flush — that is
+                // exactly the barrier/full distinction Darwin draws.
+                guard fdatasync(fileDescriptor) == 0 else { try throwErrno("fdatasync(barrier)") }
+            #endif
         case .full:
-            if fcntl(fileDescriptor, F_FULLFSYNC) == -1 {
-                guard fsync(fileDescriptor) == 0 else { try throwErrno("fsync(full fallback)") }
-            }
+            #if canImport(Darwin)
+                if fcntl(fileDescriptor, F_FULLFSYNC) == -1 {
+                    guard fsync(fileDescriptor) == 0 else { try throwErrno("fsync(full fallback)") }
+                }
+            #else
+                // `F_FULLFSYNC` asks the drive to flush its cache; Linux exposes no
+                // portable userspace equivalent, so `fsync` is the strongest portable
+                // guarantee (already the Darwin fallback when `F_FULLFSYNC` is refused).
+                guard fsync(fileDescriptor) == 0 else { try throwErrno("fsync(full)") }
+            #endif
         }
     }
 
     package func preallocate(minimumSize: Int) throws(DBError) {
         let current = try fileSize()
         guard minimumSize > current else { return }
-        var store = fstore_t(
-            fst_flags: UInt32(F_ALLOCATECONTIG),
-            fst_posmode: F_PEOFPOSMODE,
-            fst_offset: 0,
-            fst_length: off_t(minimumSize - current),
-            fst_bytesalloc: 0)
-        if unsafe fcntl(fileDescriptor, F_PREALLOCATE, &store) == -1 {
-            store.fst_flags = UInt32(F_ALLOCATEALL)
-            // Best effort: a failed preallocation only costs contiguity, not correctness.
-            _ = unsafe fcntl(fileDescriptor, F_PREALLOCATE, &store)
-        }
+        #if canImport(Darwin)
+            var store = fstore_t(
+                fst_flags: UInt32(F_ALLOCATECONTIG),
+                fst_posmode: F_PEOFPOSMODE,
+                fst_offset: 0,
+                fst_length: off_t(minimumSize - current),
+                fst_bytesalloc: 0)
+            if unsafe fcntl(fileDescriptor, F_PREALLOCATE, &store) == -1 {
+                store.fst_flags = UInt32(F_ALLOCATEALL)
+                // Best effort: a failed preallocation only costs contiguity, not correctness.
+                _ = unsafe fcntl(fileDescriptor, F_PREALLOCATE, &store)
+            }
+        #else
+            // Linux equivalent: `posix_fallocate` reserves backing blocks for the
+            // range. Like the Darwin `F_PREALLOCATE` hint it is a best-effort
+            // optimization (avoids fragmentation / ENOSPC-at-write), not a
+            // correctness requirement — the shared `ftruncate` below establishes the
+            // actual file length post-condition. On filesystems that don't support it
+            // `posix_fallocate` returns an error code, which we ignore.
+            _ = posix_fallocate(fileDescriptor, off_t(current), off_t(minimumSize - current))
+        #endif
         guard ftruncate(fileDescriptor, off_t(minimumSize)) == 0 else { try throwErrno("ftruncate") }
     }
 
@@ -151,13 +198,29 @@ package final class FileChannel: StorageChannel, @unchecked Sendable {
 
     /// Toggles the unified-buffer-cache bypass for bulk load paths.
     package func setNoCache(_ enabled: Bool) {
-        _ = fcntl(fileDescriptor, F_NOCACHE, enabled ? 1 : 0)
+        #if canImport(Darwin)
+            _ = fcntl(fileDescriptor, F_NOCACHE, enabled ? 1 : 0)
+        #else
+            // Linux has no persistent per-fd "no cache" mode. The closest best-effort
+            // is to advise the page cache to drop this file's pages when bypass is
+            // requested (`POSIX_FADV_DONTNEED` over the whole file, len 0 = to EOF),
+            // and to restore the default policy otherwise. Purely advisory: any error
+            // (e.g. ENOSYS on exotic filesystems) is ignored, exactly like the Darwin
+            // `fcntl` whose result is discarded.
+            _ = posix_fadvise(
+                fileDescriptor, 0, 0, enabled ? POSIX_FADV_DONTNEED : POSIX_FADV_NORMAL)
+        #endif
     }
 
     package func close() {
         guard fileDescriptor >= 0 else { return }
         let (exchanged, _) = closed.compareExchange(
             expected: false, desired: true, ordering: .acquiringAndReleasing)
-        if exchanged { _ = Darwin.close(fileDescriptor) }
+        // Module-qualified to call the libc syscall, not this type's `close()`.
+        #if canImport(Darwin)
+            if exchanged { _ = Darwin.close(fileDescriptor) }
+        #else
+            if exchanged { _ = Glibc.close(fileDescriptor) }
+        #endif
     }
 }

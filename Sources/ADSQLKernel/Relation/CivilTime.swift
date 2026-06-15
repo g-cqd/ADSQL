@@ -1,4 +1,8 @@
-import Darwin
+#if canImport(Darwin)
+    import Darwin
+#elseif canImport(Glibc)
+    import Glibc
+#endif
 
 /// `datetime('now')` defaults without Foundation: UTC wall clock formatted
 /// as SQLite does ("YYYY-MM-DD HH:MM:SS"). Civil-date math is the classic

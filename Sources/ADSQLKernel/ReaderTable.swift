@@ -1,5 +1,10 @@
 import ADCAtomics
-import Darwin
+
+#if canImport(Darwin)
+    import Darwin
+#elseif canImport(Glibc)
+    import Glibc
+#endif
 
 /// Cross-process reader registry + writer exclusion, living in the lock file
 /// (`<db>-lock`, mapped shared).

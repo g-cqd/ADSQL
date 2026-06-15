@@ -1,8 +1,13 @@
 import ADSQLTestSupport
-import Darwin
 import Testing
 
 @testable import ADSQLKernel
+
+#if canImport(Darwin)
+    import Darwin
+#elseif canImport(Glibc)
+    import Glibc
+#endif
 
 /// Read-path integrity guards (health-check R1/R2): the committed-page reader
 /// rejects an out-of-range page pointer, and — opt-in — verifies checksums as
