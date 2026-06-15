@@ -96,4 +96,31 @@ struct ImportFollowOnTests {
         #expect(rows1 == rows2)
         #expect(matches1 == matches2)
     }
+
+    @Test func portsPrimaryKeyAndUniqueConstraints() throws {
+        let dir = TempDir()
+        defer { dir.cleanup() }
+        let source = dir.file("roots.db")
+        var src: OpaquePointer?
+        try #require(
+            sqlite3_open_v2(source, &src, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, nil) == SQLITE_OK)
+        defer { sqlite3_close_v2(src) }
+        for sql in [
+            "CREATE TABLE roots(slug TEXT PRIMARY KEY, display_name TEXT, code TEXT UNIQUE)",
+            "INSERT INTO roots VALUES ('uikit', 'UIKit', 'UK'), ('swiftui', 'SwiftUI', 'SU')",
+        ] {
+            try #require(sqlite3_exec(src, sql, nil, nil, nil) == SQLITE_OK, "exec: \(sql)")
+        }
+
+        let db = try Database.open(at: dir.file("out.adsql"))
+        defer { db.close() }
+        _ = try db.importSQLite(from: source)  // no FTS → no manifest needed
+
+        // The TEXT PRIMARY KEY (slug, not a rowid alias) + the UNIQUE column (code)
+        // port as unique indexes — the slug index is the roots-join key.
+        let indexes = try db.read { (txn) throws(DBError) in try txn.schema().indexes(on: "roots") }
+        #expect(indexes.contains { $0.columns == ["slug"] && $0.unique })
+        #expect(indexes.contains { $0.columns == ["code"] && $0.unique })
+        #expect(try db.read { (txn) throws(DBError) in try txn.rowCount(in: "roots") } == 2)
+    }
 }

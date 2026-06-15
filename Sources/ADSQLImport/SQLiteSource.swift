@@ -79,20 +79,22 @@ public final class SQLiteSource {
         }
     }
 
-    /// Explicit `CREATE INDEX` indexes of a table — skips auto-indexes (PK / UNIQUE
-    /// constraints, `origin` != `c`) and expression indexes (a NULL `index_info`
-    /// column name), which ADSQL doesn't model.
+    /// Secondary indexes to recreate in ADSQL: explicit `CREATE INDEX` indexes plus
+    /// the auto-indexes backing PK / UNIQUE constraints (renamed off the reserved
+    /// `sqlite_` prefix). Skips partial indexes and expression indexes (a NULL
+    /// `index_info` column name), which ADSQL doesn't model. An `INTEGER PRIMARY
+    /// KEY` has no auto-index (it aliases the rowid), so it is never duplicated.
     public func indexes(of table: String) throws(DBError) -> [Index] {
-        var lists: [(name: String, unique: Bool, origin: String)] = []
+        var lists: [(name: String, unique: Bool, partial: Bool)] = []
         try query("PRAGMA index_list(\"\(escapeIdent(table))\")") { stmt in
             lists.append(
                 (
                     name: Self.text(stmt, 1), unique: sqlite3_column_int(stmt, 2) != 0,
-                    origin: Self.text(stmt, 3)
+                    partial: sqlite3_column_int(stmt, 4) != 0
                 ))
         }
         var result: [Index] = []
-        for list in lists where list.origin == "c" {
+        for list in lists where !list.partial {
             var columns: [String] = []
             var hasExpression = false
             try query("PRAGMA index_info(\"\(escapeIdent(list.name))\")") { stmt in
@@ -102,9 +104,11 @@ public final class SQLiteSource {
                     columns.append(Self.text(stmt, 2))
                 }
             }
-            if !hasExpression, !columns.isEmpty {
-                result.append(Index(name: list.name, columns: columns, unique: list.unique))
-            }
+            guard !hasExpression, !columns.isEmpty else { continue }
+            let name =
+                list.name.hasPrefix("sqlite_")
+                ? "\(table)_\(columns.joined(separator: "_"))_key" : list.name
+            result.append(Index(name: name, columns: columns, unique: list.unique))
         }
         return result
     }
