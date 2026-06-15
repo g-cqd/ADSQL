@@ -87,6 +87,12 @@ enum CompiledEval {
             }
         case .binary(.match, _, _):
             return nil  // an access path, never row-evaluated
+        case .binary(.jsonExtract, let l, let r):
+            guard let cl = sub(l), let cr = sub(r) else { return nil }
+            return { () throws(DBError) -> Value in try SQLJSON.arrow(try cl(), try cr(), asJSON: true) }
+        case .binary(.jsonExtractText, let l, let r):
+            guard let cl = sub(l), let cr = sub(r) else { return nil }
+            return { () throws(DBError) -> Value in try SQLJSON.arrow(try cl(), try cr(), asJSON: false) }
         case .binary(let op, let l, let r):  // arithmetic (NULL-propagating, REAL promote)
             guard let cl = sub(l), let cr = sub(r) else { return nil }
             return { () throws(DBError) -> Value in try SQLFunctions.arithmetic(op, try cl(), try cr()) }

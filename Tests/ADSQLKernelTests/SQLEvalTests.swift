@@ -205,6 +205,12 @@ struct SQLEvalDifferentialTests {
         "json_patch('{\"a\":1,\"b\":2}', '{\"b\":3,\"c\":4}')",
         "json_patch('{\"a\":1,\"b\":2}', '{\"a\":null}')",
         "json_patch('{\"a\":{\"x\":1}}', '{\"a\":{\"y\":2}}')",
+        // -> (returns JSON) and ->> (returns a SQL scalar); path, bare label, and index RHS
+        "'{\"a\":1}' -> '$.a'", "'{\"a\":1}' ->> '$.a'",
+        "'{\"a\":\"x\"}' -> '$.a'", "'{\"a\":\"x\"}' ->> '$.a'",
+        "'{\"a\":{\"b\":5}}' -> '$.a'", "'{\"a\":1}' -> '$.missing'",
+        "'{\"a\":1}' ->> 'a'", "'[1,2,3]' -> 2", "'[1,2,3]' ->> 2",
+        "'{\"a\":{\"b\":7}}' -> 'a' ->> 'b'",
     ]
 
     @Test(arguments: jsonCorpus.indices)

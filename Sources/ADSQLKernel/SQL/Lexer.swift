@@ -295,6 +295,10 @@ enum SQLLexer {
                 symbol("==")
                 continue
             }
+            if b == 0x2D, peek(1) == 0x3E {  // -> and ->> (JSON access operators)
+                symbol(peek(2) == 0x3E ? "->>" : "->")
+                continue
+            }
             switch b {
             case 0x3D: symbol("=")
             case 0x3C: symbol("<")

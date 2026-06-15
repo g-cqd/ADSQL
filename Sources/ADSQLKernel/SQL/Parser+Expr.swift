@@ -143,7 +143,7 @@ extension SQLParser {
     /// Pure peek — consumes nothing.
     func infixBP() -> Int? {
         if checkKeyword("COLLATE") { return Self.bpCollate }
-        if checkSymbol("||") { return Self.bpConcat }
+        if checkSymbol("||") || checkSymbol("->") || checkSymbol("->>") { return Self.bpConcat }
         if checkSymbol("*") || checkSymbol("/") || checkSymbol("%") { return Self.bpMultiplicative }
         if checkSymbol("+") || checkSymbol("-") { return Self.bpAdditive }
         if checkSymbol("<") || checkSymbol("<=") || checkSymbol(">") || checkSymbol(">=") {
@@ -182,6 +182,8 @@ extension SQLParser {
     /// `=`/`!=`/`<>` belong to the equality band, handled by `equalitySuffix`.
     mutating func consumeSimpleBinary() throws(DBError) -> SQLBinaryOp {
         if matchSymbol("||") { return .concat }
+        if matchSymbol("->>") { return .jsonExtractText }
+        if matchSymbol("->") { return .jsonExtract }
         if matchSymbol("*") { return .multiply }
         if matchSymbol("/") { return .divide }
         if matchSymbol("%") { return .modulo }

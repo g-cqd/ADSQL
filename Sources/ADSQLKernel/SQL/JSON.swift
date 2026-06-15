@@ -177,6 +177,24 @@ enum SQLJSON {
         }
     }
 
+    /// The `->` (`asJSON: true`) and `->>` (`asJSON: false`) operators. The right operand
+    /// selects a path: an INTEGER `N` → `$[N]`, TEXT beginning with `$` → that path, any
+    /// other value → the object label `$."<text>"`. `->` returns the result rendered as
+    /// JSON text; `->>` returns it as a SQL scalar. A NULL operand yields NULL.
+    static func arrow(_ document: Value, _ spec: Value, asJSON: Bool) throws(DBError) -> Value {
+        if document.isNull || spec.isNull { return .null }
+        let path: String
+        switch spec {
+        case .integer(let n): path = "$[\(n)]"
+        case .text(let s) where s.hasPrefix("$"): path = s
+        case .text(let s): path = "$." + renderString(s)
+        default: path = "$." + renderString(SQLFunctions.textify(spec))
+        }
+        let node = try parsePath(path).evaluate(try parse(SQLFunctions.textify(document)))
+        if asJSON { return node.exists ? .text(render(node)) : .null }
+        return toSQL(node)
+    }
+
     // MARK: - Builders
 
     /// JSON literal text for a SQL scalar used as a `json_array`/`json_object` element or

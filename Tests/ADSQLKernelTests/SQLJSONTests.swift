@@ -161,4 +161,18 @@ struct SQLJSONTests {
         #expect(try SQLJSON.patch(#"{"a":{"x":1}}"#, with: #"{"a":{"y":2}}"#) == .text(#"{"a":{"x":1,"y":2}}"#))
         #expect(try SQLJSON.patch(#"{"a":1}"#, with: "42") == .text("42"))  // non-object patch replaces
     }
+
+    @Test func arrowOperatorsSelectAndShape() throws {
+        let doc = #"{"a":{"b":5},"c":"x"}"#
+        // -> returns JSON (a string stays quoted); ->> returns the SQL scalar (unquoted)
+        #expect(try SQLJSON.arrow(.text(doc), .text("$.c"), asJSON: true) == .text(#""x""#))
+        #expect(try SQLJSON.arrow(.text(doc), .text("$.c"), asJSON: false) == .text("x"))
+        #expect(try SQLJSON.arrow(.text(doc), .text("$.a"), asJSON: true) == .text(#"{"b":5}"#))
+        // bare-label RHS → $."a"; integer RHS → $[n]
+        #expect(try SQLJSON.arrow(.text(doc), .text("a"), asJSON: false) == .text(#"{"b":5}"#))
+        #expect(try SQLJSON.arrow(.text("[1,2,3]"), .integer(2), asJSON: false) == .integer(3))
+        // missing path and NULL operands → NULL
+        #expect(try SQLJSON.arrow(.text(doc), .text("$.missing"), asJSON: true) == .null)
+        #expect(try SQLJSON.arrow(.null, .text("$.a"), asJSON: false) == .null)
+    }
 }

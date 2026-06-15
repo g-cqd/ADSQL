@@ -273,6 +273,10 @@ enum SQLEval {
             // row-level predicate; reaching here means it appeared where it can't
             // drive an FTS scan (e.g. a projection, or on a non-FTS table).
             throw DBError.sqlRuntime("MATCH is only valid as a WHERE constraint on an FTS table")
+        case .binary(.jsonExtract, let l, let r):
+            return try SQLJSON.arrow(try evaluate(l, env), try evaluate(r, env), asJSON: true)
+        case .binary(.jsonExtractText, let l, let r):
+            return try SQLJSON.arrow(try evaluate(l, env), try evaluate(r, env), asJSON: false)
         case .binary(let op, let l, let r):
             return try SQLFunctions.arithmetic(
                 op, try evaluate(l, env), try evaluate(r, env))
@@ -381,6 +385,8 @@ enum SQLEval {
             }
         case .binary(.concat, _, _):
             return .text
+        case .binary(.jsonExtract, _, _), .binary(.jsonExtractText, _, _):
+            return .none
         case .binary(let op, _, _) where !op.isComparison && op != .and && op != .or:
             return .numeric
         case .unary(.negate, _):

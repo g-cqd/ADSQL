@@ -48,6 +48,10 @@ public enum SQLBinaryOp: String, Equatable, Sendable {
     case divide = "/"
     case modulo = "%"
     case concat = "||"
+    /// SQLite JSON access operators: `a -> b` yields a JSON value (text), `a ->> b`
+    /// yields a SQL scalar. Same precedence as `||`.
+    case jsonExtract = "->"
+    case jsonExtractText = "->>"
     /// FTS full-text membership: `<fts-table> MATCH <query>`. Never row-evaluated;
     /// the planner turns this into an `.fts` access path (see Planner/Executor).
     case match = "MATCH"
