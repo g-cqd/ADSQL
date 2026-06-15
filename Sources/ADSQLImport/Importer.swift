@@ -40,7 +40,11 @@ extension Database {
             guard !existing.contains(tableName) else {
                 throw DBError.invalidDefinition("import target already contains table '\(tableName)'")
             }
-            try importTable(named: tableName, from: source, batchSize: batchSize)
+            // F6: create any build-time denorm columns WITH the table (no ALTER TABLE);
+            // they are populated after every table exists (see `populateDenorm`).
+            let denormColumns = manifest.denorm.first { $0.table == tableName }?.columnDefinitions ?? []
+            try importTable(
+                named: tableName, from: source, batchSize: batchSize, denormColumns: denormColumns)
         }
 
         for fts in manifest.ftsTables {
@@ -50,11 +54,16 @@ extension Database {
             try importFTS(fts, from: source, batchSize: batchSize)
         }
 
+        // F6: fill the denorm columns now that every source table (incl. any lookup
+        // table a denorm column reads) has been imported.
+        for denorm in manifest.denorm { try populateDenorm(denorm) }
+
         return try verifyIntegrity(deep: true)
     }
 
     private func importTable(
-        named tableName: String, from source: SQLiteSource, batchSize: Int
+        named tableName: String, from source: SQLiteSource, batchSize: Int,
+        denormColumns: [ColumnDefinition] = []
     ) throws(DBError) {
         let columns = try source.columns(of: tableName)
         let pk: PrimaryKey =
@@ -63,12 +72,15 @@ extension Database {
             } else {
                 .implicitRowid
             }
+        // Source columns first, then any F6 denorm columns (nullable, filled post-copy).
         let definition = TableDefinition(
             tableName,
-            columns: columns.map { ColumnDefinition($0.name, $0.type, notNull: $0.notNull) },
+            columns: columns.map { ColumnDefinition($0.name, $0.type, notNull: $0.notNull) } + denormColumns,
             primaryKey: pk)
         try writeSync { (txn) throws(DBError) in try txn.createTable(definition) }
 
+        // Slots cover only the SOURCE columns; the trailing denorm columns are left to
+        // their default (NULL) during the copy and populated afterward.
         let slots = Array(0..<columns.count)
         var batch: [[Value]] = []
         batch.reserveCapacity(batchSize)
@@ -108,6 +120,33 @@ extension Database {
             } catch DBError.indexKeyTooLarge(_, let size) {
                 print("import: skipped index \(index.name) on \(tableName): key \(size) B over the limit")
             }
+        }
+    }
+
+    /// F6: fills the denorm columns of `denorm.table` (created empty during the copy).
+    /// Per-row columns via one `UPDATE … SET name = valueSQL, …`; each lookup column via
+    /// one `UPDATE` per (small) lookup-table row keyed on `matchColumn`, then a
+    /// `fallbackColumn` fill for the rows with no match. Column names + value expressions
+    /// come from the TRUSTED manifest (interpolated, like the FTS table/column names);
+    /// the lookup-table VALUES are bound parameters. (For a very large table the single
+    /// per-row UPDATE is one big write txn — fine for a one-time build; batch by rowid if
+    /// that ever bites.)
+    private func populateDenorm(_ denorm: ImportManifest.Denorm) throws(DBError) {
+        if !denorm.columns.isEmpty {
+            let assignments = denorm.columns.map { "\($0.name) = \($0.valueSQL)" }.joined(separator: ", ")
+            try prepare("UPDATE \(denorm.table) SET \(assignments)").run()
+        }
+        for lookup in denorm.lookups {
+            let lookupRows = try prepare(
+                "SELECT \(lookup.lookupKey), \(lookup.lookupValue) FROM \(lookup.lookupTable)"
+            ).all()
+            let update = try prepare(
+                "UPDATE \(denorm.table) SET \(lookup.name) = ? WHERE \(lookup.matchColumn) = ?")
+            for row in lookupRows { try update.run(row[1], row[0]) }  // SET <value> WHERE … = <key>
+            try prepare(
+                "UPDATE \(denorm.table) SET \(lookup.name) = \(lookup.fallbackColumn) "
+                    + "WHERE \(lookup.name) IS NULL"
+            ).run()
         }
     }
 

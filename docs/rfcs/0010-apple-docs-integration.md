@@ -136,7 +136,7 @@ cell `[u8 tag][payload]`: `0`=NULL, `1`=INT `[i64 LE]`, `2`=REAL `[f64 LE]`, `3`
 | **F3** scalar + main-query surface | **✅ PROVEN** | full §2.2–2.4 main query byte-parity vs SQLite — `AppleDocsMainQueryTests`; `json_each` covered by the contracted `inJSONEach` shape (not RFC 0011's FROM-clause TVF) |
 | **F4** covering/INCLUDE serving | **✅ DONE** | binder proves required-cols ⊆ {rowid-alias} ∪ {INCLUDE} (stricter than key∪includes — a non-rowid key col is not in the entry value, so it forces a descent), stamps the `.index` plan `covering`, executor serves via `RowCursor(coveringIncludes:)` with no descent; pinned by `SQLCoveringIndexTests` (7 cases: positive/negative/reversed-INCLUDE/direct binder-decision) vs the no-index scan oracle + SQLite |
 | **F5** streaming scan API | **✅ DONE** | `Statement.forEach` streams rows one at a time (SQLite's `sqlite3_step` model), `body` returns false to stop early. The **unbounded single-table** path (no LIMIT/OFFSET, no sort, no top-N/aggregate/join) emits each row through a non-escaping sink in `Accumulator.consume` — no full-result `[SQLRow]` materialization, so memory is bounded to one row (+ the DISTINCT seen-key set) and an early stop ends the scan immediately; sort/top-N/limit/aggregate/join/compound materialize then stream the finished rows. The `.all()` path is unchanged but for one nil-check/row. `SQLStreamingTests`: `forEach ≡ all()` across 13 shapes + early-exit |
-| **F6** build-time denormalization | **✅ PROVEN** (importer productionization pending) | the denorm schema (title_lc/key_lc/year_num/track_lc/root_display/root_slug) + `ADSQLSearch.searchPagesFramedDenorm` collapse the JOIN + per-row LOWER/LIKE/json_extract; the ~2.2×-at-8-way win rides this. Remaining: fold the denorm projection into the importer (the bench built it via source-side SQL) |
+| **F6** build-time denormalization | **✅ DONE** | the denorm columns (title_lc/key_lc/year_num/track_lc/root_display/root_slug) + `ADSQLSearch.searchPagesFramedDenorm` collapse the JOIN + per-row LOWER/LIKE/json_extract; the validated ~2.2×-at-8-way win rides this. Productionized: the importer's `ImportManifest.Denorm` spec (per-row expr columns + roots-lookup columns) builds the denorm corpus directly — `DenormImportTests` |
 | **A1** compiled FTS-search primitive | **seams PRESENT** | `StatementCache` + per-`Statement` bound-plan cache + WAND; add typed `FTSSearchPlan` |
 | **A2 / A4** caller row encoder / mmap→out | **bytes PRESENT** | `RecordCodec.withText/withBlob`, `RowSlot.withTextBytes/withBlobBytes` (in-place `RawSpan`); add projection API |
 | **A3** one-call `searchFramed` | **⏳ Swift side DONE** | `ADSQLSearch.searchPagesFramed`/`…Denorm` compose the §2.2 query + §2.5 framing (byte-parity-proven, independent decoder). The remaining optimization is the zero-copy `into:&out` form (A2/A4: no intermediate `[SQLRow]`), not new surface |
@@ -348,8 +348,9 @@ first; the **perf features** then make it *beat* SQLite — the reason for the s
   > with cores. ADSQL is ~3× slower SINGLE-thread (25 vs 8.4 ms) → the swap wins on **throughput at production
   > concurrency, not per-query latency** (the wait-free-MVCC thesis, vindicated). **F6 denorm is essential**:
   > the no-denorm `searchPagesFramed` arm is only 67 req/s @ 8-way (loses to SQLite's 96). **The apple-docs
-  > swap premise is CONFIRMED.** Remaining to ship: productionize F6 (fold the denorm projection into the
-  > importer / apple-docs' corpus build) + the cross-repo `INT` wiring.
+  > swap premise is CONFIRMED.** ✅ F6 is now productionized — the importer's `ImportManifest.Denorm` spec
+  > (per-row expression columns + roots-lookup columns) builds the denorm corpus directly (`DenormImportTests`),
+  > so the only remaining ship step is the cross-repo `INT` wiring (deferred).
   >
   > **The ~3× single-thread gap (`/usr/bin/sample`-profiled), which the concurrency win overcomes:** the
   > JOIN (FTS ⋈ `documents`, inherent — FTS yields docids, `documents` holds the columns) — per-match

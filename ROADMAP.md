@@ -122,8 +122,9 @@ seeded op generator, simulated disk for crash injection). Tests in `ADSQLKernelT
 > single-thread latency (ADSQL is ~3× slower per query). **F6 build-time denormalization** (→ no `roots`
 > JOIN, cheap precomputed tier/filter columns) is what makes it competitive — the no-denorm query loses
 > even at 8-way. The FTS *delete/churn* + *index-build* gaps are **off** the read path (the importer builds
-> the FTS once; `/search` never writes). Remaining to ship the swap: productionize F6 (fold the denorm
-> projection into the importer) + the cross-repo `INT` wiring (deferred). See RFC 0010 §6.
+> the FTS once; `/search` never writes). ✅ **F6 is productionized** — the importer's `Denorm` manifest
+> spec builds the denorm corpus directly (per-row expr columns + roots-lookup columns). The only remaining
+> ship step is the cross-repo `INT` wiring (deferred). See RFC 0010 §6.
 
 ---
 

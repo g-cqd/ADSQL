@@ -50,15 +50,90 @@ public struct ImportManifest: Sendable, Codable {
 
     public enum Detail: String, Sendable, Codable { case full, column, none }
 
+    /// JSON-friendly column type (`ColumnType` is a non-`Codable` `UInt8` enum).
+    public enum TypeName: String, Sendable, Codable {
+        case integer, real, text, blob
+        var columnType: ColumnType {
+            switch self {
+            case .integer: .integer
+            case .real: .real
+            case .text: .text
+            case .blob: .blob
+            }
+        }
+    }
+
+    /// Build-time denormalization (RFC 0010 F6): extra columns the importer creates
+    /// WITH `table` (ADSQL has no `ALTER TABLE`) and populates by `UPDATE` AFTER the
+    /// row copy + all other tables exist (a lookup reads another imported table). Lets
+    /// a consumer serve a denormalized read query with no per-row `LOWER`/`json_extract`
+    /// or JOIN — the F6 win on apple-docs `/search` (≈2.2× vs SQLite at 8-way, RFC §6).
+    public struct Denorm: Sendable, Codable {
+        public var table: String
+        /// Per-row computed columns: `name` ← `valueSQL` (an expression over the row,
+        /// e.g. `LOWER(title)`), applied as one `UPDATE <table> SET name = valueSQL, …`.
+        public var columns: [Column]
+        /// Lookup columns: `name` ← the `lookupValue` of the `lookupTable` row whose
+        /// `lookupKey` == this row's `matchColumn`, else `fallbackColumn`. (ADSQL has no
+        /// correlated-subquery `UPDATE`, so the importer iterates the small lookup table.)
+        public var lookups: [Lookup]
+
+        public struct Column: Sendable, Codable {
+            public var name: String
+            public var type: TypeName
+            public var valueSQL: String
+            public init(name: String, type: TypeName, valueSQL: String) {
+                self.name = name
+                self.type = type
+                self.valueSQL = valueSQL
+            }
+        }
+        public struct Lookup: Sendable, Codable {
+            public var name: String
+            public var type: TypeName
+            public var matchColumn: String
+            public var lookupTable: String
+            public var lookupKey: String
+            public var lookupValue: String
+            public var fallbackColumn: String
+            public init(
+                name: String, type: TypeName, matchColumn: String, lookupTable: String,
+                lookupKey: String, lookupValue: String, fallbackColumn: String
+            ) {
+                self.name = name
+                self.type = type
+                self.matchColumn = matchColumn
+                self.lookupTable = lookupTable
+                self.lookupKey = lookupKey
+                self.lookupValue = lookupValue
+                self.fallbackColumn = fallbackColumn
+            }
+        }
+        public init(table: String, columns: [Column] = [], lookups: [Lookup] = []) {
+            self.table = table
+            self.columns = columns
+            self.lookups = lookups
+        }
+
+        /// The nullable column definitions appended to `table` (populated post-copy).
+        var columnDefinitions: [ColumnDefinition] {
+            columns.map { ColumnDefinition($0.name, $0.type.columnType, notNull: false) }
+                + lookups.map { ColumnDefinition($0.name, $0.type.columnType, notNull: false) }
+        }
+    }
+
     public var ftsTables: [FTSTable]
     /// Regular source tables to NOT import (beyond the auto-skipped FTS shadow
     /// tables): irrelevant/large tables a consumer doesn't need (e.g. a vectors or
     /// zstd-payload table). Auto-introspection imports every regular table except
     /// these + the FTS shadows.
     public var skipTables: [String]
-    public init(ftsTables: [FTSTable] = [], skipTables: [String] = []) {
+    /// Build-time denormalization to apply after import (F6), keyed by table.
+    public var denorm: [Denorm]
+    public init(ftsTables: [FTSTable] = [], skipTables: [String] = [], denorm: [Denorm] = []) {
         self.ftsTables = ftsTables
         self.skipTables = skipTables
+        self.denorm = denorm
     }
 
     public static let empty = ImportManifest()
