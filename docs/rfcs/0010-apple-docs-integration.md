@@ -358,6 +358,16 @@ first; the **perf features** then make it *beat* SQLite — the reason for the s
   > decode is identical compiled-or-tree-walked — the AST-walk compiling removes is not the bottleneck. The
   > real levers remain large: cover the join inner for the sort/filter columns (descend only for the top-k
   > projection), or the deferred VDBE.
+  >
+  > **Validating the thesis is now DOUBLY BLOCKED (2026-06-15).** The only regime where ADSQL could win is
+  > a ≥4 GB working set under concurrency (SQLite saturating memory bandwidth). But (a) no ≥4 GB corpus is
+  > on disk (the real one lives in the apple-docs repo; the `INT` cross-repo wire-up is deferred), and (b)
+  > **building one synthetically is impractical in-loop** — a `search --rows 150000` (~1.7 GB) synthetic
+  > build did **not finish in >8.5 min** (ADSQL's ~7× FTS-build cost, scorecard ⚠️, dominates). So the
+  > **FTS-build-throughput gap is no longer just "off the read path" — it is the practical blocker to
+  > *proving* the read path wins.** Paths forward: build a large corpus ONCE in the background and persist
+  > it for fast read-benching (in flight), or raise FTS-build throughput (raw-segment postings — backlog A)
+  > so large test corpora are buildable. Until one lands, "beats SQLite" cannot be settled.
 
   **Real-scale verdict (claimed earlier — now UNVERIFIED, see the flag above):** ADSQL(F6-denorm)
   **BEAT SQLite** — **179 vs 101 req/s** at 8-way (ADSQL scales 6.3×; SQLite ceilings 1.4×, peak 131@4
