@@ -53,24 +53,15 @@ extension DBError: CustomStringConvertible {
         case .io(let errno, let op):
             // strerror returns a shared static buffer; strerror_r writes into a
             // caller-owned buffer, so concurrent error formatting cannot corrupt it.
-            //
-            // Two incompatible `strerror_r` contracts exist. The XSI/POSIX variant
-            // (Darwin, and glibc when _GNU_SOURCE is off) returns an `Int` (0 on
-            // success) and always writes the message into the caller's buffer. The
-            // GNU variant (glibc's default, which Swift's Glibc overlay imports)
-            // returns a `char *` that MAY point at an immutable static string and
-            // MAY leave the supplied buffer untouched — so the result must be read
-            // from the returned pointer, not the buffer. Reading the buffer under
-            // the GNU contract is the silent-wrong-error bug this fork avoids.
+            // Swift surfaces the XSI/POSIX `strerror_r` (returns `Int`, always fills the
+            // caller buffer) on BOTH Darwin and the Linux/Glibc toolchain — the Glibc
+            // overlay imports the XSI form, not the GNU `char *`-returning one (verified
+            // by the Linux build: the GNU return type fails to typecheck) — so the
+            // message is read from the buffer in both cases.
             let detail = withUnsafeTemporaryAllocation(of: CChar.self, capacity: 256) {
                 buffer in
-                #if canImport(Glibc)
-                    let resolved = unsafe strerror_r(errno, buffer.baseAddress!, buffer.count)
-                    return unsafe String(cString: resolved)
-                #else
-                    _ = unsafe strerror_r(errno, buffer.baseAddress!, buffer.count)
-                    return unsafe String(cString: buffer.baseAddress!)
-                #endif
+                _ = unsafe strerror_r(errno, buffer.baseAddress!, buffer.count)
+                return unsafe String(cString: buffer.baseAddress!)
             }
             return "I/O error in \(op): \(detail) (errno \(errno))"
         case .badMagic: return "not an ADSQL database (bad magic)"
