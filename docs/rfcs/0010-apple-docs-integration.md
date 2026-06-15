@@ -129,7 +129,7 @@ cell `[u8 tag][payload]`: `0`=NULL, `1`=INT `[i64 LE]`, `2`=REAL `[f64 LE]`, `3`
 
 | Feature | State | ADSQL seam it builds on / where it lands |
 |---|---|---|
-| **F0** Linux x64/arm64 **[GATE]** | **ABSENT — #1 blocker** | port the Darwin IO/durability layer (`mmap`/`fcntl` barriers / `clonefile` / cross-process reader table) to `Glibc`; add a Linux CI lane (§4.0) |
+| **F0** Linux x64/arm64 **[GATE]** | **⏳ BUILDS (x64+arm64) ✅** | Glibc forks landed (imports, `fdatasync`/`fsync`/`posix_fallocate`/`posix_fadvise`, `clonefile`→byte-copy, XSI `strerror_r`, `pthread_t`/`CDispatch`); `swift build` green on both arches in CI. Remaining: `swift test` must pass on Linux (runtime validation of the forks), then flip the lane to required |
 | **INT** `ad_storage_*` engine swap **[GATE]** | **ABSENT** | implement the frozen `ad_storage_search_pages` ABI (= A3 `searchFramed`) so ADSQL replaces `CSQLiteShim`/libsqlite3 inside `libAppleDocsCore` |
 | **F1** SQLite importer **[GATE]** | **✅ DONE** | `ADSQLImport` target: `Database.importSQLite(from:manifest:)` + `adsql import`; schema port + coercion + index/PK/UNIQUE port + manifest FTS5 rebuild + deep integrity; idempotent, deterministic |
 | **F2** FTS byte-parity | **✅ LANDED** | bm25f score parity **+ ranked-order parity** (ties → ascending rowid via the bounded-top-N upper-bound fix) proven through the importer vs SQLite FTS5 — `ImportedFTSParityTests.swift`, default + 5-weight |
