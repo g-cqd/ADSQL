@@ -73,7 +73,27 @@ private func valuesMatch(_ a: Value, _ b: Value) -> Bool {
     if a == b { return true }
     // Reals: identical IEEE ops should agree exactly; tolerate -0.0 vs 0.0.
     if case .real(let x) = a, case .real(let y) = b { return x == y }
+    // SQLite changed float→text rendering across versions (15 vs 17 significant
+    // digits, 3.43+), so the same double stringifies differently on different
+    // runners. Compare float-valued operands (a real, or a text SQLite rendered
+    // as a float) numerically with a relative tolerance, not byte-for-byte.
+    if let x = floatValue(a), let y = floatValue(b) {
+        let scale = max(abs(x), abs(y), 1)
+        return abs(x - y) <= scale * 1e-12
+    }
     return false
+}
+
+/// The numeric value of a real, or of a text that SQLite rendered as a float
+/// (contains `.`, `e`, or `E`); nil otherwise — so float results can be compared
+/// without depending on the runner's SQLite float-formatting precision.
+private func floatValue(_ v: Value) -> Double? {
+    switch v {
+    case .real(let d): return d
+    case .text(let s) where s.contains(where: { $0 == "." || $0 == "e" || $0 == "E" }):
+        return Double(s)
+    default: return nil
+    }
 }
 
 // MARK: - Differential
@@ -187,9 +207,13 @@ struct SQLEvalDifferentialTests {
             case 8:
                 return
                     "CASE WHEN \(expression(depth - 1)) THEN \(expression(depth - 1)) ELSE \(expression(depth - 1)) END"
-            case 9: return "CAST(\(expression(depth - 1)) AS \(["INTEGER", "TEXT", "REAL"][Int(rng.next() % 3)]))"
+            // CAST-to-TEXT and LENGTH over a (large/repeating) real render the
+            // double to text, whose precision is SQLite-version-dependent — so they
+            // are deliberately excluded here to keep the oracle deterministic across
+            // runners. Float text is still exercised by the fixed corpus + valuesMatch.
+            case 9: return "CAST(\(expression(depth - 1)) AS \(["INTEGER", "REAL"][Int(rng.next() % 2)]))"
             case 10: return "(\(expression(depth - 1)) IN (\(literal()), \(literal()), \(literal())))"
-            default: return "LENGTH(\(expression(depth - 1)))"
+            default: return "(\(expression(depth - 1)) - \(expression(depth - 1)))"
             }
         }
 
