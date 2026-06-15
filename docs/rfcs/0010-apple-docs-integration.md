@@ -305,13 +305,19 @@ first; the **perf features** then make it *beat* SQLite — the reason for the s
   already **SEEK** (`documents` USING ROWID, `roots` USING INDEX), so it is **not** O(matches×docs). The
   dominant cost is the **per-match tree-walk `SQLEval.evaluate`** (bm25 + tier CASE + 13 filters) over
   **all ~7k matches** — `ORDER BY tier` prevents top-K pruning, so every match is scored/tiered/filtered;
-  even count-only is ~60 ms, and ADSQL's per-match work is ~45× SQLite's. Levers, biggest first:
-  ✅ **bounded top-N** (landed, `b7e1fb7` — projects only the top-k: ~369→254 ms) → **A1** compile the
-  join/search-path eval (replace the per-match tree-walk `SQLEval.evaluate` with the compiled-closure
-  path the single-table executor already uses — **the big lever**) → **A5** push the typed filters into
-  the scan (fewer matches scored) → **F6** fold `roots` + precompute `tier` inputs (drop a per-match seek
-  + cheapen the CASE) → **A2–A4** stream the §2.5 framing off the mmap (drop `.all()`). The `search` bench
-  is the regression gate; ✅ **F4** covering engine landed.
+  even count-only is ~60 ms, and ADSQL's per-match work is ~45× SQLite's. Levers + progress:
+  ✅ **bounded top-N** (`b7e1fb7` — projects only the top-k) and ✅ **F6 denormalization** (`75d28d5` —
+  precompute `title_lc`/`key_lc` + `year_num`/`track_lc`, fold `roots`; per-match tier/filter ops become
+  cheap comparisons) together cut single-thread p50 from **16.9 ms → 6.5 ms** (2.6×), narrowing the SQLite
+  gap from ~13× to **~5.2×** (5k bench, equivalence-proven vs the original §2.2). The residual ~5× is
+  **bm25 over all matches** (`ORDER BY tier` still blocks WAND top-K) + the inherent Swift-vs-C eval tax.
+  Remaining levers (uncertain payoff): **A5** push filters into the scan, faster bm25, a WAND+rerank
+  restructuring (semantically tricky), or the deferred **VDBE** (this eval-bound workload is the case that
+  would justify it). **Key caveat:** the small cache-resident bench is the **pessimistic** regime for
+  ADSQL — **no memory-bandwidth contention**, which is the entire reason apple-docs ceilings at ~32 req/s
+  and where wait-free MVCC wins. The **definitive** "beat SQLite" test is the real apple-docs `load.mjs`
+  bench at the **4 GB** corpus with ADSQL wired in (the `INT` cross-repo step) — not more small-scale
+  micro-benching. ✅ **F4** covering engine landed.
 - **P1 — boundary collapse:** **A1** search primitive → **A2** caller encoder → **A3** one-call framed
   (= the `INT` ABI body) → **A4** mmap→out single-copy.
 - **P2 — polish:** **A5** pushed filters, **A6** snapshot/plan-cache wiring, **A7** vectorized.

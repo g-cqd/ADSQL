@@ -113,7 +113,7 @@ seeded op generator, simulated disk for crash injection). Tests in `ADSQLKernelT
 | **FTS MATCH** (membership) | **~3.3× slower** ⚠️ | rides the general per-row path |
 | **FTS index build** | **~7× slower** ⚠️ | constant factor vs FTS5 segments |
 | **FTS delete / churn** | **~390× slower** ⚠️ | re-encodes postings per doc → O(corpus); the standout gap |
-| **apple-docs `/search`** (composed, as-built) | **~26× slower** ⚠️ | per-match tree-walk `SQLEval.evaluate` (bm25 + tier CASE + 13 filters) over ALL matches — joins already SEEK; `ORDER BY tier` blocks top-K pruning. Bounded top-N landed (369→254 ms); **A1 compiled join eval** (the big lever) + A5 + F6 next (M8 P0b). `ADSQLBench search` tracks it |
+| **apple-docs `/search`** (composed) | **~5× slower** ⚠️ (was ~26×) | bounded top-N + F6 denorm cut it 2.6× (gap ~13×→~5×, 5k bench, equivalence-proven); residual = bm25-over-all-matches (`ORDER BY tier` blocks WAND) + Swift-vs-C eval. The small cache-resident bench is the PESSIMISTIC regime — the real 4 GB memory-bandwidth-contention test (where wait-free MVCC wins) needs the cross-repo `load.mjs` bench. `ADSQLBench search` tracks it |
 
 > **apple-docs read path (M8) — measured, not assumed:** the `ADSQLBench search` scenario shows the
 > as-built composed `/search` query is **~26× slower than SQLite** (the `ORDER BY tier, rank` shape
