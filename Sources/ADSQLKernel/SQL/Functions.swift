@@ -432,6 +432,69 @@ enum SQLFunctions {
         case "JSON_QUOTE":
             try requireArgs(1...1)
             return try SQLJSON.quote(try arg(0))
+        case "JSON":
+            try requireArgs(1...1)
+            return try SQLJSON.minify(try arg(0))
+        case "JSON_ARRAY":
+            guard !star else { throw DBError.sqlBind("json_array() does not take *") }
+            var values: [Value] = []
+            values.reserveCapacity(args.count)
+            for index in 0..<args.count { values.append(try arg(index)) }
+            return try SQLJSON.array(values)
+        case "JSON_OBJECT":
+            guard !star, args.count % 2 == 0 else {
+                throw DBError.sqlBind("json_object() requires an even number of arguments")
+            }
+            var pairs: [(key: Value, value: Value)] = []
+            pairs.reserveCapacity(args.count / 2)
+            var index = 0
+            while index < args.count {
+                pairs.append((try arg(index), try arg(index + 1)))
+                index += 2
+            }
+            return try SQLJSON.object(pairs)
+        case "JSON_SET", "JSON_INSERT", "JSON_REPLACE":
+            guard !star, args.count >= 1, args.count % 2 == 1 else {
+                throw DBError.sqlBind("\(name.lowercased())() takes a document then path/value pairs")
+            }
+            let document = try arg(0)
+            if document.isNull { return .null }
+            var assignments: [(path: String, value: Value)] = []
+            assignments.reserveCapacity((args.count - 1) / 2)
+            var index = 1
+            while index < args.count {
+                let pathValue = try arg(index)
+                guard case .text(let path) = pathValue else {
+                    throw DBError.sqlRuntime("\(name.lowercased())() path must be TEXT")
+                }
+                assignments.append((path, try arg(index + 1)))
+                index += 2
+            }
+            let mode: SQLJSON.MutationMode =
+                name == "JSON_SET" ? .set : (name == "JSON_INSERT" ? .insert : .replace)
+            return try SQLJSON.mutate(SQLFunctions.textify(document), assignments, mode: mode)
+        case "JSON_REMOVE":
+            guard !star, args.count >= 1 else {
+                throw DBError.sqlBind("json_remove() takes at least 1 argument")
+            }
+            let document = try arg(0)
+            if document.isNull { return .null }
+            var paths: [String] = []
+            for index in 1..<args.count {
+                let pathValue = try arg(index)
+                guard case .text(let path) = pathValue else {
+                    throw DBError.sqlRuntime("json_remove() path must be TEXT")
+                }
+                paths.append(path)
+            }
+            if paths.isEmpty { return try SQLJSON.minify(document) }
+            return try SQLJSON.removePaths(SQLFunctions.textify(document), paths: paths)
+        case "JSON_PATCH":
+            try requireArgs(2...2)
+            let target = try arg(0)
+            let patch = try arg(1)
+            if target.isNull || patch.isNull { return .null }
+            return try SQLJSON.patch(SQLFunctions.textify(target), with: SQLFunctions.textify(patch))
         case "COUNT", "SUM":
             throw DBError.sqlBind("\(name)() is an aggregate and needs GROUP BY context")
         default:

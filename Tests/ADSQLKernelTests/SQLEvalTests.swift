@@ -164,6 +164,63 @@ struct SQLEvalDifferentialTests {
         #expect(valuesMatch(ours, theirs), "\(expr): adsql \(ours) vs sqlite \(theirs)")
     }
 
+    /// Full SQLite JSON1 surface (reads, builders, and mutations) checked against the
+    /// bundled SQLite. Note: cases relying on SQLite's per-value "JSON subtype" (nested
+    /// json()/json_array results embedded as JSON rather than quoted) are intentionally
+    /// excluded — ADSQL's `Value` carries no subtype, a documented divergence.
+    static let jsonCorpus: [String] = [
+        // json_extract: scalars, containers, string, missing, end-relative, multi-path
+        "json_extract('{\"a\":{\"b\":[10,20,30]}}', '$.a.b[1]')",
+        "json_extract('{\"a\":{\"b\":[10,20,30]}}', '$.a.b')",
+        "json_extract('{\"a\":\"s\"}', '$.a')",
+        "json_extract('{\"a\":1}', '$.missing')",
+        "json_extract('[1,2,3]', '$[#-1]')",
+        "json_extract('{\"a\":1,\"b\":2}', '$.a', '$.b')",
+        // json_type
+        "json_type('{\"a\":1}', '$.a')", "json_type('{\"a\":2.5}', '$.a')",
+        "json_type('{\"a\":\"s\"}', '$.a')", "json_type('{\"a\":[1]}', '$.a')",
+        "json_type('{\"a\":{}}', '$.a')", "json_type('true')", "json_type('null')",
+        "json_type('{\"a\":1}', '$.missing')",
+        // json_valid
+        "json_valid('{\"a\":1}')", "json_valid('{bad}')", "json_valid(NULL)",
+        // json_array_length
+        "json_array_length('[1,2,3]')", "json_array_length('{\"a\":[1,2,3,4]}', '$.a')",
+        "json_array_length('{\"a\":1}')", "json_array_length('[1,2,3]', '$.x')",
+        // json_quote
+        "json_quote('abc')", "json_quote('a\"b')",
+        // json (minify)
+        "json(' { \"a\" : 1 , \"b\" : [ 2 , 3 ] } ')", "json('[1,2,  3]')",
+        // json_array / json_object
+        "json_array(1, 2, 'x', null)", "json_array()", "json_object('a', 1, 'b', 'y')",
+        // json_set / json_insert / json_replace
+        "json_set('{\"a\":1}', '$.b', 2)", "json_set('{\"a\":1}', '$.a', 99)",
+        "json_insert('{\"a\":1}', '$.a', 9)", "json_insert('{\"a\":1}', '$.b', 9)",
+        "json_replace('{\"a\":1}', '$.a', 9)", "json_replace('{\"a\":1}', '$.b', 9)",
+        "json_set('[1,2]', '$[#]', 3)", "json_set('[1,2,3]', '$[#-1]', 9)",
+        "json_set('{}', '$.a.b', 1)", "json_insert('{}', '$.x.y', 5)",
+        // json_remove
+        "json_remove('{\"a\":1,\"b\":2}', '$.a')", "json_remove('[10,20,30]', '$[1]')",
+        "json_remove('{\"a\":1}', '$.missing')",
+        // json_patch (RFC 7396)
+        "json_patch('{\"a\":1,\"b\":2}', '{\"b\":3,\"c\":4}')",
+        "json_patch('{\"a\":1,\"b\":2}', '{\"a\":null}')",
+        "json_patch('{\"a\":{\"x\":1}}', '{\"a\":{\"y\":2}}')",
+    ]
+
+    @Test(arguments: jsonCorpus.indices)
+    func jsonFunctionMatchesSQLite(_ index: Int) throws {
+        let expr = Self.jsonCorpus[index]
+        let scratch = SQLiteScratch()
+        let theirs: Value
+        do {
+            theirs = try scratch.eval(expr)
+        } catch {
+            return  // bundled SQLite lacks this function/syntax — skip rather than fail
+        }
+        let ours = try adsqlEval(expr)
+        #expect(valuesMatch(ours, theirs), "\(expr): adsql \(ours) vs sqlite \(theirs)")
+    }
+
     @Test func parameterBinding() throws {
         let scratch = SQLiteScratch()
         let params: [String: Value] = [

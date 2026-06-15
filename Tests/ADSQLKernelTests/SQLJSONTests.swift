@@ -102,4 +102,63 @@ struct SQLJSONTests {
         #expect(try SQLJSON.extractMultiple(doc, paths: ["$.a", "$.missing"]) == .text("[1,null]"))
         #expect(try SQLJSON.extractMultiple(doc, paths: ["$.c", "$.a"]) == .text("[[2,3],1]"))
     }
+
+    // MARK: - Builders & mutations
+
+    @Test func minifyValidatesAndCompacts() throws {
+        #expect(try SQLJSON.minify(.text(#" { "a" : 1 , "b" : [ 2 , 3 ] } "#)) == .text(#"{"a":1,"b":[2,3]}"#))
+        #expect(try SQLJSON.minify(.null) == .null)
+        #expect(throws: DBError.self) { try SQLJSON.minify(.text("{bad}")) }
+    }
+
+    @Test func buildsArraysAndObjects() throws {
+        #expect(try SQLJSON.array([.integer(1), .text("x"), .null, .real(2.5)]) == .text(#"[1,"x",null,2.5]"#))
+        #expect(try SQLJSON.array([]) == .text("[]"))
+        let pairs: [(key: Value, value: Value)] = [
+            (key: .text("a"), value: .integer(1)), (key: .text("b"), value: .text("y")),
+        ]
+        #expect(try SQLJSON.object(pairs) == .text(#"{"a":1,"b":"y"}"#))
+        #expect(throws: DBError.self) {
+            try SQLJSON.object([(key: .integer(1), value: .integer(2))])  // label must be TEXT
+        }
+    }
+
+    @Test func setInsertReplacePreserveIntRealAndSemantics() throws {
+        // set creates or overwrites; an integer stays an integer (not 2.0)
+        #expect(
+            try SQLJSON.mutate(#"{"a":1}"#, [(path: "$.b", value: .integer(2))], mode: .set) == .text(#"{"a":1,"b":2}"#)
+        )
+        #expect(try SQLJSON.mutate(#"{"a":1}"#, [(path: "$.a", value: .real(2.5))], mode: .set) == .text(#"{"a":2.5}"#))
+        // insert only fills an absent slot
+        #expect(
+            try SQLJSON.mutate(#"{"a":1}"#, [(path: "$.a", value: .integer(9))], mode: .insert) == .text(#"{"a":1}"#))
+        #expect(
+            try SQLJSON.mutate(#"{"a":1}"#, [(path: "$.b", value: .integer(9))], mode: .insert)
+                == .text(#"{"a":1,"b":9}"#))
+        // replace only overwrites a present slot
+        #expect(
+            try SQLJSON.mutate(#"{"a":1}"#, [(path: "$.b", value: .integer(9))], mode: .replace) == .text(#"{"a":1}"#))
+        #expect(
+            try SQLJSON.mutate(#"{"a":1}"#, [(path: "$.a", value: .integer(9))], mode: .replace) == .text(#"{"a":9}"#))
+        // append [#] and end-relative [#-1] on arrays
+        #expect(try SQLJSON.mutate("[1,2]", [(path: "$[#]", value: .integer(3))], mode: .set) == .text("[1,2,3]"))
+        #expect(try SQLJSON.mutate("[1,2,3]", [(path: "$[#-1]", value: .integer(9))], mode: .set) == .text("[1,2,9]"))
+        // set creates missing intermediate containers (object inferred from the next key)
+        #expect(try SQLJSON.mutate("{}", [(path: "$.a.b", value: .integer(1))], mode: .set) == .text(#"{"a":{"b":1}}"#))
+    }
+
+    @Test func removeDeletesPathsOrRoot() throws {
+        #expect(try SQLJSON.removePaths(#"{"a":1,"b":2}"#, paths: ["$.a"]) == .text(#"{"b":2}"#))
+        #expect(try SQLJSON.removePaths("[10,20,30]", paths: ["$[1]"]) == .text("[10,30]"))
+        #expect(try SQLJSON.removePaths(#"{"a":1}"#, paths: ["$"]) == .null)  // removing the root
+        #expect(try SQLJSON.removePaths(#"{"a":1}"#, paths: ["$.missing"]) == .text(#"{"a":1}"#))  // no-op
+    }
+
+    @Test func patchMergesPerRFC7396() throws {
+        #expect(try SQLJSON.patch(#"{"a":1,"b":2}"#, with: #"{"b":3,"c":4}"#) == .text(#"{"a":1,"b":3,"c":4}"#))
+        #expect(try SQLJSON.patch(#"{"a":1,"b":2}"#, with: #"{"a":null}"#) == .text(#"{"b":2}"#))  // null deletes
+        // deep merge of nested objects
+        #expect(try SQLJSON.patch(#"{"a":{"x":1}}"#, with: #"{"a":{"y":2}}"#) == .text(#"{"a":{"x":1,"y":2}}"#))
+        #expect(try SQLJSON.patch(#"{"a":1}"#, with: "42") == .text("42"))  // non-object patch replaces
+    }
 }

@@ -177,6 +177,251 @@ enum SQLJSON {
         }
     }
 
+    // MARK: - Builders
+
+    /// JSON literal text for a SQL scalar used as a `json_array`/`json_object` element or
+    /// a `json_set` value: a TEXT value becomes a JSON *string* (quoted), numbers and
+    /// NULL pass through, and BLOB is rejected.
+    ///
+    /// Note: SQLite uses a per-value "JSON subtype" so that the result of a nested
+    /// `json()`/`json_array()`/… is embedded as JSON rather than quoted. ADSQL's `Value`
+    /// carries no subtype, so a TEXT argument is always treated as a JSON string.
+    private static func jsonLiteral(_ value: Value) throws(DBError) -> String {
+        switch value {
+        case .null: return "null"
+        case .integer(let v): return String(v)
+        case .real(let d): return SQLFunctions.realToText(d)
+        case .text(let s): return renderString(s)
+        case .blob: throw DBError.sqlRuntime("JSON cannot hold BLOB values")
+        }
+    }
+
+    /// `json(X)`: validate and minify JSON text. NULL → NULL.
+    static func minify(_ value: Value) throws(DBError) -> Value {
+        if value.isNull { return .null }
+        return .text(render(try parse(SQLFunctions.textify(value))))
+    }
+
+    /// `json_array(v1, v2, …)`.
+    static func array(_ values: [Value]) throws(DBError) -> Value {
+        var out = "["
+        for (index, value) in values.enumerated() {
+            if index > 0 { out += "," }
+            out += try jsonLiteral(value)
+        }
+        return .text(out + "]")
+    }
+
+    /// `json_object(k1, v1, k2, v2, …)`: labels must be TEXT.
+    static func object(_ pairs: [(key: Value, value: Value)]) throws(DBError) -> Value {
+        var out = "{"
+        for (index, pair) in pairs.enumerated() {
+            if index > 0 { out += "," }
+            guard case .text(let key) = pair.key else {
+                throw DBError.sqlRuntime("json_object() labels must be TEXT")
+            }
+            out += renderString(key) + ":" + (try jsonLiteral(pair.value))
+        }
+        return .text(out + "}")
+    }
+
+    // MARK: - Mutations
+
+    /// A SQLite-typed, mutable JSON tree. Distinct from ADJSON's `JSONValue` because it
+    /// preserves the integer/real distinction (so `json_set(x, '$.n', 1)` writes `1`, not
+    /// `1.0`) and keeps object members in document order.
+    private indirect enum Tree {
+        case null
+        case bool(Bool)
+        case integer(Int64)
+        case real(Double)
+        case string(String)
+        case array([Tree])
+        case object([(String, Tree)])
+    }
+
+    enum MutationMode { case set, insert, replace }
+
+    private static func materialize(_ json: JSON) -> Tree {
+        if json.isNull { return .null }
+        if let b = json.bool { return .bool(b) }
+        if let i = json.int { return .integer(Int64(i)) }
+        if let d = json.double { return .real(d) }
+        if let s = json.string { return .string(s) }
+        if json.isArray {
+            var items: [Tree] = []
+            items.reserveCapacity(json.count)
+            json.forEachElement { items.append(materialize($0)) }
+            return .array(items)
+        }
+        var members: [(String, Tree)] = []
+        members.reserveCapacity(json.count)
+        json.forEachMember { key, value in members.append((key, materialize(value))) }
+        return .object(members)
+    }
+
+    private static func serialize(_ node: Tree) -> String {
+        switch node {
+        case .null: return "null"
+        case .bool(let b): return b ? "true" : "false"
+        case .integer(let v): return String(v)
+        case .real(let d): return SQLFunctions.realToText(d)
+        case .string(let s): return renderString(s)
+        case .array(let items): return "[" + items.map(serialize).joined(separator: ",") + "]"
+        case .object(let members):
+            return "{" + members.map { renderString($0.0) + ":" + serialize($0.1) }.joined(separator: ",") + "}"
+        }
+    }
+
+    private static func leafValue(_ value: Value) throws(DBError) -> Tree {
+        switch value {
+        case .null: return .null
+        case .integer(let v): return .integer(v)
+        case .real(let d): return .real(d)
+        case .text(let s): return .string(s)
+        case .blob: throw DBError.sqlRuntime("JSON cannot hold BLOB values")
+        }
+    }
+
+    /// Apply one path assignment. Like SQLite, `set`/`insert` create missing intermediate
+    /// containers (their type inferred from the next segment: object for a key, array for
+    /// an index), while `replace` never creates. Descending into a wrong-typed existing
+    /// value is a no-op.
+    private static func applyMutation(
+        _ node: Tree, _ segments: ArraySlice<SQLiteJSONPath.Segment>, _ value: Tree,
+        _ mode: MutationMode
+    ) -> Tree {
+        guard let segment = segments.first else {
+            // Whole-document target ($): set/replace overwrite; insert is a no-op ($ exists).
+            return mode == .insert ? node : value
+        }
+        let rest = segments.dropFirst()
+        let isLast = rest.isEmpty
+        let creating = mode != .replace
+        switch segment {
+        case .key(let key):
+            guard case .object(var members) = node else { return node }
+            if let index = members.firstIndex(where: { $0.0 == key }) {
+                if isLast {
+                    if mode != .insert { members[index].1 = value }
+                } else {
+                    members[index].1 = applyMutation(members[index].1, rest, value, mode)
+                }
+            } else if isLast {
+                if creating { members.append((key, value)) }
+            } else if creating {
+                members.append((key, applyMutation(emptyContainer(for: rest.first!), rest, value, mode)))
+            }
+            return .object(members)
+        case .index(let i):
+            guard case .array(var items) = node, i >= 0, i < items.count else { return node }
+            if isLast {
+                if mode != .insert { items[i] = value }
+            } else {
+                items[i] = applyMutation(items[i], rest, value, mode)
+            }
+            return .array(items)
+        case .fromEnd(let n):
+            guard case .array(var items) = node else { return node }
+            let i = items.count - n
+            guard i >= 0, i < items.count else { return node }
+            if isLast {
+                if mode != .insert { items[i] = value }
+            } else {
+                items[i] = applyMutation(items[i], rest, value, mode)
+            }
+            return .array(items)
+        case .append:
+            guard case .array(var items) = node, creating else { return node }
+            if isLast {
+                items.append(value)
+            } else {
+                items.append(applyMutation(emptyContainer(for: rest.first!), rest, value, mode))
+            }
+            return .array(items)
+        }
+    }
+
+    private static func emptyContainer(for segment: SQLiteJSONPath.Segment) -> Tree {
+        switch segment {
+        case .key: return .object([])
+        case .index, .fromEnd, .append: return .array([])
+        }
+    }
+
+    private static func removeAt(_ node: Tree, _ segments: ArraySlice<SQLiteJSONPath.Segment>) -> Tree {
+        guard let segment = segments.first else { return node }
+        let rest = segments.dropFirst()
+        let isLast = rest.isEmpty
+        switch segment {
+        case .key(let key):
+            guard case .object(var members) = node,
+                let index = members.firstIndex(where: { $0.0 == key })
+            else { return node }
+            if isLast { members.remove(at: index) } else { members[index].1 = removeAt(members[index].1, rest) }
+            return .object(members)
+        case .index(let i):
+            guard case .array(var items) = node, i >= 0, i < items.count else { return node }
+            if isLast { items.remove(at: i) } else { items[i] = removeAt(items[i], rest) }
+            return .array(items)
+        case .fromEnd(let n):
+            guard case .array(var items) = node else { return node }
+            let i = items.count - n
+            guard i >= 0, i < items.count else { return node }
+            if isLast { items.remove(at: i) } else { items[i] = removeAt(items[i], rest) }
+            return .array(items)
+        case .append:
+            return node  // the append slot never holds a value
+        }
+    }
+
+    /// RFC 7396 JSON Merge Patch (SQLite's `json_patch` semantics).
+    private static func mergePatch(_ target: Tree, _ patch: Tree) -> Tree {
+        guard case .object(let patchMembers) = patch else { return patch }
+        var result: [(String, Tree)]
+        if case .object(let existing) = target { result = existing } else { result = [] }
+        for (key, patchValue) in patchMembers {
+            if case .null = patchValue {
+                result.removeAll { $0.0 == key }
+            } else if let index = result.firstIndex(where: { $0.0 == key }) {
+                result[index].1 = mergePatch(result[index].1, patchValue)
+            } else {
+                result.append((key, mergePatch(.null, patchValue)))
+            }
+        }
+        return .object(result)
+    }
+
+    /// `json_set` / `json_insert` / `json_replace`: apply (path, value) assignments.
+    static func mutate(
+        _ json: String, _ assignments: [(path: String, value: Value)], mode: MutationMode
+    ) throws(DBError) -> Value {
+        var tree = materialize(try parse(json))
+        for assignment in assignments {
+            let segments = try parsePath(assignment.path).segments
+            let value = try leafValue(assignment.value)
+            tree = applyMutation(tree, segments[...], value, mode)
+        }
+        return .text(serialize(tree))
+    }
+
+    /// `json_remove`: delete each path. Removing the root (`$`) yields SQL NULL.
+    static func removePaths(_ json: String, paths: [String]) throws(DBError) -> Value {
+        var tree = materialize(try parse(json))
+        for path in paths {
+            let segments = try parsePath(path).segments
+            if segments.isEmpty { return .null }
+            tree = removeAt(tree, segments[...])
+        }
+        return .text(serialize(tree))
+    }
+
+    /// `json_patch(target, patch)`: RFC 7396 merge.
+    static func patch(_ target: String, with patch: String) throws(DBError) -> Value {
+        let merged = mergePatch(materialize(try parse(target)), materialize(try parse(patch)))
+        return .text(serialize(merged))
+    }
+
     // MARK: - Table-valued helpers
 
     /// `json_each` over an array (or single value): the `value` column rowset, in
