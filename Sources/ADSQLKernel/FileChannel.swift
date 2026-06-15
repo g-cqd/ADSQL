@@ -93,8 +93,13 @@ package final class FileChannel: StorageChannel, @unchecked Sendable {
     package func pwritev(_ buffers: [UnsafeRawBufferPointer], at offset: Int) throws(DBError) {
         var at = offset
         var index = 0
+        #if canImport(Darwin)
+            let iovCap = Int(IOV_MAX)
+        #else
+            let iovCap = 1024  // Linux UIO_MAXIOV; the Glibc Swift overlay doesn't surface IOV_MAX
+        #endif
         while unsafe index < buffers.count {
-            let count = unsafe min(buffers.count - index, Int(IOV_MAX))
+            let count = unsafe min(buffers.count - index, iovCap)
             let batch = unsafe buffers[index..<(index + count)]
             let total = unsafe batch.reduce(0) { $0 + $1.count }
             var iov = unsafe batch.map { buf in

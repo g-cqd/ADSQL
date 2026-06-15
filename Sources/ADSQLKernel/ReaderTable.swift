@@ -70,8 +70,14 @@ import ADCAtomics
         }
 
         if claimWriterLock {
-            var lock = flock(
-                l_start: 0, l_len: 1, l_pid: 0, l_type: Int16(F_WRLCK), l_whence: Int16(SEEK_SET))
+            // Build field-by-field: `struct flock`'s member order differs between the
+            // Darwin and Glibc overlays, so a labeled initializer isn't portable.
+            var lock = flock()
+            lock.l_type = Int16(F_WRLCK)
+            lock.l_whence = Int16(SEEK_SET)
+            lock.l_start = 0
+            lock.l_len = 1
+            lock.l_pid = 0
             if unsafe fcntl(fd, F_SETLK, &lock) == -1 {
                 var probe = lock
                 _ = unsafe fcntl(fd, F_GETLK, &probe)

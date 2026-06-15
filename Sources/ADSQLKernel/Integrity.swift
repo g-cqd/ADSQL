@@ -212,14 +212,14 @@ extension Database {
         private static func byteCopySnapshot(
             from source: String, to destination: String
         ) -> Result<Void, DBError> {
-            let src = source.withCString { unsafe open($0, O_RDONLY | O_CLOEXEC) }
+            let src = source.withCString { unsafe Glibc.open($0, O_RDONLY | O_CLOEXEC) }
             guard src >= 0 else {
                 return .failure(DBError.io(errno: errno, op: "open(\(source))"))
             }
             defer { _ = Glibc.close(src) }
 
             let dst = destination.withCString {
-                unsafe open($0, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0o644)
+                unsafe Glibc.open($0, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0o644)
             }
             guard dst >= 0 else {
                 let err = errno
