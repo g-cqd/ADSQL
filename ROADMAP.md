@@ -2,8 +2,10 @@
 
 A from-scratch, **pure-Swift, SQLite-compatible embedded database** for Apple platforms.
 Copy-on-write B+tree over `mmap`, single-writer / wait-free-reader MVCC, crash-safe by
-construction. Swift 6.2, module-wide `.strictMemorySafety()` (SE-0458) + experimental Lifetimes,
-macOS 26, Apple-Silicon-first (16 KiB native pages), **zero runtime dependencies**.
+construction. Swift 6.3 tools, module-wide `.strictMemorySafety()` (SE-0458) + experimental Lifetimes,
+macOS 15 floor (device platforms at 26), **arm64 + x86_64** (16 KiB logical pages). One runtime
+dependency: **ADJSONCore** — ADJSON's Foundation-free, swift-syntax-free JSON core, backing the SQL
+JSON functions (`json_extract`, the `->`/`->>` path operators, json builders).
 
 > **This file is the single source of truth** — architecture, current status, the vs-SQLite
 > scorecard, and the prioritized backlog. It consolidates what were nine RFCs + three design
@@ -91,8 +93,9 @@ seeded op generator, simulated disk for crash injection). Tests in `ADSQLKernelT
 | **M4.6–M4.8 — Scan/query perf** | ✅ done | Zero-copy row decode, bounded top-N, residual-conjunct elimination, ordered rowid fetch, lazy `RowView` scans, `DISTINCT` O(n²)→O(n), index-nested-loop join, slot-bound columns. Strict memory safety enabled module-wide. |
 | **M5 — FTS + bm25/bm25f** | ✅ mostly done | FTS5 virtual tables, `MATCH`, `bm25`/`bm25f`, unicode61/porter/trigram, block-max WAND, trigger sync. **ADSQL beats SQLite FTS5 on ranked top-k.** Small F6 tail remains (see backlog B). |
 | **Health + perf program (R1–R7)** | ✅ done | General 2-table merge join + `.auto` cost model (**JOIN now ~2.1× faster than SQLite**); hoisted insert + a `sample`-profiled, evidence-based closure of the INSERT gap as inherent; compiled-evaluator default flip; god-file splits (no file > ~600 lines); `public`→`package` storage encapsulation (external surface −35%); seven-criteria `StrategyBench`; FTS bench breadth. |
-| **M6 — Hardening + importer** | ⏳ future | Expanded fuzz / crash-injection; SQLite-file importer (loose→strict coercion); ops polish. |
-| **M7 — Query DSL & metaprogramming** | ⏳ future | Type-safe, injection-safe query DSL + a scoped `swift-syntax` macro tier (kernel stays zero-dep). |
+| **M6 — Hardening** | ⏳ future | Expanded fuzz / crash-injection; ops polish. *(The SQLite-file importer moved up — it is now **F1 of M8**.)* |
+| **M7 — Query DSL & metaprogramming** | ⏳ deferred below M8 | Type-safe, injection-safe query DSL + a scoped `swift-syntax` macro tier. |
+| **M8 — apple-docs read-engine swap** | ⏳ **active — top priority** | Swap SQLite behind apple-docs `/search` (it ceilings at ~32 req/s on memory-bandwidth contention). **P0 gate:** F1 importer → F2 FTS byte-parity → F4 covering serve → F5 streaming → F6 denorm; then **P1/P2** boundary collapse (A1–A7). See **[RFC 0010](docs/rfcs/0010-apple-docs-integration.md)**. |
 
 ### Scorecard vs system SQLite (apple-docs shapes, M-series, 200k rows / 2k FTS docs)
 
@@ -111,19 +114,33 @@ seeded op generator, simulated disk for crash injection). Tests in `ADSQLKernelT
 | **FTS index build** | **~7× slower** ⚠️ | constant factor vs FTS5 segments |
 | **FTS delete / churn** | **~390× slower** ⚠️ | re-encodes postings per doc → O(corpus); the standout gap |
 
+> **apple-docs read path (M8):** served **index-only off a covering FTS index** under wait-free MVCC —
+> the working set is the covering postings, not the 4 GB base table, so the `.all()`-materialization
+> concern doesn't bite (bounded `LIMIT` 20–100 results). The FTS *delete/churn* and *index-build* gaps
+> are **off** the read path (the importer builds the FTS once; `/search` never writes). See RFC 0010.
+
 ---
 
 ## 3. Future work (prioritized backlog)
+
+> **Driving program — apple-docs read-engine integration (M8, [RFC 0010](docs/rfcs/0010-apple-docs-integration.md)).**
+> The backlog is now **sequenced by M8**: P0 swap-gate **F1** importer → **F2** FTS byte-parity →
+> **F4** covering serve → **F5** streaming → **F6** denorm, then P1/P2 boundary-collapse **A1–A7**
+> (compiled FTS-search primitive, caller row encoder, one-call `searchFramed(into:)`, mmap→out
+> single-copy, pushed filters, snapshot/plan cache). Items below carry their **F#/A#** where they feed
+> M8; **VDBE** and **M7 (Query DSL)** are deferred below it.
 
 ### A. Performance levers (open)
 - **VDBE register machine** — a flat opcode loop over a `[Value]` register file (the deep evaluator
   lever). Deferred on evidence that read paths are **access-path-bound** (the compiled closures are
   already ≈ tree-walk on realistic queries); revisit only if an eval-heavy workload justifies it.
-  Multi-week.
+  Multi-week — **deferred below M8** (the apple-docs read path is access-path-bound, not eval-bound).
 - **`ANALYZE` + statistics + real cost model** — replace the heuristic access-path/join scoring with
   per-index selectivity so the planner picks scan-vs-seek and the right join strategy on cost.
-- **Covering / `INCLUDE`-index serving** — answer queries straight off the index cursor with no table
-  descent (verify the current `INCLUDE`-column support, then extend).
+- **Covering / `INCLUDE`-index serving** **(M8 F4 — the memory-bandwidth fix)** — answer queries
+  straight off the index cursor with no base-table descent. `IndexDefinition.includes` +
+  `RowView.coveringIncludes` + `RowCursor(coveringIncludes:)` already exist; the work is wiring
+  `Planner.chooseIndex` to detect "projection ⊆ columns ∪ includes" and the executor to activate it.
 - **Ordered/batched rowid sweep + `madvise` prefetch** (bitmap-heap-scan style); **per-page zone maps
   (min/max)** to skip leaf pages on filtered scans; **batch-at-a-time filter evaluation**;
   **correlated-subquery decorrelation / index-probe.**
@@ -137,15 +154,19 @@ seeded op generator, simulated disk for crash injection). Tests in `ADSQLKernelT
   page-copy tuning.
 
 ### B. FTS completion (M5 tail)
+- **M8 F2 — FTS byte-parity gate:** the engine is parity-*capable* (bit-identical bm25f, deterministic
+  `WANDTopK` tie-break), but the **proof against the apple-docs corpus is pending** — extend
+  `FTSParityTests` to run the query corpus through both engines and diff ranked order (RFC 0010).
 - Finish the prefix-union / zero-copy key-read path; `snippet()` / `highlight()` SQL functions (**not
   yet supported**); remaining bench shapes (contentless `documents_body_fts`, prefix/`columnsize=0`
   `sf_symbols_fts`); a concurrent-FTS-reader bench arm.
 
-### C. M6 — hardening + importer
-- Expanded fuzz / crash-injection coverage; a **SQLite-file importer** (loose→strict type coercion);
-  operational polish.
+### C. Hardening + importer
+- The **SQLite-file importer** (loose→strict coercion + manifest-driven FTS5 reconstruction + build-time
+  denormalization) is **M8 F1 + F6 — the swap gate** (RFC 0010), no longer a generic M6 item.
+- Remaining M6: expanded fuzz / crash-injection coverage; operational polish.
 
-### D. M7 — Query DSL & metaprogramming (gated on the AST seam, which is ready)
+### D. M7 — Query DSL & metaprogramming (deferred below M8; gated on the AST seam, which is ready)
 - **P0 (dependency-free core):** a result-builder query/DDL DSL + operator-overload expression DSL that
   lowers to the public AST via `prepare(ast:)` (injection-safe, non-`Equatable` expression wrapper).
 - **P1 (macro tier):** an isolated `ADSQLMacros` `swift-syntax` plugin (kernel + façade stay zero-dep)
