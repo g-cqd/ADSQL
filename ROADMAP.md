@@ -113,7 +113,7 @@ seeded op generator, simulated disk for crash injection). Tests in `ADSQLKernelT
 | **FTS MATCH** (membership) | **~3.3× slower** ⚠️ | rides the general per-row path |
 | **FTS index build** | **~7× slower** ⚠️ | constant factor vs FTS5 segments |
 | **FTS delete / churn** | **~390× slower** ⚠️ | re-encodes postings per doc → O(corpus); the standout gap |
-| **apple-docs `/search`** (real 4 GB, 8-way) | **~1.77× faster** ✅ (with F6) | DEFINITIVE test: ADSQL(F6-denorm) **wins at production concurrency — 179 vs 101 req/s** at 8-way (ADSQL scales **6.3×**; SQLite ceilings **1.4×**, peak 131@4 then regresses — the §1 signature, confirmed). Crosses SQLite between 4–8 threads; gap widens with cores. Single-thread still ~3.5× slower (the wait-free-MVCC thesis: wins *throughput*, not per-query latency). Denorm-equivalence + import byte-parity-verified at 358k docs |
+| **apple-docs `/search`** (real 4 GB, 8-way) | **~2.2× faster** ✅ (F6 + invariant-fold) | DEFINITIVE test: ADSQL(F6-denorm) **wins at production concurrency — 223 vs 101 req/s** at 8-way (ADSQL scales **6.3×**; SQLite ceilings **1.4×**, peak 131@4 then regresses — the §1 signature, confirmed); crosses between 4–8 threads, gap widens with cores. Invariant-subexpr folding cut single-thread 29→24.5 ms (~3× slower than SQLite, down from ~6×). The wait-free-MVCC thesis: wins *throughput*. Denorm-equivalence + import byte-parity-verified at 358k docs |
 
 > **apple-docs read path (M8) — measured, not assumed:** the `ADSQLBench search` scenario shows the
 > as-built composed `/search` query is **~26× slower than SQLite** (the `ORDER BY tier, rank` shape
