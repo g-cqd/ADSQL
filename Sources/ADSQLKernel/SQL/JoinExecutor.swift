@@ -466,6 +466,44 @@ extension SelectExecutor {
         let env = rowEnv(plan, context: context, params: params, outer: outer, subquery: subquery)
         let paramsEnv = SQLEvalEnv.parametersOnly { p throws(DBError) in try params.lookup(p) }
         let collectKeys = !plan.orderBy.isEmpty
+        let bounds = try sliceBounds(plan, params: params)
+
+        // Bounded top-N: an ORDER BY + small positive LIMIT (no DISTINCT) keeps only
+        // `offset+limit` rows in a sorted buffer during the scan instead of
+        // materializing and sorting every matched row — and projects the full output
+        // tuple ONLY for rows that make the cut (the dominant cost on the apple-docs
+        // `/search` join, RFC 0010: thousands of FTS matches but LIMIT 20). The keep
+        // rule, tie-break (insert-after-equal ⇒ scan order), and final slice are
+        // byte-identical to the collect-all + `sortedOrder` + `sliceBounds` path below
+        // (`sortedOrder` is stable on `lhs < rhs`, and the FTS docid set arrives in
+        // ascending rowid order, so equal-key runs keep the same order either way).
+        // DISTINCT is excluded: dedup must see the whole set before LIMIT, so a row
+        // outside the top-N keys could still be a needed unique representative.
+        if collectKeys, !plan.distinct, let bounds, let limit = bounds.limit, limit >= 1 {
+            let bound = bounds.offset + limit
+            if bound >= 1, bound <= 4096 {
+                var buffer = TopNBuffer(
+                    capacity: bound, terms: plan.orderBy, collations: plan.orderCollations)
+                try forEachFilteredRow(
+                    plan, tables: tables, index: index, joinIndexes: joinIndexes,
+                    ftsRecords: ftsRecords, resolver: resolver, context: context, env: env,
+                    paramsEnv: paramsEnv, execution: execution
+                ) { () throws(DBError) in
+                    var keys: [Value] = []
+                    keys.reserveCapacity(plan.orderBy.count)
+                    for term in plan.orderBy { keys.append(try SQLEval.evaluate(term.expr, env)) }
+                    // Only project the full tuple when the row qualifies for the buffer.
+                    if buffer.wouldDrop(keys) { return }
+                    var projected: [Value] = []
+                    projected.reserveCapacity(plan.outputs.count)
+                    for output in plan.outputs { projected.append(try SQLEval.evaluate(output.expr, env)) }
+                    buffer.insert(keys: keys, row: projected)
+                }
+                let kept = buffer.sortedRows()
+                let lower = min(bounds.offset, kept.count)
+                return kept[lower...].map { SQLRow(header: plan.header, values: $0) }
+            }
+        }
 
         var rows: [[Value]] = []
         var sortKeys: [[Value]] = []
@@ -492,11 +530,71 @@ extension SelectExecutor {
             let order = sortedOrder(sortKeys, terms: plan.orderBy, collations: plan.orderCollations)
             rows = order.map { rows[$0] }
         }
-        if let bounds = try sliceBounds(plan, params: params) {
+        if let bounds {
             let lower = min(bounds.offset, rows.count)
             let upper = bounds.limit.map { min(lower + $0, rows.count) } ?? rows.count
             rows = Array(rows[lower..<upper])
         }
         return rows.map { SQLRow(header: plan.header, values: $0) }
+    }
+}
+
+/// A fixed-capacity ascending top-N buffer for the join path: holds the best
+/// `capacity` rows seen so far, ordered by `terms`/`collations`. The keep rule,
+/// the insert-after-equal tie-break (so an equal-key run keeps scan order), and
+/// the eventual `sortedRows()` order are identical to the single-table
+/// `SelectExecutor.Accumulator` top-N and the collect-all `sortedOrder` path — so
+/// substituting it never changes results, only how many rows are projected/kept.
+struct TopNBuffer {
+    private let capacity: Int
+    private let terms: [SQLOrderingTerm]
+    private let collations: [Collation]
+    private var rows: [[Value]] = []
+    private var keys: [[Value]] = []
+
+    init(capacity: Int, terms: [SQLOrderingTerm], collations: [Collation]) {
+        self.capacity = capacity
+        self.terms = terms
+        self.collations = collations
+        rows.reserveCapacity(capacity)
+        keys.reserveCapacity(capacity)
+    }
+
+    /// True when the buffer is full and `candidate` does NOT order before the worst
+    /// kept key — the row would be dropped, so the caller can skip projecting it.
+    func wouldDrop(_ candidate: [Value]) -> Bool {
+        rows.count >= capacity && !orderBefore(candidate, keys[capacity - 1])
+    }
+
+    /// Inserts a qualifying row into the sorted buffer, evicting the worst when over
+    /// capacity. (Call only when `wouldDrop` is false.)
+    mutating func insert(keys candidate: [Value], row: [Value]) {
+        var lo = 0
+        var hi = rows.count
+        while lo < hi {
+            let mid = (lo + hi) / 2
+            // Upper bound: an equal key inserts AFTER existing entries, so a run of
+            // tied sort keys keeps scan order (ascending rowid) — matching the
+            // collect-all `sortedOrder` (stable) and the single-table top-N.
+            if orderBefore(candidate, keys[mid]) { hi = mid } else { lo = mid + 1 }
+        }
+        rows.insert(row, at: lo)
+        keys.insert(candidate, at: lo)
+        if rows.count > capacity {
+            rows.removeLast()
+            keys.removeLast()
+        }
+    }
+
+    /// The kept rows in ascending ORDER BY order (already maintained sorted).
+    consuming func sortedRows() -> [[Value]] { rows }
+
+    /// Does sort key `a` order strictly before `b` under the ORDER BY terms?
+    private func orderBefore(_ a: [Value], _ b: [Value]) -> Bool {
+        for position in terms.indices {
+            let comparison = SelectExecutor.orderCompare(a[position], b[position], collations[position])
+            if comparison != 0 { return terms[position].descending ? comparison > 0 : comparison < 0 }
+        }
+        return false
     }
 }
