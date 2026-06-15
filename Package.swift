@@ -73,6 +73,7 @@ let package = Package(
     ],
     products: [
         .library(name: "ADSQL", targets: ["ADSQL"]),
+        .library(name: "ADSQLImport", targets: ["ADSQLImport"]),
         .executable(name: "adsql", targets: ["ADSQLTool"]),
     ],
     dependencies: packageDependencies,
@@ -85,8 +86,13 @@ let package = Package(
         .target(
             name: "ADSQL", dependencies: ["ADSQLKernel"], swiftSettings: strictSettings,
             plugins: isDev ? ["LintBuild"] : []),
-        .executableTarget(name: "ADSQLTool", dependencies: ["ADSQL"], swiftSettings: strictSettings),
+        .executableTarget(
+            name: "ADSQLTool", dependencies: ["ADSQL", "ADSQLImport"], swiftSettings: strictSettings),
         .systemLibrary(name: "CSQLite"),
+        // SQLite-file importer (M8 F1, RFC 0010): reads a source .db via CSQLite and writes an
+        // ADSQL database. Kept out of ADSQLKernel so the read-only engine never links sqlite3.
+        .target(
+            name: "ADSQLImport", dependencies: ["ADSQLKernel", "CSQLite"], swiftSettings: strictSettings),
         .executableTarget(
             name: "ADSQLBench", dependencies: ["ADSQL", "CSQLite"], swiftSettings: benchSettings),
         .target(
@@ -98,6 +104,11 @@ let package = Package(
         .testTarget(
             name: "ADSQLKernelTests",
             dependencies: ["ADSQLKernel", "ADSQLTestSupport", "CSQLite"],
+            swiftSettings: testSettings
+        ),
+        .testTarget(
+            name: "ADSQLImportTests",
+            dependencies: ["ADSQLImport", "ADSQLTestSupport", "CSQLite"],
             swiftSettings: testSettings
         ),
 

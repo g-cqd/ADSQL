@@ -1,5 +1,7 @@
 import ADSQL
+import ADSQLImport
 import Darwin
+import Foundation
 
 let usage = """
     adsql — ADSQL database tool
@@ -14,6 +16,7 @@ let usage = """
       adsql check    <path> [--deep]
       adsql tables   <path>
       adsql schema   <path> [table]
+      adsql import   <sqlite-path> <adsql-path> [--manifest <path>]
       adsql snapshot <path> <destination>
       adsql hold-read <path> <seconds>     # test helper: pin a read snapshot
     """
@@ -184,6 +187,25 @@ do {
             usleep(UInt32(seconds * 1_000_000))
         }
         db.close()
+
+    case "import":
+        guard arguments.count >= 4 else {
+            fail("usage: adsql import <sqlite-path> <adsql-path> [--manifest <path>]")
+        }
+        let sourcePath = arguments[2]
+        let targetPath = arguments[3]
+        var manifest = ImportManifest.empty
+        if let flag = arguments.firstIndex(of: "--manifest"), flag + 1 < arguments.count {
+            let data = try Data(contentsOf: URL(fileURLWithPath: arguments[flag + 1]))
+            manifest = try JSONDecoder().decode(ImportManifest.self, from: data)
+        }
+        let db = try Database.open(at: targetPath)
+        let report = try db.importSQLite(from: sourcePath, manifest: manifest)
+        db.close()
+        print("imported \(sourcePath) → \(targetPath)")
+        print(
+            "tables: \(report.tableCount) · keys: \(report.kvCount) · "
+                + "pages: \(report.pageCount) · generation: \(report.generation)")
 
     default:
         fail(usage)

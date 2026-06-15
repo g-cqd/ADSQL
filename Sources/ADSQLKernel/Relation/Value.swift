@@ -58,6 +58,16 @@ public enum Collation: UInt8, Equatable, Sendable {
 }
 
 extension Value {
+    /// Loose→strict coercion to a column type, matching SQLite's `CAST` — the
+    /// sanctioned coercion boundary named in this type's doc, used by the SQLite
+    /// importer to land dynamically-typed source cells into strict columns. NULL
+    /// passes through unchanged.
+    public func coerced(to type: ColumnType) -> Value {
+        SQLFunctions.cast(self, to: type)
+    }
+}
+
+extension Value {
     /// Total order matching KeyCodec's encoding byte order exactly:
     /// NULL < INTEGER < REAL < TEXT < BLOB (storage classes never interleave
     /// under strict typing — a column compares within one class).
