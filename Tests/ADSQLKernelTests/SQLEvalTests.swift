@@ -181,8 +181,10 @@ struct SQLEvalDifferentialTests {
         "json_type('{\"a\":\"s\"}', '$.a')", "json_type('{\"a\":[1]}', '$.a')",
         "json_type('{\"a\":{}}', '$.a')", "json_type('true')", "json_type('null')",
         "json_type('{\"a\":1}', '$.missing')",
-        // json_valid
-        "json_valid('{\"a\":1}')", "json_valid('{bad}')", "json_valid(NULL)",
+        // json_valid (json_valid(NULL) is excluded: its result — NULL vs 0 — varies
+        // across SQLite versions, so it can't be reliably diffed against the system
+        // oracle (the Linux libsqlite3 differs from macOS); ADSQL matches modern SQLite).
+        "json_valid('{\"a\":1}')", "json_valid('{bad}')",
         // json_array_length
         "json_array_length('[1,2,3]')", "json_array_length('{\"a\":[1,2,3,4]}', '$.a')",
         "json_array_length('{\"a\":1}')", "json_array_length('[1,2,3]', '$.x')",

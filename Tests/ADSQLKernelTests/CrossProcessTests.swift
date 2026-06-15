@@ -6,9 +6,15 @@ import Testing
 
 private final class BundleMarker {}
 
-/// Locates the adsql CLI next to the test bundle in the build products dir.
+/// Locates the adsql CLI. On macOS the executable is a sibling of the `.xctest`
+/// bundle in the build products dir (the `Bundle(for:)` path below). On Linux there
+/// is no test bundle, so that layout doesn't hold; the CI lane passes the exact
+/// built path via `ADSQL_CLI_PATH` (`swift build --show-bin-path`/adsql).
 private func adsqlBinary() -> String {
-    Bundle(for: BundleMarker.self).bundleURL
+    if let override = ProcessInfo.processInfo.environment["ADSQL_CLI_PATH"], !override.isEmpty {
+        return override
+    }
+    return Bundle(for: BundleMarker.self).bundleURL
         .deletingLastPathComponent()
         .appendingPathComponent("adsql")
         .path

@@ -103,7 +103,9 @@ jobs:
       - name: Build
         run: swift build
       - name: Test (SQLite-differential suite)
-        run: swift test
+        # The cross-process tests spawn the built `adsql` CLI; on Linux there is no
+        # `.xctest` bundle to locate it next to, so pass its exact path explicitly.
+        run: ADSQL_CLI_PATH="$(swift build --show-bin-path)/adsql" swift test
 
   platforms:
     name: Build (${{ matrix.platform }})
