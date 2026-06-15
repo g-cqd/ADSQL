@@ -301,6 +301,60 @@ struct RecordCodecTests {
             #expect(try text(9) == nil)  // beyond the stored column count
         }
     }
+
+    /// `cellOffsets` returns one offset per stored cell, and `decodeCell` at each
+    /// offset reproduces the original value — the contract the lazy-scan offset cache
+    /// relies on. Exercises every storage class in one record.
+    @Test func cellOffsetsLocateEveryCell() throws {
+        let values: [Value] = [.null, .integer(-7), .real(3.5), .text("hi"), .blob([9, 9, 9])]
+        let record = RecordCodec.encode(values)
+        // Capture via Result (the codec calls run inside the non-escaping byte view).
+        var result: Result<(count: Int, decoded: [Value]), DBError> = .success((0, []))
+        record.withUnsafeBytes { (bytes: UnsafeRawBufferPointer) in
+            do throws(DBError) {
+                let offsets = try RecordCodec.cellOffsets(bytes)
+                var decoded: [Value] = []
+                for off in offsets { decoded.append(try RecordCodec.decodeCell(bytes, at: off)) }
+                result = .success((offsets.count, decoded))
+            } catch {
+                result = .failure(error)
+            }
+        }
+        let (count, decoded) = try result.get()
+        #expect(count == values.count)
+        #expect(decoded == values)
+    }
+
+    /// Deterministic malformations must throw a typed `integrityFailure` — never trap
+    /// or silently misread. Each case targets a specific guard in `decodeOne`/`decode`/
+    /// `cellOffsets` that random fuzzing rarely hits (a wrong tag or a length that
+    /// overruns the buffer). The byte format is `[varint count][cell…]`, cell =
+    /// `[tag][payload]` with tags null=0/int=1/real=2/text=3/blob=4.
+    @Test func malformedRecordsThrowTypedErrors() {
+        func decodeThrows(_ bytes: [UInt8]) -> Bool {
+            var threw = false
+            bytes.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in
+                do throws(DBError) { _ = try RecordCodec.decode(raw) } catch { threw = true }
+            }
+            return threw
+        }
+        #expect(decodeThrows([1, 9]), "count=1, unknown cell tag 9")
+        #expect(decodeThrows([1, 2, 0, 0, 0]), "count=1, REAL tag with <8 payload bytes")
+        #expect(decodeThrows([1, 1]), "count=1, INTEGER tag with no varint payload")
+        #expect(decodeThrows([1, 3, 5, 65, 66]), "count=1, TEXT len=5 but only 2 payload bytes")
+        #expect(decodeThrows([1, 4, 9, 1, 2]), "count=1, BLOB len=9 but only 2 payload bytes")
+        #expect(decodeThrows([2, 0]), "count=2 but only one (null) cell stored")
+
+        // A column count above the 4096 cap is rejected by both decode and cellOffsets.
+        var overCount: [UInt8] = []
+        Varint.append(UInt64(5000), to: &overCount)
+        #expect(decodeThrows(overCount), "column count over the 4096 cap")
+        var offsetsThrew = false
+        overCount.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in
+            do throws(DBError) { _ = try RecordCodec.cellOffsets(raw) } catch { offsetsThrew = true }
+        }
+        #expect(offsetsThrew, "cellOffsets also rejects the bad column count")
+    }
 }
 
 @Suite("CivilTime")
