@@ -7,6 +7,13 @@ import Synchronization
     import Glibc
 #endif
 
+// SE-0444 (MemberImportVisibility): on Linux, Dispatch re-exports the pthread types
+// through CDispatch, so `pthread_attr_t()`'s init below needs CDispatch imported
+// explicitly. canImport-guarded — a no-op where CDispatch isn't a separate module.
+#if canImport(CDispatch)
+    import CDispatch
+#endif
+
 /// A serial executor backed by ONE dedicated pthread running on a large,
 /// controlled stack. It is a drop-in replacement for the `adsql.writer`
 /// `DispatchQueue` and preserves that queue's exact contract:
@@ -105,14 +112,26 @@ import Synchronization
             _ = unsafe pthread_attr_set_qos_class_np(&attr, QOS_CLASS_USER_INITIATED, 0)
         #endif
 
-        var tid: pthread_t?
+        // `pthread_t` is an opaque pointer on Darwin (the handle is optional and a bind
+        // is an unsafe expression) but a plain integer on Glibc (non-optional), so fork
+        // the declaration + unwrap to match `pthread_create`'s out-parameter type.
+        #if canImport(Darwin)
+            var tid: pthread_t?
+        #else
+            var tid = pthread_t()
+        #endif
         let rc = unsafe pthread_create(&tid, &attr, writerThreadMain, opaque)
-        // `pthread_t` is an opaque-pointer (unsafe) type, so binding/storing the
-        // handle is itself an unsafe expression even though we never dereference it.
-        guard rc == 0, let tid = unsafe tid else {
-            unsafe Unmanaged<WriterThread>.fromOpaque(opaque).release()
-            fatalError("pthread_create failed (\(rc))")
-        }
+        #if canImport(Darwin)
+            guard rc == 0, let tid = unsafe tid else {
+                unsafe Unmanaged<WriterThread>.fromOpaque(opaque).release()
+                fatalError("pthread_create failed (\(rc))")
+            }
+        #else
+            guard rc == 0 else {
+                unsafe Unmanaged<WriterThread>.fromOpaque(opaque).release()
+                fatalError("pthread_create failed (\(rc))")
+            }
+        #endif
         thread.withLock { unsafe $0.tid = tid }
     }
 
