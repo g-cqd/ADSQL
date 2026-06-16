@@ -4,8 +4,11 @@ A from-scratch, **pure-Swift, SQLite-compatible embedded database** for Apple pl
 Copy-on-write B+tree over `mmap`, single-writer / wait-free-reader MVCC, crash-safe by
 construction. Swift 6.3 tools, module-wide `.strictMemorySafety()` (SE-0458) + experimental Lifetimes,
 macOS 15 floor (device platforms at 26), **arm64 + x86_64** (16 KiB logical pages). One runtime
-dependency: **ADJSONCore** — ADJSON's Foundation-free, swift-syntax-free JSON core, backing the SQL
-JSON functions (`json_extract`, the `->`/`->>` path operators, json builders).
+dependency: **ADJSONCore** — ADJSON's Foundation-free, swift-syntax-free JSON core, now the **sole
+owner of SQLite-dialect JSON**: parse, `SQLiteJSONPath` walking, the `json_set`/`insert`/`replace`/
+`remove` mutation engine, RFC 7396 merge, and byte-exact `.sqlite` serialization (`%!.15g` reals,
+`\b`/`\f` short escapes). `SQL/JSON.swift` keeps only the JSON↔SQL-`Value` boundary + `json_*` wiring
+(~220 hand-rolled lines deleted; the differential `json_*` suite stays byte-identical to SQLite).
 
 > **This file is the single source of truth** — architecture, current status, the vs-SQLite
 > scorecard, and the prioritized backlog. It consolidates what were nine RFCs + three design
